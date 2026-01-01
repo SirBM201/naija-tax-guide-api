@@ -1,32 +1,29 @@
 import os
 import hmac
 import hashlib
-from flask import Flask, request, abort, jsonify, Response
+from flask import Flask, request, abort, jsonify
 
 app = Flask(__name__)
 
-# Environment variables
+# --- ENV VARS ---
 VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "naija-tax-guide-verify")
-APP_SECRET = os.getenv("META_APP_SECRET", "")  # Meta App Secret
+APP_SECRET = os.getenv("META_APP_SECRET", "")  # optional but recommended
 
 
-# --------------------
+# ---------------------------
 # Health check (Koyeb)
-# --------------------
-@app.get("/health")
+# ---------------------------
+@app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok"}), 200
+    return "OK", 200
 
 
-# --------------------
+# ---------------------------
 # Signature verification
-# --------------------
+# ---------------------------
 def verify_signature(req) -> bool:
-    """
-    Verify X-Hub-Signature-256 from Meta.
-    """
     if not APP_SECRET:
-        # Allow verification to pass if secret not set (NOT recommended for prod)
+        # Allow requests if secret not set (OK for now)
         return True
 
     signature = req.headers.get("X-Hub-Signature-256")
@@ -37,7 +34,7 @@ def verify_signature(req) -> bool:
     payload = req.get_data()
 
     expected_hash = hmac.new(
-        APP_SECRET.encode("utf-8"),
+        APP_SECRET.encode(),
         payload,
         hashlib.sha256
     ).hexdigest()
@@ -45,42 +42,37 @@ def verify_signature(req) -> bool:
     return hmac.compare_digest(received_hash, expected_hash)
 
 
-# --------------------
-# Webhook endpoint
-# --------------------
+# ---------------------------
+# Webhook
+# ---------------------------
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
 
-    # ---- Meta verification ----
+    # Meta verification
     if request.method == "GET":
         mode = request.args.get("hub.mode")
         token = request.args.get("hub.verify_token")
         challenge = request.args.get("hub.challenge")
 
         if mode == "subscribe" and token == VERIFY_TOKEN:
-            print("✅ Webhook verified by Meta")
-            return Response(challenge, status=200, mimetype="text/plain")
+            return challenge, 200
 
-        print("❌ Webhook verification failed")
         return abort(403)
 
-    # ---- Incoming events ----
+    # Incoming events
     if request.method == "POST":
         if not verify_signature(request):
-            print("❌ Invalid webhook signature")
             return abort(403)
 
-        payload = request.get_json(silent=True) or {}
-        print("📩 Incoming webhook event:")
-        print(payload)
+        data = request.get_json(silent=True)
+        print("📩 Incoming webhook:", data)
 
-        # IMPORTANT: Always respond fast
-        return Response("EVENT_RECEIVED", status=200)
+        return "EVENT_RECEIVED", 200
 
 
-# --------------------
-# App entrypoint
-# --------------------
+# ---------------------------
+# Entry point
+# ---------------------------
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8000"))
+    port = int(os.getenv("PORT", 8000))
     app.run(host="0.0.0.0", port=port)
