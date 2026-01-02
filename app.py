@@ -1,62 +1,54 @@
 import os
-import json
 import hmac
 import hashlib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from flask import Flask, request, abort, jsonify
-
-# Optional but recommended for Supabase + outbound replies
 from supabase import create_client, Client
-import requests
 
+# ------------------------------------------------------------
+# App
+# ------------------------------------------------------------
 app = Flask(__name__)
 
-# -------------------------
-# Env vars (set in Koyeb)
-# -------------------------
+# ------------------------------------------------------------
+# ENV VARS (Koyeb)
+# ------------------------------------------------------------
 VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "naija-tax-guide-verify")
-
-META_APP_SECRET = os.getenv("META_APP_SECRET", "")  # Meta App Secret for signature check
-WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "")    # WhatsApp Cloud API token
-PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")  # from WhatsApp > API Setup
+APP_SECRET = os.getenv("META_APP_SECRET", "")  # Meta App Secret (optional but recommended)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 
-SERVICE_NAME = os.getenv("SERVICE_NAME", "naija-tax-guide-api")
+if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+    # Fail fast: backend cannot work without DB
+    raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY env vars.")
 
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
-# -------------------------
-# Supabase client
-# -------------------------
-supabase: Client | None = None
-if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
-    supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+# Session defaults
+SESSION_TTL_MINUTES = int(os.getenv("SESSION_TTL_MINUTES", "120"))
 
-
-# -------------------------
-# Health / Root (Koyeb friendly)
-# -------------------------
+# ------------------------------------------------------------
+# Health checks
+# ------------------------------------------------------------
 @app.get("/")
 def root():
-    return jsonify({"service": SERVICE_NAME, "status": "ok"}), 200
+    return jsonify({"service": "naija-tax-guide-api", "status": "ok"}), 200
 
 @app.get("/health")
 def health():
     return jsonify({"status": "ok"}), 200
 
-
-# -------------------------
-# Security: verify Meta signature
-# -------------------------
-def verify_meta_signature(req) -> bool:
+# ------------------------------------------------------------
+# Security: verify Meta signature (X-Hub-Signature-256)
+# ------------------------------------------------------------
+def verify_signature(req) -> bool:
     """
-    Meta sends: X-Hub-Signature-256: sha256=<hash>
-    We compute HMAC-SHA256(secret, raw_body).
+    Verifies Meta webhook signature (X-Hub-Signature-256).
+    If META_APP_SECRET is not set, verification is skipped (OK for dev; not ideal for prod).
     """
-    if not META_APP_SECRET:
-        # OK for early testing, but set this in production
+    if not APP_SECRET:
         return True
 
     signature = req.headers.get("X-Hub-Signature-256", "")
@@ -64,327 +56,447 @@ def verify_meta_signature(req) -> bool:
         return False
 
     provided_hash = signature.split("=", 1)[1]
-    raw_body = req.get_data()  # bytes
+    payload = req.get_data()  # raw bytes
 
     expected_hash = hmac.new(
-        META_APP_SECRET.encode("utf-8"),
-        msg=raw_body,
+        APP_SECRET.encode("utf-8"),
+        msg=payload,
         digestmod=hashlib.sha256
     ).hexdigest()
 
     return hmac.compare_digest(provided_hash, expected_hash)
 
-
-# -------------------------
-# WhatsApp outbound send
-# -------------------------
-def send_whatsapp_text(to_phone: str, message: str) -> tuple[bool, str]:
+# ------------------------------------------------------------
+# Helpers: WhatsApp payload parsing (Meta Cloud API)
+# ------------------------------------------------------------
+def extract_inbound_text(meta_payload: dict) -> dict:
     """
-    Sends a WhatsApp text message via Cloud API.
-    Requires WHATSAPP_TOKEN and WHATSAPP_PHONE_NUMBER_ID.
+    Extracts a single inbound message:
+    returns { "wa_phone": "...", "text": "...", "message_id": "...", "raw": {...} }
+    If no inbound user message exists, returns {}.
     """
-    if not (WHATSAPP_TOKEN and PHONE_NUMBER_ID):
-        return False, "Missing WHATSAPP_TOKEN or WHATSAPP_PHONE_NUMBER_ID"
-
-    url = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
-    headers = {
-        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to_phone,
-        "type": "text",
-        "text": {"body": message},
-    }
-
     try:
-        r = requests.post(url, headers=headers, json=payload, timeout=15)
-        if r.status_code >= 200 and r.status_code < 300:
-            return True, "sent"
-        return False, f"send_failed {r.status_code}: {r.text}"
-    except Exception as e:
-        return False, f"send_exception: {e}"
+        entry = (meta_payload.get("entry") or [])[0]
+        change = (entry.get("changes") or [])[0]
+        value = change.get("value") or {}
 
+        messages = value.get("messages") or []
+        if not messages:
+            return {}
 
-# -------------------------
-# Basic flow router (auto-reply)
-# -------------------------
-def build_menu_text() -> str:
-    return (
-        "Naija Hustle Tax Guide 🇳🇬\n"
-        "Reply with a number:\n\n"
-        "1) PAYE Calculator (estimate)\n"
-        "2) VAT Guide\n"
-        "3) Withholding Tax (WHT) Guide\n"
-        "4) Small Business Tax Tips\n"
-        "5) Talk to Admin\n\n"
-        "Type: MENU anytime to see this again."
+        msg = messages[0]
+        wa_phone = msg.get("from")  # sender wa id (phone)
+        msg_id = msg.get("id")
+
+        mtype = msg.get("type")
+        text = ""
+
+        if mtype == "text":
+            text = ((msg.get("text") or {}).get("body") or "").strip()
+        elif mtype == "button":
+            text = ((msg.get("button") or {}).get("text") or "").strip()
+        elif mtype == "interactive":
+            # list replies / button replies
+            inter = msg.get("interactive") or {}
+            i_type = inter.get("type")
+            if i_type == "list_reply":
+                text = (((inter.get("list_reply") or {}).get("title")) or "").strip()
+            elif i_type == "button_reply":
+                text = (((inter.get("button_reply") or {}).get("title")) or "").strip()
+        else:
+            # unsupported types: image/audio/location/etc.
+            text = ""
+
+        return {
+            "wa_phone": wa_phone,
+            "text": text,
+            "message_id": msg_id,
+            "raw": msg,
+            "value": value,
+        }
+    except Exception:
+        return {}
+
+def now_utc():
+    return datetime.now(timezone.utc)
+
+def expires_at_utc(minutes: int):
+    return now_utc() + timedelta(minutes=minutes)
+
+# ------------------------------------------------------------
+# DB: Users
+# ------------------------------------------------------------
+def get_or_create_user(wa_phone: str) -> dict:
+    res = supabase.table("wa_users").select("*").eq("wa_phone", wa_phone).limit(1).execute()
+    if res.data:
+        return res.data[0]
+
+    created = supabase.table("wa_users").insert({
+        "wa_phone": wa_phone,
+        "created_at": now_utc().isoformat(),
+        "updated_at": now_utc().isoformat(),
+    }).execute()
+    return created.data[0]
+
+# ------------------------------------------------------------
+# DB: Sessions (ONE active per phone - global)
+# ------------------------------------------------------------
+def get_active_session(wa_phone: str) -> dict | None:
+    res = (
+        supabase.table("flow_sessions")
+        .select("*")
+        .eq("wa_phone", wa_phone)
+        .eq("status", "active")
+        .order("updated_at", desc=True)
+        .limit(1)
+        .execute()
     )
+    return res.data[0] if res.data else None
 
-def route_message(text: str) -> str:
-    t = (text or "").strip().lower()
+def create_session(wa_phone: str, user_id: int, flow_key: str = "menu") -> dict:
+    payload = {
+        "wa_phone": wa_phone,
+        "user_id": user_id,
+        "flow_key": flow_key,
+        "status": "active",
+        "current_step": "start",
+        "step_index": 0,
+        "context": {},
+        "meta": {},
+        "last_inbound_at": now_utc().isoformat(),
+        "expires_at": expires_at_utc(SESSION_TTL_MINUTES).isoformat(),
+        "created_at": now_utc().isoformat(),
+        "updated_at": now_utc().isoformat(),
+    }
+    res = supabase.table("flow_sessions").insert(payload).execute()
+    return res.data[0]
 
-    if t in ("menu", "hi", "hello", "help", "start"):
-        return build_menu_text()
+def update_session(session_id: str, patch: dict) -> dict:
+    patch = dict(patch)
+    patch["updated_at"] = now_utc().isoformat()
+    res = supabase.table("flow_sessions").update(patch).eq("id", session_id).execute()
+    return res.data[0]
 
-    # Quick numeric menu
-    if t == "1":
-        return (
-            "PAYE Calculator (Estimate)\n"
-            "Send your details in this format:\n"
-            "PAYE gross=250000 pension=0 nhf=0 nhis=0\n\n"
-            "Example:\n"
-            "PAYE gross=500000 pension=25000"
-        )
+def end_session(session_id: str, status: str = "completed") -> None:
+    supabase.table("flow_sessions").update({
+        "status": status,
+        "updated_at": now_utc().isoformat(),
+        "expires_at": now_utc().isoformat()
+    }).eq("id", session_id).execute()
 
-    if t == "2":
-        return (
-            "VAT Guide\n"
-            "- VAT is charged on eligible goods/services.\n"
-            "- Standard VAT rate has historically been 7.5%, but reforms have been discussed.\n"
-            "Reply: VAT DETAILS to learn when to charge VAT and how to file."
-        )
-
-    if t == "3":
-        return (
-            "Withholding Tax (WHT) Guide\n"
-            "Reply: WHT RENT or WHT CONTRACT or WHT PROFESSIONAL\n"
-            "…and I will show typical rates + examples."
-        )
-
-    if t == "4":
-        return (
-            "Small Business Tax Tips\n"
-            "Reply: SME TIPS\n"
-            "or ask a question like:\n"
-            "'Do I need TIN?' / 'How do I file PAYE?'"
-        )
-
-    if t == "5":
-        return (
-            "Okay. Please type your question and include your state (optional).\n"
-            "An admin will respond as soon as possible."
-        )
-
-    # PAYE parsing (simple, configurable later)
-    if t.startswith("paye"):
-        # Example: PAYE gross=500000 pension=25000
-        return handle_paye_estimate(text)
-
-    if t.startswith("vat details"):
-        return (
-            "VAT DETAILS\n"
-            "1) If you sell taxable goods/services, you may need to charge VAT.\n"
-            "2) Keep VAT invoices/receipts.\n"
-            "3) File/Remit based on your registration status.\n\n"
-            "Reply: VAT EXAMPLE for a worked example."
-        )
-
-    if t.startswith("vat example"):
-        return (
-            "VAT EXAMPLE\n"
-            "If you sold ₦100,000 of a VATable service:\n"
-            "VAT = rate × 100,000\n"
-            "Total invoice = 100,000 + VAT\n\n"
-            "Reply: VAT RATE to see the configured rate in this bot."
-        )
-
-    if t.startswith("wht"):
-        return handle_wht_info(t)
-
-    return (
-        "I didn’t understand that.\n\n"
-        "Type MENU to see options, or send:\n"
-        "- PAYE gross=250000 pension=0\n"
-        "- VAT DETAILS\n"
-        "- WHT RENT"
-    )
-
-
-def handle_wht_info(t: str) -> str:
-    if "rent" in t:
-        return "WHT RENT: Share landlord/tenant type + amount, and I’ll guide the steps."
-    if "contract" in t:
-        return "WHT CONTRACT: Share contract type + amount, and I’ll guide the likely WHT treatment."
-    if "professional" in t:
-        return "WHT PROFESSIONAL: Tell me the service type (legal, consulting, etc.)."
-    return "WHT: Reply with WHT RENT or WHT CONTRACT or WHT PROFESSIONAL."
-
-
-def handle_paye_estimate(raw_text: str) -> str:
-    """
-    Minimal PAYE estimator scaffold.
-    IMPORTANT: We'll move rates/bands into Supabase config so you can update without redeploy.
-    """
-    # Parse key=val pairs
-    parts = raw_text.replace(",", " ").split()
-    kv = {}
-    for p in parts[1:]:
-        if "=" in p:
-            k, v = p.split("=", 1)
-            kv[k.strip().lower()] = v.strip()
-
-    def to_num(x):
-        try:
-            return float(x)
-        except:
-            return 0.0
-
-    gross = to_num(kv.get("gross", "0"))
-    pension = to_num(kv.get("pension", "0"))
-    nhf = to_num(kv.get("nhf", "0"))
-    nhis = to_num(kv.get("nhis", "0"))
-
-    if gross <= 0:
-        return "PAYE: Please send gross salary. Example: PAYE gross=250000 pension=0"
-
-    # CRA (Consolidated Relief Allowance) commonly referenced as:
-    # CRA = higher of (₦200,000 + 20% of gross) or (1% of gross + 20% of gross)
-    # We'll keep it configurable later; for now use the common form.
-    cra = max(200000 + 0.20 * gross, 0.01 * gross + 0.20 * gross)
-
-    deductions = pension + nhf + nhis
-    taxable = max(0.0, gross - cra - deductions)
-
-    # Progressive bands (common Nigeria PIT bands often cited):
-    # 7% first 300k, 11% next 300k, 15% next 500k, 19% next 500k, 21% next 1.6m, 24% above
-    # We'll keep it as an estimate and later store in Supabase config.
-    tax = progressive_tax_estimate(taxable)
-
-    return (
-        "PAYE Estimate (Guide Only)\n"
-        f"Gross: ₦{gross:,.2f}\n"
-        f"CRA (est.): ₦{cra:,.2f}\n"
-        f"Deductions (pension+nhf+nhis): ₦{deductions:,.2f}\n"
-        f"Taxable: ₦{taxable:,.2f}\n"
-        f"Estimated Annual Tax: ₦{tax:,.2f}\n\n"
-        "Reply: PAYE MONTHLY to convert to monthly, or MENU to go back."
-    )
-
-def progressive_tax_estimate(taxable: float) -> float:
-    bands = [
-        (300000, 0.07),
-        (300000, 0.11),
-        (500000, 0.15),
-        (500000, 0.19),
-        (1600000, 0.21),
-        (float("inf"), 0.24),
-    ]
-    remaining = taxable
-    total = 0.0
-    for limit, rate in bands:
-        chunk = min(remaining, limit)
-        if chunk <= 0:
-            break
-        total += chunk * rate
-        remaining -= chunk
-    return total
-
-
-# -------------------------
-# Idempotency + logging helpers
-# -------------------------
-def already_processed(message_id: str) -> bool:
-    if not (supabase and message_id):
-        return False
-    r = supabase.table("webhook_dedup").select("message_id").eq("message_id", message_id).limit(1).execute()
-    return bool(r.data)
-
-def mark_processed(message_id: str):
-    if not (supabase and message_id):
-        return
-    supabase.table("webhook_dedup").insert({
+# ------------------------------------------------------------
+# DB: Message log
+# ------------------------------------------------------------
+def log_message(wa_phone: str, direction: str, text: str, payload: dict, session_id: str | None, message_id: str | None):
+    supabase.table("flow_messages").insert({
+        "wa_phone": wa_phone,
+        "direction": direction,
+        "text": text,
+        "payload": payload or {},
+        "session_id": session_id,
         "message_id": message_id,
-        "created_at": datetime.now(timezone.utc).isoformat()
+        "created_at": now_utc().isoformat(),
     }).execute()
 
-def log_event(event: dict):
-    if not supabase:
-        return
-    supabase.table("webhook_events").insert({
-        "received_at": datetime.now(timezone.utc).isoformat(),
-        "payload": event
-    }).execute()
+# ------------------------------------------------------------
+# Flow Engine: MENU + PAYE Calculator (starter)
+# ------------------------------------------------------------
+def normalize(s: str) -> str:
+    return (s or "").strip().lower()
 
+def parse_money(text: str) -> float | None:
+    """
+    Accepts inputs like:
+    500000
+    500,000
+    500000.50
+    """
+    t = (text or "").strip().replace(",", "")
+    try:
+        val = float(t)
+        if val < 0:
+            return None
+        return val
+    except Exception:
+        return None
 
-# -------------------------
-# Webhook endpoint
-# -------------------------
+def compute_paye_placeholder(gross: float, pension: float = 0.0, nhf: float = 0.0) -> dict:
+    """
+    Placeholder calculation. We will replace with the real PAYE logic next.
+    For now, returns the captured inputs and a simple taxable estimate.
+    """
+    taxable = max(gross - pension - nhf, 0.0)
+    return {
+        "gross": gross,
+        "pension": pension,
+        "nhf": nhf,
+        "taxable_estimate": taxable
+    }
+
+def handle_flow(session: dict, inbound_text: str) -> tuple[str, dict]:
+    """
+    Returns (reply_text, session_patch)
+    session_patch will be merged into DB update.
+    """
+    flow_key = session.get("flow_key", "menu")
+    step = session.get("current_step", "start")
+    ctx = session.get("context") or {}
+
+    t = normalize(inbound_text)
+
+    # Global commands
+    if t in {"menu", "start", "home"}:
+        return (
+            "Naija Hustle Tax Guide\n"
+            "Reply with a number:\n"
+            "1) Calculators\n"
+            "2) Guides\n"
+            "3) Help\n\n"
+            "Type MENU anytime to return here.",
+            {
+                "flow_key": "menu",
+                "current_step": "main_menu",
+                "step_index": 0,
+                "context": {},
+                "expires_at": expires_at_utc(SESSION_TTL_MINUTES).isoformat(),
+            }
+        )
+
+    if t in {"cancel", "stop"}:
+        return (
+            "Session cancelled. Type MENU to start again.",
+            {
+                "status": "cancelled",
+                "expires_at": now_utc().isoformat(),
+            }
+        )
+
+    # -------------------------
+    # MENU flow
+    # -------------------------
+    if flow_key == "menu":
+        if step in {"start", "main_menu"}:
+            if t in {"1", "calculators", "calc"}:
+                return (
+                    "Calculators\n"
+                    "Reply with a number:\n"
+                    "1) PAYE (Salary Tax)\n"
+                    "2) VAT\n"
+                    "3) Withholding Tax (WHT)\n\n"
+                    "Type MENU to go back.",
+                    {
+                        "current_step": "calc_menu",
+                        "step_index": 1,
+                        "expires_at": expires_at_utc(SESSION_TTL_MINUTES).isoformat(),
+                    }
+                )
+            if t in {"2", "guides", "guide"}:
+                return (
+                    "Guides\n"
+                    "Reply with a number:\n"
+                    "1) PAYE Guide\n"
+                    "2) VAT Guide\n"
+                    "3) Filing & Compliance\n\n"
+                    "Type MENU to go back.",
+                    {
+                        "current_step": "guides_menu",
+                        "step_index": 1,
+                        "expires_at": expires_at_utc(SESSION_TTL_MINUTES).isoformat(),
+                    }
+                )
+            if t in {"3", "help"}:
+                return (
+                    "Help\n"
+                    "- Type MENU anytime to return home\n"
+                    "- Type CANCEL to stop a session\n"
+                    "- Use numbers to select options\n\n"
+                    "Reply MENU to continue.",
+                    {
+                        "current_step": "help",
+                        "step_index": 1,
+                        "expires_at": expires_at_utc(SESSION_TTL_MINUTES).isoformat(),
+                    }
+                )
+
+            return ("Please reply with 1, 2, or 3. Type MENU to restart.", {})
+
+        if step == "calc_menu":
+            if t in {"1", "paye"}:
+                return (
+                    "PAYE Calculator\n"
+                    "Enter your monthly GROSS salary (e.g., 500000):",
+                    {
+                        "flow_key": "paye_calc",
+                        "current_step": "ask_gross",
+                        "step_index": 0,
+                        "context": {},
+                        "expires_at": expires_at_utc(SESSION_TTL_MINUTES).isoformat(),
+                    }
+                )
+            if t in {"2", "vat"}:
+                return ("VAT calculator is next. Type MENU for now.", {})
+            if t in {"3", "wht"}:
+                return ("WHT calculator is next. Type MENU for now.", {})
+
+            return ("Please reply with 1, 2, or 3. Type MENU to go back.", {})
+
+        if step == "guides_menu":
+            # We’ll implement guides as content retrieval next
+            return ("Guides will be added next. Type MENU to go back.", {})
+
+        return ("Type MENU to begin.", {})
+
+    # -------------------------
+    # PAYE calculator flow (multi-step)
+    # -------------------------
+    if flow_key == "paye_calc":
+        if step == "ask_gross":
+            gross = parse_money(inbound_text)
+            if gross is None or gross <= 0:
+                return ("Please enter a valid gross amount (example: 500000).", {})
+            ctx["gross"] = gross
+            return (
+                "Enter your monthly PENSION amount (enter 0 if none):",
+                {
+                    "current_step": "ask_pension",
+                    "step_index": 1,
+                    "context": ctx,
+                    "expires_at": expires_at_utc(SESSION_TTL_MINUTES).isoformat(),
+                }
+            )
+
+        if step == "ask_pension":
+            pension = parse_money(inbound_text)
+            if pension is None or pension < 0:
+                return ("Please enter a valid pension amount (example: 20000) or 0.", {})
+            ctx["pension"] = pension
+            return (
+                "Enter your monthly NHF amount (enter 0 if none):",
+                {
+                    "current_step": "ask_nhf",
+                    "step_index": 2,
+                    "context": ctx,
+                    "expires_at": expires_at_utc(SESSION_TTL_MINUTES).isoformat(),
+                }
+            )
+
+        if step == "ask_nhf":
+            nhf = parse_money(inbound_text)
+            if nhf is None or nhf < 0:
+                return ("Please enter a valid NHF amount or 0.", {})
+            ctx["nhf"] = nhf
+
+            result = compute_paye_placeholder(
+                gross=float(ctx.get("gross", 0)),
+                pension=float(ctx.get("pension", 0)),
+                nhf=float(ctx.get("nhf", 0)),
+            )
+
+            # We end this calculator session after result for cleanliness
+            reply = (
+                "PAYE Calculator (Draft Result)\n"
+                f"- Gross: {result['gross']:,}\n"
+                f"- Pension: {result['pension']:,}\n"
+                f"- NHF: {result['nhf']:,}\n"
+                f"- Taxable Estimate: {result['taxable_estimate']:,}\n\n"
+                "Next: I will plug in the correct PAYE bands + CRA rules.\n"
+                "Type MENU to do another calculation."
+            )
+            return (
+                reply,
+                {
+                    "current_step": "done",
+                    "status": "completed",
+                    "context": ctx,
+                    "expires_at": now_utc().isoformat(),
+                }
+            )
+
+        return ("Type MENU to start over.", {})
+
+    # Fallback
+    return ("Type MENU to begin.", {})
+
+# ------------------------------------------------------------
+# Webhook
+# ------------------------------------------------------------
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
-    # --- Verification (Meta GET)
+    # ---- Webhook verification (Meta) ----
     if request.method == "GET":
         mode = request.args.get("hub.mode")
         token = request.args.get("hub.verify_token")
         challenge = request.args.get("hub.challenge")
 
         if mode == "subscribe" and token == VERIFY_TOKEN:
-            return challenge, 200
-        abort(403)
+            return (challenge or ""), 200
+        return abort(403)
 
-    # --- Incoming webhook (Meta POST)
-    if not verify_meta_signature(request):
-        abort(403)
+    # ---- Incoming events ----
+    if request.method == "POST":
+        if not verify_signature(request):
+            return abort(403)
 
-    data = request.get_json(silent=True) or {}
-    log_event(data)
+        payload = request.get_json(silent=True) or {}
 
-    # WhatsApp message payload shape: entry[0].changes[0].value.messages[0]
-    try:
-        entry = data.get("entry", [])
-        if not entry:
+        inbound = extract_inbound_text(payload)
+        if not inbound:
+            # This can happen for status updates (delivered/read) etc.
             return "EVENT_RECEIVED", 200
 
-        changes = entry[0].get("changes", [])
-        if not changes:
-            return "EVENT_RECEIVED", 200
+        wa_phone = inbound["wa_phone"]
+        text = inbound["text"]
+        meta_msg_id = inbound["message_id"]
 
-        value = changes[0].get("value", {})
-        messages = value.get("messages", [])
+        # log inbound
+        log_message(
+            wa_phone=wa_phone,
+            direction="inbound",
+            text=text,
+            payload=inbound.get("raw") or {},
+            session_id=None,
+            message_id=meta_msg_id
+        )
 
-        # Status updates may arrive without messages
-        if not messages:
-            return "EVENT_RECEIVED", 200
+        # ensure user
+        user = get_or_create_user(wa_phone)
+        session = get_active_session(wa_phone)
 
-        msg = messages[0]
-        message_id = msg.get("id", "")
-        from_phone = msg.get("from", "")
-        text = (msg.get("text") or {}).get("body", "")
+        # if none, create session and show menu immediately
+        if not session:
+            session = create_session(wa_phone=wa_phone, user_id=user["id"], flow_key="menu")
 
-        if message_id and already_processed(message_id):
-            return "EVENT_RECEIVED", 200
+        # handle flow
+        reply_text, patch = handle_flow(session, text)
 
-        reply = route_message(text)
+        # if patch ends session, update accordingly
+        if patch.get("status") in {"completed", "cancelled", "expired", "error"}:
+            updated = update_session(session["id"], patch)
+            session_id = updated["id"]
+        else:
+            # always refresh last_inbound + expiry
+            patch.setdefault("last_inbound_at", now_utc().isoformat())
+            patch.setdefault("expires_at", expires_at_utc(SESSION_TTL_MINUTES).isoformat())
+            updated = update_session(session["id"], patch)
+            session_id = updated["id"]
 
-        # send reply (only if token configured)
-        if from_phone and reply:
-            ok, info = send_whatsapp_text(from_phone, reply)
-            # Optional: store reply status
-            if supabase:
-                supabase.table("outbound_messages").insert({
-                    "message_id": message_id or None,
-                    "to_phone": from_phone,
-                    "inbound_text": text,
-                    "reply_text": reply,
-                    "sent_ok": ok,
-                    "send_info": info,
-                    "created_at": datetime.now(timezone.utc).isoformat()
-                }).execute()
+        # log outbound (note: actual sending to WhatsApp happens in your send-message function later)
+        log_message(
+            wa_phone=wa_phone,
+            direction="outbound",
+            text=reply_text,
+            payload={"note": "reply_generated_locally"},
+            session_id=session_id,
+            message_id=None
+        )
 
-        if message_id:
-            mark_processed(message_id)
+        # For now, return the reply as JSON (useful for testing)
+        # In production, you'll call WhatsApp Cloud API to send message instead.
+        return jsonify({"reply": reply_text}), 200
 
-    except Exception as e:
-        # Do not break webhook; Meta expects fast 200
-        print(f"Webhook processing error: {e}")
-
-    return "EVENT_RECEIVED", 200
-
-
-# -------------------------
-# Koyeb entrypoint
-# -------------------------
+# ------------------------------------------------------------
+# Entrypoint (Koyeb)
+# ------------------------------------------------------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     app.run(host="0.0.0.0", port=port, debug=False)
