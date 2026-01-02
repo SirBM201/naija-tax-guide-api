@@ -1,5 +1,4 @@
 import os
-import json
 import hmac
 import hashlib
 from datetime import datetime, timedelta, timezone
@@ -8,7 +7,6 @@ from typing import Any, Dict, Optional, Tuple, List
 import requests
 from flask import Flask, request, jsonify
 from supabase import create_client
-
 
 # ------------------------------------------------------------
 # App / Env
@@ -36,6 +34,9 @@ if not WHATSAPP_TOKEN or not WHATSAPP_PHONE_NUMBER_ID or not WHATSAPP_VERIFY_TOK
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 WA_MESSAGES_URL = f"https://graph.facebook.com/v21.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
+
+# Reuse HTTP connection (faster + more stable)
+_http = requests.Session()
 
 
 # ------------------------------------------------------------
@@ -71,7 +72,14 @@ def send_reply(wa_phone: str, text: str) -> None:
         "text": {"body": text},
     }
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
-    requests.post(WA_MESSAGES_URL, headers=headers, json=payload, timeout=30)
+    try:
+        r = _http.post(WA_MESSAGES_URL, headers=headers, json=payload, timeout=30)
+        # Do not crash the worker if WA fails
+        if r.status_code >= 400:
+            # Optional: you can log r.text into DB later
+            pass
+    except Exception:
+        pass
 
 
 def log_event(wa_phone: str, event: str, meta: Optional[Dict[str, Any]] = None) -> None:
@@ -90,7 +98,6 @@ def log_event(wa_phone: str, event: str, meta: Optional[Dict[str, Any]] = None) 
 # ------------------------------------------------------------
 def upsert_user_profile(wa_phone: str) -> None:
     try:
-        # users.wa_phone is UNIQUE
         supabase.table("users").upsert({
             "wa_phone": wa_phone,
             "last_seen_at": iso(now_utc()),
@@ -130,13 +137,12 @@ def get_user_plan(wa_phone: str) -> str:
 
 
 # ------------------------------------------------------------
-# BILLING GUARD (Block 4 foundation)
-# Put this in billing/guard.py later if you want. For now, keep it stable here.
+# BILLING GUARD (keep in app.py for now; move later)
 # ------------------------------------------------------------
 def can_use_flow(user_plan: str, flow_key: str) -> bool:
     """
-    MVP: allow menu + onboarding + vat + paye on free.
-    Later you can restrict: free only menu + vat, paid for paye/business advanced.
+    MVP: allow these flows on free.
+    Later: restrict advanced flows to paid plans.
     """
     flow_key = (flow_key or "").lower()
     user_plan = (user_plan or "free").lower()
@@ -148,7 +154,7 @@ def can_use_flow(user_plan: str, flow_key: str) -> bool:
 
 
 # ------------------------------------------------------------
-# FLOW SESSIONS (matches your existing schema columns)
+# FLOW SESSIONS (matches your existing schema)
 # - status: active | expired | cancelled | switched_flow | restarted
 # ------------------------------------------------------------
 def get_active_session(wa_phone: str) -> Optional[Dict[str, Any]]:
@@ -258,24 +264,22 @@ def detect_flow_start(message_text: str) -> Optional[str]:
 
 # ------------------------------------------------------------
 # BLOCK 1: PAYE CALCULATOR FLOW
-# (Configurable brackets from public.paye_brackets)
-# Steps:
-#  PAYE_ASK_GROSS -> PAYE_ASK_PENSION -> PAYE_ASK_OTHER_DED -> PAYE_SHOW
 # ------------------------------------------------------------
 def fetch_paye_brackets() -> List[Dict[str, Any]]:
-    res = supabase.table("paye_brackets") \
-        .select("band_min, band_max, rate, sort_order") \
-        .eq("country_code", "NG") \
-        .eq("period", "monthly") \
-        .order("sort_order", desc=False) \
-        .execute()
-    return res.data or []
+    try:
+        res = supabase.table("paye_brackets") \
+            .select("band_min, band_max, rate, sort_order") \
+            .eq("country_code", "NG") \
+            .eq("period", "monthly") \
+            .order("sort_order", desc=False) \
+            .execute()
+        return res.data or []
+    except Exception:
+        return []
 
 
 def compute_progressive_tax(taxable: float, brackets: List[Dict[str, Any]]) -> float:
     tax = 0.0
-    remaining = taxable
-
     for b in brackets:
         band_min = float(b["band_min"])
         band_max = b.get("band_max")
@@ -285,8 +289,6 @@ def compute_progressive_tax(taxable: float, brackets: List[Dict[str, Any]]) -> f
             continue
 
         upper = float(band_max) if band_max is not None else None
-        band_amount = 0.0
-
         if upper is None:
             band_amount = max(0.0, taxable - band_min)
         else:
@@ -347,20 +349,17 @@ def paye_flow_reply(session: Dict[str, Any], message_text: str) -> Tuple[str, Di
         pension_pct = float(ctx.get("pension_pct", 0))
         pension_amt = gross * (pension_pct / 100.0)
 
-        # CRA foundation (CONFIGURABLE LATER):
-        # annual CRA often used as (20% of gross annual + fixed amount).
-        # For MVP, we implement a simple monthly CRA approximation to avoid hardcoding:
-        # You can later store CRA rules in DB and compute accurately.
+        # CRA (config later)
         cra_monthly = 0.0
-        cra_pct = float(os.getenv("CRA_PCT", "0"))  # set later if desired
-        cra_fixed_monthly = float(os.getenv("CRA_FIXED_MONTHLY", "0"))  # set later if desired
+        cra_pct = float(os.getenv("CRA_PCT", "0"))
+        cra_fixed_monthly = float(os.getenv("CRA_FIXED_MONTHLY", "0"))
         if cra_pct > 0:
             cra_monthly = gross * (cra_pct / 100.0) + cra_fixed_monthly
 
         taxable = max(0.0, gross - pension_amt - float(other) - cra_monthly)
 
         brackets = fetch_paye_brackets()
-        tax = compute_progressive_tax(taxable, brackets)
+        tax = compute_progressive_tax(taxable, brackets) if brackets else 0.0
 
         ctx.update({
             "other_deductions": float(other),
@@ -388,7 +387,7 @@ def paye_flow_reply(session: Dict[str, Any], message_text: str) -> Tuple[str, Di
 
 
 # ------------------------------------------------------------
-# VAT FLOW (kept)
+# VAT FLOW
 # ------------------------------------------------------------
 def vat_flow_reply(session: Dict[str, Any], message_text: str) -> Tuple[str, Dict[str, Any]]:
     ctx = session.get("context") or {}
@@ -447,9 +446,7 @@ def vat_flow_reply(session: Dict[str, Any], message_text: str) -> Tuple[str, Dic
 
 
 # ------------------------------------------------------------
-# BLOCK 2: BUSINESS GUIDE SYSTEM
-# - Onboarding writes business_profiles
-# - GUIDE flow returns guides from DB
+# BLOCK 2: BUSINESS + GUIDE
 # ------------------------------------------------------------
 def save_business_profile(wa_phone: str, patch: Dict[str, Any]) -> None:
     data = {"wa_phone": wa_phone, **patch, "updated_at": iso(now_utc())}
@@ -488,7 +485,6 @@ def hustle_onboarding_reply(session: Dict[str, Any], message_text: str) -> Tuple
         ctx["registered"] = yn in ["yes", "y"]
         patch = {"current_step": "HB_DONE", "step_index": 4, "context": ctx}
 
-        # Persist profile
         try:
             save_business_profile(session["wa_phone"], {
                 "business_type": ctx.get("business_type"),
@@ -545,10 +541,7 @@ def guide_flow_reply(session: Dict[str, Any], message_text: str) -> Tuple[str, D
 
 
 # ------------------------------------------------------------
-# BLOCK 3: REMINDERS + OUTBOUND QUEUE (cron-safe)
-#  - /tasks/expire_sessions    -> marks expired sessions
-#  - /tasks/queue_reminders    -> enqueues reminder messages
-#  - /tasks/dispatch_outbound  -> sends queued WhatsApp messages
+# BLOCK 3: REMINDERS + OUTBOUND QUEUE
 # ------------------------------------------------------------
 @app.get("/tasks/expire_sessions")
 def expire_sessions():
@@ -573,12 +566,6 @@ def expire_sessions():
 
 @app.get("/tasks/queue_reminders")
 def queue_reminders():
-    """
-    Enqueue reminders for users who were inactive.
-    Safe approach:
-      - find users last_seen_at older than X hours
-      - do not spam: only queue if no recent queued reminder in last 24h
-    """
     try:
         hours = int(request.args.get("hours", "24"))
         inactive_since = iso(now_utc() - timedelta(hours=hours))
@@ -594,7 +581,6 @@ def queue_reminders():
         for u in users:
             phone = u["wa_phone"]
 
-            # prevent frequent reminders
             recent = supabase.table("outbound_queue") \
                 .select("id") \
                 .eq("wa_phone", phone) \
@@ -631,9 +617,6 @@ def queue_reminders():
 
 @app.get("/tasks/dispatch_outbound")
 def dispatch_outbound():
-    """
-    Send queued messages. Call this from an external cron (or manual).
-    """
     try:
         batch = supabase.table("outbound_queue") \
             .select("*") \
@@ -669,14 +652,11 @@ def dispatch_outbound():
 
 
 # ------------------------------------------------------------
-# BLOCK 4: UPGRADE FLOW + PAYSTACK FOUNDATION
-# - "UPGRADE" keyword shows plan options
-# - /paystack/initialize creates a payment record (stub)
-# - /paystack/webhook verifies and marks success (skeleton)
+# BLOCK 4: UPGRADE + PAYSTACK FOUNDATION
 # ------------------------------------------------------------
 PLAN_PRICES = {
-    "basic": 200000,  # kobo => ₦2,000 (placeholder)
-    "pro":   500000,  # ₦5,000 (placeholder)
+    "basic": 200000,  # kobo => ₦2,000 placeholder
+    "pro":   500000,  # ₦5,000 placeholder
 }
 
 
@@ -698,7 +678,6 @@ def create_payment_record(wa_phone: str, plan: str) -> Dict[str, Any]:
     if amount_kobo is None:
         raise ValueError("invalid_plan")
 
-    # reference can be generated later by Paystack; we store our own placeholder
     reference = f"local_{wa_phone}_{int(now_utc().timestamp())}_{plan}"
 
     res = supabase.table("payments").insert({
@@ -717,11 +696,6 @@ def create_payment_record(wa_phone: str, plan: str) -> Dict[str, Any]:
 
 @app.post("/paystack/initialize")
 def paystack_initialize():
-    """
-    Foundation endpoint.
-    Later: call Paystack initialize API using PAYSTACK_SECRET_KEY and return authorization_url.
-    For now: creates payment record + returns reference.
-    """
     data = request.get_json(silent=True) or {}
     wa_phone = safe_text(data.get("wa_phone"))
     plan = safe_text(data.get("plan")).lower()
@@ -731,7 +705,6 @@ def paystack_initialize():
 
     try:
         payment = create_payment_record(wa_phone, plan)
-        # Later: replace this with real authorization_url from Paystack
         return jsonify({
             "status": "ok",
             "reference": payment["reference"],
@@ -745,10 +718,6 @@ def paystack_initialize():
 
 @app.post("/paystack/webhook")
 def paystack_webhook():
-    """
-    Skeleton verification. Paystack typically sends x-paystack-signature header.
-    Later: verify with HMAC SHA512 using PAYSTACK_SECRET_KEY.
-    """
     raw = request.get_data() or b""
     sig = request.headers.get("x-paystack-signature", "")
 
@@ -757,15 +726,12 @@ def paystack_webhook():
         if not hmac.compare_digest(expected, sig):
             return "invalid signature", 401
 
-    event = request.get_json(silent=True) or {}
-    # You will map Paystack payload to:
-    # reference, status, plan, customer phone/email, etc.
-    # For MVP skeleton, we just ACK.
+    # For now: ACK only
     return "ok", 200
 
 
 # ------------------------------------------------------------
-# ROUTER: map flow_key -> flow handler
+# ROUTER
 # ------------------------------------------------------------
 def route_flow(session: Dict[str, Any], message_text: str) -> Tuple[str, Dict[str, Any]]:
     fk = (session.get("flow_key") or "").lower()
@@ -830,7 +796,7 @@ def webhook_receive():
                         send_reply(wa_phone, "Please send a text message. Type *menu* to begin.")
                         continue
 
-                    text = msg.get("text", {}).get("body", "")
+                    text = (msg.get("text") or {}).get("body", "")
                     handle_inbound(wa_phone, text, msg)
 
         return jsonify({"status": "ok"}), 200
@@ -875,7 +841,6 @@ def handle_inbound(wa_phone: str, message_text: str, raw_msg: Dict[str, Any]) ->
             send_reply(wa_phone, "❌ Invalid plan. Reply: UPGRADE BASIC or UPGRADE PRO")
             return
 
-        # Create payment record (foundation)
         try:
             p = create_payment_record(wa_phone, plan)
             send_reply(
@@ -891,7 +856,7 @@ def handle_inbound(wa_phone: str, message_text: str, raw_msg: Dict[str, Any]) ->
             send_reply(wa_phone, "❌ Could not initialize upgrade. Try again later.")
         return
 
-    # Active session handling
+    # Active session
     active = get_active_session(wa_phone)
     if active and session_expired(active):
         close_active_session(wa_phone, reason="expired")
@@ -916,12 +881,12 @@ def handle_inbound(wa_phone: str, message_text: str, raw_msg: Dict[str, Any]) ->
         log_event(wa_phone, "FLOW_STARTED", {"flow": flow_key})
 
         reply, patch = route_flow(session, "")
-        if patch:
+        if patch and session.get("id"):
             update_session(session["id"], patch)
         send_reply(wa_phone, reply)
         return
 
-    # No flow + no active session => prompt menu
+    # No flow + no session
     if not active:
         send_reply(
             wa_phone,
@@ -929,7 +894,7 @@ def handle_inbound(wa_phone: str, message_text: str, raw_msg: Dict[str, Any]) ->
         )
         return
 
-    # Continue existing session
+    # Continue flow
     try:
         update_session(active["id"], {"last_inbound_at": iso(now_utc())})
     except Exception:
@@ -937,7 +902,15 @@ def handle_inbound(wa_phone: str, message_text: str, raw_msg: Dict[str, Any]) ->
 
     reply, patch = route_flow(active, text)
     if patch:
-        update_session(active["id"], patch)
+        try:
+            update_session(active["id"], patch)
+        except Exception:
+            pass
 
     send_reply(wa_phone, reply)
     log_event(wa_phone, "OUTBOUND", {"flow": active.get("flow_key")})
+
+
+# Local run (optional)
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
