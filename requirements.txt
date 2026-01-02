@@ -1,5 +1,13 @@
 Flask==3.0.3
 gunicorn==22.0.0
+requests==2.32.3
+
+# Supabase client (this is the missing package)
 supabase==2.6.0
-httpx==0.27.0
+postgrest==0.16.11
+gotrue==2.9.1
+realtime==2.0.6
+storage3==0.7.7
+supafunc==0.5.5
+httpx==0.27.2
 python-dotenv==1.0.1
