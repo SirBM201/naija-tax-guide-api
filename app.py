@@ -1,13 +1,12 @@
 import os
 import json
-import time
+import hmac
+import hashlib
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
 import requests
 from flask import Flask, request, jsonify
-
-# Supabase python client
 from supabase import create_client
 
 
@@ -23,7 +22,11 @@ WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "")
 WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
 WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
 
+PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY", "")  # optional for now
+
 SERVICE_NAME = os.getenv("SERVICE_NAME", "naija-tax-guide-api")
+DEFAULT_SESSION_TTL_HOURS = int(os.getenv("SESSION_TTL_HOURS", "24"))
+OUTBOUND_BATCH_SIZE = int(os.getenv("OUTBOUND_BATCH_SIZE", "20"))
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
     raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
@@ -33,7 +36,6 @@ if not WHATSAPP_TOKEN or not WHATSAPP_PHONE_NUMBER_ID or not WHATSAPP_VERIFY_TOK
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 WA_MESSAGES_URL = f"https://graph.facebook.com/v21.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
-DEFAULT_SESSION_TTL_HOURS = int(os.getenv("SESSION_TTL_HOURS", "24"))
 
 
 # ------------------------------------------------------------
@@ -43,12 +45,25 @@ def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def iso(dt: datetime) -> str:
+    return dt.isoformat()
+
+
 def safe_text(s: Any) -> str:
     return (s or "").strip()
 
 
+def to_number(s: str) -> Optional[float]:
+    try:
+        s = safe_text(s).replace(",", "")
+        if s == "":
+            return None
+        return float(s)
+    except Exception:
+        return None
+
+
 def send_reply(wa_phone: str, text: str) -> None:
-    """Send a WhatsApp text message via Cloud API."""
     payload = {
         "messaging_product": "whatsapp",
         "to": wa_phone,
@@ -56,13 +71,10 @@ def send_reply(wa_phone: str, text: str) -> None:
         "text": {"body": text},
     }
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
-    r = requests.post(WA_MESSAGES_URL, headers=headers, json=payload, timeout=30)
-    # If you want, you can log r.status_code / r.text to Supabase events.
-    return
+    requests.post(WA_MESSAGES_URL, headers=headers, json=payload, timeout=30)
 
 
 def log_event(wa_phone: str, event: str, meta: Optional[Dict[str, Any]] = None) -> None:
-    """Lightweight analytics. Safe to fail silently."""
     try:
         supabase.table("events").insert({
             "wa_phone": wa_phone,
@@ -74,42 +86,37 @@ def log_event(wa_phone: str, event: str, meta: Optional[Dict[str, Any]] = None) 
 
 
 # ------------------------------------------------------------
-# 1) User Profile (one row per phone)
+# USERS + SUBSCRIPTIONS
 # ------------------------------------------------------------
 def upsert_user_profile(wa_phone: str) -> None:
-    """Ensure one user row exists for each phone. Minimal fields for now."""
     try:
+        # users.wa_phone is UNIQUE
         supabase.table("users").upsert({
             "wa_phone": wa_phone,
-            "last_seen_at": now_utc().isoformat(),
+            "last_seen_at": iso(now_utc()),
+            "updated_at": iso(now_utc())
         }, on_conflict="wa_phone").execute()
     except Exception:
-        # Don't block the bot if profile fails
         pass
 
 
 def get_user_plan(wa_phone: str) -> str:
-    """
-    Subscription plan lookup.
-    Table: user_subscriptions (wa_phone PK, plan text, expires_at timestamptz)
-    If missing or expired -> free
-    """
     try:
         res = supabase.table("user_subscriptions") \
-            .select("plan, expires_at") \
-            .eq("wa_phone", wa_phone) \
-            .limit(1) \
-            .execute()
-
+            .select("plan, status, expires_at") \
+            .eq("wa_phone", wa_phone).limit(1).execute()
         if not res.data:
             return "free"
 
         row = res.data[0]
-        plan = row.get("plan") or "free"
+        plan = (row.get("plan") or "free").lower()
+        status = (row.get("status") or "active").lower()
         expires_at = row.get("expires_at")
 
+        if status != "active":
+            return "free"
+
         if expires_at:
-            # if expires_at is passed, downgrade
             try:
                 exp = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
                 if exp < now_utc():
@@ -123,27 +130,26 @@ def get_user_plan(wa_phone: str) -> str:
 
 
 # ------------------------------------------------------------
-# 2) Guard / Monetization Gate (foundation)
+# BILLING GUARD (Block 4 foundation)
+# Put this in billing/guard.py later if you want. For now, keep it stable here.
 # ------------------------------------------------------------
 def can_use_flow(user_plan: str, flow_key: str) -> bool:
     """
-    Start permissive. Tighten later by editing FREE_LIMITED.
-    Example:
-      FREE_LIMITED = ["hustler_onboarding"]
-      if user_plan == "free" and flow_key not in FREE_LIMITED: return False
+    MVP: allow menu + onboarding + vat + paye on free.
+    Later you can restrict: free only menu + vat, paid for paye/business advanced.
     """
-    FREE_LIMITED = ["hustler_onboarding", "vat", "menu"]  # keep MVP usable
+    flow_key = (flow_key or "").lower()
+    user_plan = (user_plan or "free").lower()
+
+    FREE_ALLOWED = {"menu", "vat", "hustler_onboarding", "paye", "guide"}
     if user_plan == "free":
-        return flow_key in FREE_LIMITED
+        return flow_key in FREE_ALLOWED
     return True
 
 
 # ------------------------------------------------------------
-# 3) Sessions (Supabase flow_sessions)
-# Your actual columns (based on your screenshot):
-# id, wa_phone, user_id, flow_key, status, current_step, step_index,
-# context, meta, locked_by, locked_at, last_inbound_at, last_outbound_at,
-# expires_at, created_at, updated_at
+# FLOW SESSIONS (matches your existing schema columns)
+# - status: active | expired | cancelled | switched_flow | restarted
 # ------------------------------------------------------------
 def get_active_session(wa_phone: str) -> Optional[Dict[str, Any]]:
     try:
@@ -152,20 +158,16 @@ def get_active_session(wa_phone: str) -> Optional[Dict[str, Any]]:
             .eq("wa_phone", wa_phone) \
             .eq("status", "active") \
             .order("updated_at", desc=True) \
-            .limit(1) \
-            .execute()
-        if not res.data:
-            return None
-        return res.data[0]
+            .limit(1).execute()
+        return res.data[0] if res.data else None
     except Exception:
         return None
 
 
 def close_active_session(wa_phone: str, reason: str = "closed") -> None:
     try:
-        # close ALL active sessions for this phone (simple + safe)
         supabase.table("flow_sessions") \
-            .update({"status": reason, "updated_at": now_utc().isoformat()}) \
+            .update({"status": reason, "updated_at": iso(now_utc())}) \
             .eq("wa_phone", wa_phone) \
             .eq("status", "active") \
             .execute()
@@ -174,7 +176,7 @@ def close_active_session(wa_phone: str, reason: str = "closed") -> None:
 
 
 def create_session(wa_phone: str, flow_key: str) -> Dict[str, Any]:
-    expires_at = (now_utc() + timedelta(hours=DEFAULT_SESSION_TTL_HOURS)).isoformat()
+    expires_at = iso(now_utc() + timedelta(hours=DEFAULT_SESSION_TTL_HOURS))
     row = {
         "wa_phone": wa_phone,
         "flow_key": flow_key,
@@ -183,21 +185,32 @@ def create_session(wa_phone: str, flow_key: str) -> Dict[str, Any]:
         "step_index": 1,
         "context": {},
         "meta": {},
-        "last_inbound_at": now_utc().isoformat(),
+        "last_inbound_at": iso(now_utc()),
         "expires_at": expires_at,
-        "updated_at": now_utc().isoformat(),
+        "updated_at": iso(now_utc()),
     }
     res = supabase.table("flow_sessions").insert(row).execute()
     return res.data[0] if res.data else row
 
 
 def update_session(session_id: Any, patch: Dict[str, Any]) -> None:
-    patch["updated_at"] = now_utc().isoformat()
+    patch["updated_at"] = iso(now_utc())
     supabase.table("flow_sessions").update(patch).eq("id", session_id).execute()
 
 
+def session_expired(session: Dict[str, Any]) -> bool:
+    exp = session.get("expires_at")
+    if not exp:
+        return False
+    try:
+        dt = datetime.fromisoformat(exp.replace("Z", "+00:00"))
+        return dt < now_utc()
+    except Exception:
+        return False
+
+
 # ------------------------------------------------------------
-# 4) Commands / Menu
+# COMMANDS / MENU
 # ------------------------------------------------------------
 def handle_command(message_text: str) -> Optional[Dict[str, Any]]:
     cmd = safe_text(message_text).lower()
@@ -206,13 +219,15 @@ def handle_command(message_text: str) -> Optional[Dict[str, Any]]:
         return {
             "reply": (
                 "📌 *Naija Hustle Tax Guide*\n\n"
-                "Reply with any option:\n"
+                "Reply any option:\n"
                 "• VAT – VAT calculator\n"
+                "• PAYE – PAYE estimator\n"
                 "• BUSINESS – Hustler onboarding\n"
-                "• PAYE – Salary tax (coming next)\n\n"
+                "• GUIDE – Quick tax guides\n\n"
                 "Commands:\n"
                 "• restart – start over\n"
-                "• cancel – end session"
+                "• cancel – end session\n"
+                "• upgrade – paid plans (foundation)"
             )
         }
 
@@ -221,6 +236,9 @@ def handle_command(message_text: str) -> Optional[Dict[str, Any]]:
 
     if cmd == "cancel":
         return {"action": "cancel"}
+
+    if cmd == "upgrade":
+        return {"action": "upgrade"}
 
     return None
 
@@ -233,167 +251,317 @@ def detect_flow_start(message_text: str) -> Optional[str]:
         return "hustler_onboarding"
     if t in ["paye", "salary", "salary tax"]:
         return "paye"
+    if t in ["guide", "guides", "tax guide", "tax guides"]:
+        return "guide"
     return None
 
 
 # ------------------------------------------------------------
-# VAT Flow
+# BLOCK 1: PAYE CALCULATOR FLOW
+# (Configurable brackets from public.paye_brackets)
 # Steps:
-#   VAT_ASK_SALES -> VAT_ASK_INPUT -> VAT_SHOW
+#  PAYE_ASK_GROSS -> PAYE_ASK_PENSION -> PAYE_ASK_OTHER_DED -> PAYE_SHOW
+# ------------------------------------------------------------
+def fetch_paye_brackets() -> List[Dict[str, Any]]:
+    res = supabase.table("paye_brackets") \
+        .select("band_min, band_max, rate, sort_order") \
+        .eq("country_code", "NG") \
+        .eq("period", "monthly") \
+        .order("sort_order", desc=False) \
+        .execute()
+    return res.data or []
+
+
+def compute_progressive_tax(taxable: float, brackets: List[Dict[str, Any]]) -> float:
+    tax = 0.0
+    remaining = taxable
+
+    for b in brackets:
+        band_min = float(b["band_min"])
+        band_max = b.get("band_max")
+        rate = float(b["rate"])
+
+        if taxable <= band_min:
+            continue
+
+        upper = float(band_max) if band_max is not None else None
+        band_amount = 0.0
+
+        if upper is None:
+            band_amount = max(0.0, taxable - band_min)
+        else:
+            band_amount = max(0.0, min(taxable, upper) - band_min)
+
+        tax += band_amount * rate
+
+    return max(0.0, tax)
+
+
+def paye_flow_reply(session: Dict[str, Any], message_text: str) -> Tuple[str, Dict[str, Any]]:
+    ctx = session.get("context") or {}
+    step = session.get("current_step") or "START"
+    t = safe_text(message_text)
+
+    if step in ["START", "PAYE_ASK_GROSS"]:
+        patch = {"current_step": "PAYE_ASK_GROSS", "step_index": 1}
+        reply = (
+            "✅ *PAYE Estimator (Monthly)*\n\n"
+            "Enter your *monthly gross salary* (₦).\n"
+            "Example: 450000"
+        )
+        return reply, patch
+
+    if step == "PAYE_ASK_GROSS":
+        gross = to_number(t)
+        if gross is None or gross <= 0:
+            return "❌ Enter a valid gross salary amount. Example: 450000", {}
+        ctx["gross"] = gross
+        patch = {"current_step": "PAYE_ASK_PENSION", "step_index": 2, "context": ctx}
+        return (
+            f"Gross recorded: ₦{gross:,.2f}\n\n"
+            "Enter your *pension contribution %*.\n"
+            "Example: 8\n"
+            "If none, reply 0.",
+            patch
+        )
+
+    if step == "PAYE_ASK_PENSION":
+        pct = to_number(t)
+        if pct is None or pct < 0 or pct > 50:
+            return "❌ Enter a valid pension % (0 to 50). Example: 8", {}
+        ctx["pension_pct"] = pct
+        patch = {"current_step": "PAYE_ASK_OTHER_DED", "step_index": 3, "context": ctx}
+        return (
+            "Enter *other monthly tax-deductible items* (₦).\n"
+            "Example: NHF, NHIS, approved deductions.\n"
+            "If none, reply 0.",
+            patch
+        )
+
+    if step == "PAYE_ASK_OTHER_DED":
+        other = to_number(t)
+        if other is None or other < 0:
+            return "❌ Enter a valid amount. Example: 0 or 25000", {}
+
+        gross = float(ctx.get("gross", 0))
+        pension_pct = float(ctx.get("pension_pct", 0))
+        pension_amt = gross * (pension_pct / 100.0)
+
+        # CRA foundation (CONFIGURABLE LATER):
+        # annual CRA often used as (20% of gross annual + fixed amount).
+        # For MVP, we implement a simple monthly CRA approximation to avoid hardcoding:
+        # You can later store CRA rules in DB and compute accurately.
+        cra_monthly = 0.0
+        cra_pct = float(os.getenv("CRA_PCT", "0"))  # set later if desired
+        cra_fixed_monthly = float(os.getenv("CRA_FIXED_MONTHLY", "0"))  # set later if desired
+        if cra_pct > 0:
+            cra_monthly = gross * (cra_pct / 100.0) + cra_fixed_monthly
+
+        taxable = max(0.0, gross - pension_amt - float(other) - cra_monthly)
+
+        brackets = fetch_paye_brackets()
+        tax = compute_progressive_tax(taxable, brackets)
+
+        ctx.update({
+            "other_deductions": float(other),
+            "pension_amount": pension_amt,
+            "cra_monthly": cra_monthly,
+            "taxable_income": taxable,
+            "estimated_paye": tax
+        })
+
+        patch = {"current_step": "PAYE_SHOW", "step_index": 4, "context": ctx}
+
+        reply = (
+            "📊 *PAYE Estimate (Monthly)*\n\n"
+            f"• Gross: ₦{gross:,.2f}\n"
+            f"• Pension ({pension_pct}%): ₦{pension_amt:,.2f}\n"
+            f"• Other deductible: ₦{float(other):,.2f}\n"
+            f"• CRA (config): ₦{cra_monthly:,.2f}\n\n"
+            f"• Taxable: ₦{taxable:,.2f}\n"
+            f"✅ *Estimated PAYE:* ₦{tax:,.2f}\n\n"
+            "Type *menu* for options or *restart* to calculate again."
+        )
+        return reply, patch
+
+    return "Type *menu* to start.", {"current_step": "START", "step_index": 1}
+
+
+# ------------------------------------------------------------
+# VAT FLOW (kept)
 # ------------------------------------------------------------
 def vat_flow_reply(session: Dict[str, Any], message_text: str) -> Tuple[str, Dict[str, Any]]:
-    context = session.get("context") or {}
+    ctx = session.get("context") or {}
     step = session.get("current_step") or "START"
-
     t = safe_text(message_text)
 
     if step in ["START", "VAT_ASK_SALES"]:
         patch = {"current_step": "VAT_ASK_SALES", "step_index": 1}
-        reply = (
+        return (
             "✅ *VAT Calculator (Nigeria)*\n\n"
-            "Enter your *total sales/turnover amount* (₦).\n"
-            "Example: 1500000"
+            "Enter your *total sales/turnover amount* (₦).\nExample: 1500000",
+            patch
+        )
+
+    if step == "VAT_ASK_SALES":
+        sales = to_number(t)
+        if sales is None or sales < 0:
+            return "❌ Enter a valid sales amount. Example: 1500000", {}
+        ctx["sales"] = sales
+        patch = {"current_step": "VAT_ASK_INPUT", "step_index": 2, "context": ctx}
+        return (
+            f"Sales recorded: ₦{sales:,.2f}\n\n"
+            "Now enter your *input VAT* (₦). If none, reply 0.",
+            patch
+        )
+
+    if step == "VAT_ASK_INPUT":
+        input_vat = to_number(t)
+        if input_vat is None or input_vat < 0:
+            return "❌ Enter a valid input VAT amount. Example: 0 or 25000", {}
+        sales = float(ctx.get("sales", 0))
+        vat_rate = float(os.getenv("VAT_RATE", "0.075"))
+        output_vat = sales * vat_rate
+        net = output_vat - float(input_vat)
+
+        patch = {"current_step": "VAT_SHOW", "step_index": 3, "context": {
+            **ctx,
+            "input_vat": float(input_vat),
+            "output_vat": output_vat,
+            "net_vat": net
+        }}
+
+        verdict = f"✅ *VAT payable:* ₦{net:,.2f}" if net >= 0 else f"✅ *VAT credit:* ₦{abs(net):,.2f}"
+
+        reply = (
+            "📊 *VAT Summary*\n\n"
+            f"• Sales: ₦{sales:,.2f}\n"
+            f"• Output VAT: ₦{output_vat:,.2f}\n"
+            f"• Input VAT: ₦{float(input_vat):,.2f}\n\n"
+            f"{verdict}\n\n"
+            "Type *menu* for more options."
         )
         return reply, patch
 
-    if step == "VAT_ASK_SALES":
-        try:
-            sales = float(t.replace(",", ""))
-            if sales < 0:
-                raise ValueError("neg")
-            context["sales"] = sales
-            patch = {"current_step": "VAT_ASK_INPUT", "step_index": 2, "context": context}
-            reply = (
-                f"Sales recorded: ₦{sales:,.2f}\n\n"
-                "Now enter your *VAT paid on purchases (input VAT)* (₦).\n"
-                "If none, reply 0."
-            )
-            return reply, patch
-        except Exception:
-            return "❌ Please enter a valid number for sales (example: 1500000).", {}
-
-    if step == "VAT_ASK_INPUT":
-        try:
-            input_vat = float(t.replace(",", ""))
-            if input_vat < 0:
-                raise ValueError("neg")
-            sales = float(context.get("sales", 0))
-            vat_rate = 0.075  # 7.5%
-            output_vat = sales * vat_rate
-            net = output_vat - input_vat
-
-            context.update({
-                "input_vat": input_vat,
-                "output_vat": output_vat,
-                "net_vat": net
-            })
-
-            patch = {"current_step": "VAT_SHOW", "step_index": 3, "context": context}
-
-            if net >= 0:
-                verdict = f"✅ *Estimated VAT payable:* ₦{net:,.2f}"
-            else:
-                verdict = f"✅ *Estimated VAT credit/refund:* ₦{abs(net):,.2f}"
-
-            reply = (
-                "📊 *VAT Summary*\n\n"
-                f"• Sales: ₦{sales:,.2f}\n"
-                f"• Output VAT (7.5%): ₦{output_vat:,.2f}\n"
-                f"• Input VAT: ₦{input_vat:,.2f}\n\n"
-                f"{verdict}\n\n"
-                "Type *menu* for more options or *restart* to run again."
-            )
-            return reply, patch
-        except Exception:
-            return "❌ Please enter a valid number for input VAT (example: 25000).", {}
-
-    # fallback
     return "Type *menu* to start.", {"current_step": "START", "step_index": 1}
 
 
+# ------------------------------------------------------------
+# BLOCK 2: BUSINESS GUIDE SYSTEM
+# - Onboarding writes business_profiles
+# - GUIDE flow returns guides from DB
+# ------------------------------------------------------------
+def save_business_profile(wa_phone: str, patch: Dict[str, Any]) -> None:
+    data = {"wa_phone": wa_phone, **patch, "updated_at": iso(now_utc())}
+    supabase.table("business_profiles").upsert(data, on_conflict="wa_phone").execute()
+
+
 def hustle_onboarding_reply(session: Dict[str, Any], message_text: str) -> Tuple[str, Dict[str, Any]]:
-    """
-    Simple placeholder onboarding flow.
-    We'll expand this next (business type, state, registration, turnover, etc.)
-    """
-    context = session.get("context") or {}
+    ctx = session.get("context") or {}
     step = session.get("current_step") or "START"
     t = safe_text(message_text)
 
     if step in ["START", "HB_ASK_TYPE"]:
         patch = {"current_step": "HB_ASK_TYPE", "step_index": 1}
-        reply = (
+        return (
             "✅ *Hustler Onboarding*\n\n"
-            "What do you do?\n"
-            "Reply with a short description.\n"
-            "Example: POS agent / Fashion / Food / Freelancer"
+            "What do you do?\nExample: POS agent / Fashion / Food / Freelancer",
+            patch
         )
-        return reply, patch
 
     if step == "HB_ASK_TYPE":
-        context["business_type"] = t
-        patch = {"current_step": "HB_ASK_STATE", "step_index": 2, "context": context}
-        reply = "Which state are you operating from in Nigeria? (e.g., Lagos, Kano, Rivers)"
-        return reply, patch
+        if len(t) < 2:
+            return "❌ Please reply with a short business type. Example: POS agent", {}
+        ctx["business_type"] = t
+        patch = {"current_step": "HB_ASK_STATE", "step_index": 2, "context": ctx}
+        return "Which state are you operating from? Example: Lagos", patch
 
     if step == "HB_ASK_STATE":
-        context["state"] = t
-        patch = {"current_step": "HB_DONE", "step_index": 3, "context": context}
+        ctx["state"] = t
+        patch = {"current_step": "HB_ASK_REGISTERED", "step_index": 3, "context": ctx}
+        return "Are you registered with CAC? Reply YES or NO.", patch
+
+    if step == "HB_ASK_REGISTERED":
+        yn = t.lower()
+        if yn not in ["yes", "no", "y", "n"]:
+            return "❌ Reply YES or NO.", {}
+        ctx["registered"] = yn in ["yes", "y"]
+        patch = {"current_step": "HB_DONE", "step_index": 4, "context": ctx}
+
+        # Persist profile
+        try:
+            save_business_profile(session["wa_phone"], {
+                "business_type": ctx.get("business_type"),
+                "state": ctx.get("state"),
+                "registered": bool(ctx.get("registered"))
+            })
+        except Exception:
+            pass
+
         reply = (
             "✅ Onboarding saved.\n\n"
-            f"• Business: {context.get('business_type')}\n"
-            f"• State: {context.get('state')}\n\n"
-            "Next: we will suggest the most relevant taxes + record-keeping tips.\n"
-            "Type *menu* to continue."
+            f"• Business: {ctx.get('business_type')}\n"
+            f"• State: {ctx.get('state')}\n"
+            f"• CAC Registered: {'Yes' if ctx.get('registered') else 'No'}\n\n"
+            "Type *GUIDE* for quick guides or *menu*."
         )
         return reply, patch
 
     return "Type *menu* to start.", {"current_step": "START", "step_index": 1}
 
 
-def paye_reply(session: Dict[str, Any], message_text: str) -> Tuple[str, Dict[str, Any]]:
-    # Placeholder: we implement PAYE properly in the next block.
-    return (
-        "PAYE is next. For now, use:\n"
-        "• VAT (calculator)\n"
-        "• BUSINESS (onboarding)\n\n"
-        "Type *menu* to continue.",
-        {}
-    )
+def guide_flow_reply(session: Dict[str, Any], message_text: str) -> Tuple[str, Dict[str, Any]]:
+    step = session.get("current_step") or "START"
+    t = safe_text(message_text).lower()
 
+    if step in ["START", "G_ASK_TOPIC"]:
+        patch = {"current_step": "G_ASK_TOPIC", "step_index": 1}
+        return (
+            "📚 *Quick Guides*\n\n"
+            "Reply with a topic:\n"
+            "• VAT\n"
+            "• PAYE\n"
+            "• BUSINESS\n\n"
+            "Or type *menu*.",
+            patch
+        )
 
-def route_flow(session: Dict[str, Any], message_text: str) -> Tuple[str, Dict[str, Any]]:
-    flow_key = session.get("flow_key")
-    if flow_key == "vat":
-        return vat_flow_reply(session, message_text)
-    if flow_key == "hustler_onboarding":
-        return hustle_onboarding_reply(session, message_text)
-    if flow_key == "paye":
-        return paye_reply(session, message_text)
-    return ("Type *menu* to start.", {})
+    topic_map = {"vat": "vat_overview", "paye": "paye_overview", "business": "sme_basics"}
+    if step == "G_ASK_TOPIC":
+        if t not in topic_map:
+            return "❌ Reply VAT, PAYE, or BUSINESS.", {}
+        guide_key = topic_map[t]
+        try:
+            res = supabase.table("guides").select("title, body").eq("guide_key", guide_key).limit(1).execute()
+            if not res.data:
+                return "Guide not found yet. Type *menu*.", {}
+            g = res.data[0]
+            patch = {"current_step": "G_DONE", "step_index": 2}
+            return f"📌 *{g['title']}*\n\n{g['body']}\n\nType *menu*.", patch
+        except Exception:
+            return "Guide error. Type *menu*.", {}
+
+    return "Type *menu*.", {"current_step": "START", "step_index": 1}
 
 
 # ------------------------------------------------------------
-# 5) Expiry cleanup endpoint (manual/cron)
+# BLOCK 3: REMINDERS + OUTBOUND QUEUE (cron-safe)
+#  - /tasks/expire_sessions    -> marks expired sessions
+#  - /tasks/queue_reminders    -> enqueues reminder messages
+#  - /tasks/dispatch_outbound  -> sends queued WhatsApp messages
 # ------------------------------------------------------------
 @app.get("/tasks/expire_sessions")
 def expire_sessions():
-    """
-    Optional endpoint you can call manually or from a cron
-    to mark old sessions as expired.
-    """
     try:
-        cutoff = (now_utc() - timedelta(hours=DEFAULT_SESSION_TTL_HOURS)).isoformat()
-
-        # expire active sessions past expires_at OR inactive beyond cutoff
         supabase.table("flow_sessions") \
-            .update({"status": "expired", "updated_at": now_utc().isoformat()}) \
+            .update({"status": "expired", "updated_at": iso(now_utc())}) \
             .eq("status", "active") \
-            .lt("expires_at", now_utc().isoformat()) \
+            .lt("expires_at", iso(now_utc())) \
             .execute()
 
+        cutoff = iso(now_utc() - timedelta(hours=DEFAULT_SESSION_TTL_HOURS))
         supabase.table("flow_sessions") \
-            .update({"status": "expired", "updated_at": now_utc().isoformat()}) \
+            .update({"status": "expired", "updated_at": iso(now_utc())}) \
             .eq("status", "active") \
             .lt("last_inbound_at", cutoff) \
             .execute()
@@ -403,8 +571,217 @@ def expire_sessions():
         return jsonify({"status": "error", "error": str(e)}), 500
 
 
+@app.get("/tasks/queue_reminders")
+def queue_reminders():
+    """
+    Enqueue reminders for users who were inactive.
+    Safe approach:
+      - find users last_seen_at older than X hours
+      - do not spam: only queue if no recent queued reminder in last 24h
+    """
+    try:
+        hours = int(request.args.get("hours", "24"))
+        inactive_since = iso(now_utc() - timedelta(hours=hours))
+        recent_cutoff = iso(now_utc() - timedelta(hours=24))
+
+        users = supabase.table("users") \
+            .select("wa_phone, last_seen_at") \
+            .lt("last_seen_at", inactive_since) \
+            .limit(200) \
+            .execute().data or []
+
+        queued = 0
+        for u in users:
+            phone = u["wa_phone"]
+
+            # prevent frequent reminders
+            recent = supabase.table("outbound_queue") \
+                .select("id") \
+                .eq("wa_phone", phone) \
+                .eq("status", "queued") \
+                .gt("created_at", recent_cutoff) \
+                .limit(1).execute().data
+
+            if recent:
+                continue
+
+            msg = (
+                "⏳ Quick reminder: you can continue anytime.\n\n"
+                "Type:\n"
+                "• VAT (calculator)\n"
+                "• PAYE (estimator)\n"
+                "• BUSINESS (onboarding)\n"
+                "• GUIDE (tips)\n\n"
+                "Reply *menu* to see options."
+            )
+
+            supabase.table("outbound_queue").insert({
+                "wa_phone": phone,
+                "message": msg,
+                "status": "queued",
+                "scheduled_for": iso(now_utc()),
+                "meta": {"reason": "inactivity_reminder"}
+            }).execute()
+            queued += 1
+
+        return jsonify({"status": "ok", "queued": queued})
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+
+@app.get("/tasks/dispatch_outbound")
+def dispatch_outbound():
+    """
+    Send queued messages. Call this from an external cron (or manual).
+    """
+    try:
+        batch = supabase.table("outbound_queue") \
+            .select("*") \
+            .eq("status", "queued") \
+            .lte("scheduled_for", iso(now_utc())) \
+            .order("scheduled_for", desc=False) \
+            .limit(OUTBOUND_BATCH_SIZE) \
+            .execute().data or []
+
+        sent = 0
+        failed = 0
+
+        for row in batch:
+            try:
+                send_reply(row["wa_phone"], row["message"])
+                supabase.table("outbound_queue").update({
+                    "status": "sent",
+                    "sent_at": iso(now_utc()),
+                    "updated_at": iso(now_utc())
+                }).eq("id", row["id"]).execute()
+                sent += 1
+            except Exception as e:
+                supabase.table("outbound_queue").update({
+                    "status": "failed",
+                    "fail_reason": str(e),
+                    "updated_at": iso(now_utc())
+                }).eq("id", row["id"]).execute()
+                failed += 1
+
+        return jsonify({"status": "ok", "sent": sent, "failed": failed})
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+
 # ------------------------------------------------------------
-# Health / Root
+# BLOCK 4: UPGRADE FLOW + PAYSTACK FOUNDATION
+# - "UPGRADE" keyword shows plan options
+# - /paystack/initialize creates a payment record (stub)
+# - /paystack/webhook verifies and marks success (skeleton)
+# ------------------------------------------------------------
+PLAN_PRICES = {
+    "basic": 200000,  # kobo => ₦2,000 (placeholder)
+    "pro":   500000,  # ₦5,000 (placeholder)
+}
+
+
+def upgrade_message() -> str:
+    return (
+        "💳 *Upgrade Plans* (foundation)\n\n"
+        "Reply:\n"
+        "• UPGRADE BASIC\n"
+        "• UPGRADE PRO\n\n"
+        "BASIC: ₦2,000/month (placeholder)\n"
+        "PRO: ₦5,000/month (placeholder)\n\n"
+        "After payment, your plan activates automatically."
+    )
+
+
+def create_payment_record(wa_phone: str, plan: str) -> Dict[str, Any]:
+    plan = plan.lower()
+    amount_kobo = PLAN_PRICES.get(plan)
+    if amount_kobo is None:
+        raise ValueError("invalid_plan")
+
+    # reference can be generated later by Paystack; we store our own placeholder
+    reference = f"local_{wa_phone}_{int(now_utc().timestamp())}_{plan}"
+
+    res = supabase.table("payments").insert({
+        "wa_phone": wa_phone,
+        "provider": "paystack",
+        "reference": reference,
+        "plan": plan,
+        "amount_kobo": int(amount_kobo),
+        "currency": "NGN",
+        "status": "initiated",
+        "meta": {"mode": "foundation"}
+    }).execute()
+
+    return res.data[0] if res.data else {"reference": reference, "plan": plan, "amount_kobo": amount_kobo}
+
+
+@app.post("/paystack/initialize")
+def paystack_initialize():
+    """
+    Foundation endpoint.
+    Later: call Paystack initialize API using PAYSTACK_SECRET_KEY and return authorization_url.
+    For now: creates payment record + returns reference.
+    """
+    data = request.get_json(silent=True) or {}
+    wa_phone = safe_text(data.get("wa_phone"))
+    plan = safe_text(data.get("plan")).lower()
+
+    if not wa_phone or plan not in PLAN_PRICES:
+        return jsonify({"status": "error", "error": "wa_phone and valid plan required"}), 400
+
+    try:
+        payment = create_payment_record(wa_phone, plan)
+        # Later: replace this with real authorization_url from Paystack
+        return jsonify({
+            "status": "ok",
+            "reference": payment["reference"],
+            "plan": plan,
+            "amount_kobo": payment["amount_kobo"],
+            "message": "Foundation created. Wire Paystack later."
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+
+@app.post("/paystack/webhook")
+def paystack_webhook():
+    """
+    Skeleton verification. Paystack typically sends x-paystack-signature header.
+    Later: verify with HMAC SHA512 using PAYSTACK_SECRET_KEY.
+    """
+    raw = request.get_data() or b""
+    sig = request.headers.get("x-paystack-signature", "")
+
+    if PAYSTACK_SECRET_KEY:
+        expected = hmac.new(PAYSTACK_SECRET_KEY.encode("utf-8"), raw, hashlib.sha512).hexdigest()
+        if not hmac.compare_digest(expected, sig):
+            return "invalid signature", 401
+
+    event = request.get_json(silent=True) or {}
+    # You will map Paystack payload to:
+    # reference, status, plan, customer phone/email, etc.
+    # For MVP skeleton, we just ACK.
+    return "ok", 200
+
+
+# ------------------------------------------------------------
+# ROUTER: map flow_key -> flow handler
+# ------------------------------------------------------------
+def route_flow(session: Dict[str, Any], message_text: str) -> Tuple[str, Dict[str, Any]]:
+    fk = (session.get("flow_key") or "").lower()
+    if fk == "vat":
+        return vat_flow_reply(session, message_text)
+    if fk == "paye":
+        return paye_flow_reply(session, message_text)
+    if fk == "hustler_onboarding":
+        return hustle_onboarding_reply(session, message_text)
+    if fk == "guide":
+        return guide_flow_reply(session, message_text)
+    return ("Type *menu* to start.", {})
+
+
+# ------------------------------------------------------------
+# HEALTH / ROOT
 # ------------------------------------------------------------
 @app.get("/")
 def root():
@@ -417,7 +794,7 @@ def health():
 
 
 # ------------------------------------------------------------
-# Webhook Verification (Meta)
+# WEBHOOK VERIFY (Meta)
 # ------------------------------------------------------------
 @app.get("/webhook")
 def webhook_verify():
@@ -431,39 +808,30 @@ def webhook_verify():
 
 
 # ------------------------------------------------------------
-# Webhook Receive (Meta)
+# WEBHOOK RECEIVE (Meta)
 # ------------------------------------------------------------
 @app.post("/webhook")
 def webhook_receive():
     payload = request.get_json(silent=True) or {}
-    # You can log payload for debugging if needed:
-    # print(json.dumps(payload))
 
     try:
         entries = payload.get("entry", [])
         for entry in entries:
-            changes = entry.get("changes", [])
-            for change in changes:
+            for change in entry.get("changes", []):
                 value = change.get("value", {})
-                messages = value.get("messages", [])
-                for msg in messages:
+                for msg in (value.get("messages") or []):
                     wa_phone = msg.get("from")
                     if not wa_phone:
                         continue
 
-                    # Track profile
                     upsert_user_profile(wa_phone)
 
-                    # Extract message text
-                    message_text = ""
-                    if msg.get("type") == "text":
-                        message_text = msg.get("text", {}).get("body", "")
-                    else:
-                        # Ignore non-text for now
+                    if msg.get("type") != "text":
                         send_reply(wa_phone, "Please send a text message. Type *menu* to begin.")
                         continue
 
-                    handle_inbound(wa_phone, message_text, msg)
+                    text = msg.get("text", {}).get("body", "")
+                    handle_inbound(wa_phone, text, msg)
 
         return jsonify({"status": "ok"}), 200
 
@@ -475,7 +843,7 @@ def handle_inbound(wa_phone: str, message_text: str, raw_msg: Dict[str, Any]) ->
     text = safe_text(message_text)
     log_event(wa_phone, "INBOUND", {"text": text[:200]})
 
-    # 1) Global command handling
+    # Commands
     cmd = handle_command(text)
     if cmd:
         if cmd.get("action") == "cancel":
@@ -488,48 +856,57 @@ def handle_inbound(wa_phone: str, message_text: str, raw_msg: Dict[str, Any]) ->
             send_reply(wa_phone, "🔄 Restarted. Type *menu* to continue.")
             return
 
+        if cmd.get("action") == "upgrade":
+            send_reply(wa_phone, upgrade_message())
+            return
+
         send_reply(wa_phone, cmd["reply"])
         return
 
-    # 2) Upgrade keyword (foundation)
-    if text.lower() == "upgrade":
-        send_reply(
-            wa_phone,
-            "💳 Upgrade is coming next.\n\n"
-            "For now, you can use:\n"
-            "• VAT\n"
-            "• BUSINESS\n\n"
-            "Type *menu* to continue."
-        )
-        log_event(wa_phone, "UPGRADE_INTENT")
+    # Upgrade keyword variants
+    lower = text.lower()
+    if lower == "upgrade":
+        send_reply(wa_phone, upgrade_message())
         return
 
-    # 3) Expire old sessions (soft)
-    # If you want to be strict, rely on expires_at checks inside DB cleanup.
-    # Here we just close if expires_at passed (best effort).
-    active = get_active_session(wa_phone)
-    if active and active.get("expires_at"):
+    if lower.startswith("upgrade "):
+        plan = lower.replace("upgrade", "").strip()
+        if plan not in PLAN_PRICES:
+            send_reply(wa_phone, "❌ Invalid plan. Reply: UPGRADE BASIC or UPGRADE PRO")
+            return
+
+        # Create payment record (foundation)
         try:
-            exp = datetime.fromisoformat(active["expires_at"].replace("Z", "+00:00"))
-            if exp < now_utc():
-                close_active_session(wa_phone, reason="expired")
-                active = None
+            p = create_payment_record(wa_phone, plan)
+            send_reply(
+                wa_phone,
+                "✅ Upgrade initialized.\n\n"
+                f"Plan: {plan.upper()}\n"
+                f"Reference: {p['reference']}\n\n"
+                "Next: we will connect Paystack to generate a payment link.\n"
+                "Type *menu* to continue using the bot."
+            )
+            log_event(wa_phone, "UPGRADE_INIT", {"plan": plan, "reference": p["reference"]})
         except Exception:
-            pass
+            send_reply(wa_phone, "❌ Could not initialize upgrade. Try again later.")
+        return
 
-    # 4) Detect new flow start
+    # Active session handling
+    active = get_active_session(wa_phone)
+    if active and session_expired(active):
+        close_active_session(wa_phone, reason="expired")
+        active = None
+
+    # New flow start
     flow_key = detect_flow_start(text)
-
-    # If user typed VAT/BUSINESS/PAYE, start that flow (close old session first)
     if flow_key:
         user_plan = get_user_plan(wa_phone)
 
-        # Gate check (before starting a flow)
+        # Enforcement (before starting a flow)
         if not can_use_flow(user_plan, flow_key):
             send_reply(
                 wa_phone,
-                "🔒 This feature requires a paid plan.\n"
-                "Reply *UPGRADE* to continue."
+                "🔒 This feature requires a paid plan.\nReply *UPGRADE* to continue."
             )
             log_event(wa_phone, "GATED_FLOW", {"flow": flow_key, "plan": user_plan})
             return
@@ -538,27 +915,23 @@ def handle_inbound(wa_phone: str, message_text: str, raw_msg: Dict[str, Any]) ->
         session = create_session(wa_phone, flow_key)
         log_event(wa_phone, "FLOW_STARTED", {"flow": flow_key})
 
-        reply, patch = route_flow(session, "")  # empty to trigger START prompt
+        reply, patch = route_flow(session, "")
         if patch:
             update_session(session["id"], patch)
-
         send_reply(wa_phone, reply)
         return
 
-    # 5) Continue existing session, else show menu
+    # No flow + no active session => prompt menu
     if not active:
         send_reply(
             wa_phone,
-            "Type *menu* to begin.\n\n"
-            "Quick start:\n"
-            "• VAT\n"
-            "• BUSINESS"
+            "Type *menu* to begin.\n\nQuick start:\n• VAT\n• PAYE\n• BUSINESS\n• GUIDE"
         )
         return
 
-    # Update inbound timestamp
+    # Continue existing session
     try:
-        update_session(active["id"], {"last_inbound_at": now_utc().isoformat()})
+        update_session(active["id"], {"last_inbound_at": iso(now_utc())})
     except Exception:
         pass
 
@@ -568,8 +941,3 @@ def handle_inbound(wa_phone: str, message_text: str, raw_msg: Dict[str, Any]) ->
 
     send_reply(wa_phone, reply)
     log_event(wa_phone, "OUTBOUND", {"flow": active.get("flow_key")})
-
-
-# For local dev only:
-# if __name__ == "__main__":
-#     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
