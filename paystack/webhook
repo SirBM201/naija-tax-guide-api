@@ -1,0 +1,61 @@
+def activate_user_subscription(wa_phone: str, plan: str) -> None:
+    expires_at = iso(now_utc() + timedelta(days=DEFAULT_PLAN_DURATION_DAYS))
+    supabase.table("user_subscriptions").upsert({
+        "wa_phone": wa_phone,
+        "plan": plan,
+        "status": "active",
+        "expires_at": expires_at,
+        "updated_at": iso(now_utc())
+    }, on_conflict="wa_phone").execute()
+
+@app.post("/paystack/webhook")
+def paystack_webhook():
+    raw = request.get_data() or b""
+    sig = request.headers.get("x-paystack-signature", "")
+
+    if not PAYSTACK_SECRET_KEY:
+        return "PAYSTACK_SECRET_KEY not set", 500
+
+    expected = hmac.new(PAYSTACK_SECRET_KEY.encode("utf-8"), raw, hashlib.sha512).hexdigest()
+    if not hmac.compare_digest(expected, sig):
+        return "invalid signature", 401
+
+    event = request.get_json(silent=True) or {}
+    event_type = event.get("event")
+
+    data = event.get("data") or {}
+    reference = data.get("reference")
+    status = (data.get("status") or "").lower()
+
+    # We only activate on charge.success
+    if event_type == "charge.success" and reference:
+        # read our payment record
+        pay = supabase.table("payments").select("*").eq("reference", reference).limit(1).execute().data
+        if pay:
+            pay = pay[0]
+            wa_phone = pay.get("wa_phone")
+            plan = (pay.get("plan") or "").lower()
+
+            # update payment
+            supabase.table("payments").update({
+                "status": "success",
+                "meta": {"paystack_event": event}
+            }).eq("reference", reference).execute()
+
+            # activate subscription
+            if wa_phone and plan:
+                activate_user_subscription(wa_phone, plan)
+
+                # optional WhatsApp confirmation
+                try:
+                    send_reply(
+                        wa_phone,
+                        "✅ Payment received!\n\n"
+                        f"Your plan is now ACTIVE: *{plan.upper()}*.\n"
+                        "Type *menu* to continue."
+                    )
+                except Exception:
+                    pass
+
+    # Always ACK quickly
+    return "ok", 200
