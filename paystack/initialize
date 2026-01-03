@@ -1,0 +1,88 @@
+APP_BASE_URL = os.getenv("APP_BASE_URL", "").rstrip("/")
+DEFAULT_PLAN_DURATION_DAYS = int(os.getenv("DEFAULT_PLAN_DURATION_DAYS", "30"))
+
+PAYSTACK_INIT_URL = "https://api.paystack.co/transaction/initialize"
+
+def paystack_headers() -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {PAYSTACK_SECRET_KEY}",
+        "Content-Type": "application/json",
+    }
+
+@app.post("/paystack/initialize")
+def paystack_initialize():
+    """
+    Real Paystack initialize:
+    - creates local payment record
+    - calls Paystack to get authorization_url + reference
+    - stores reference back in payments
+    """
+    data = request.get_json(silent=True) or {}
+    wa_phone = safe_text(data.get("wa_phone"))
+    plan = safe_text(data.get("plan")).lower()
+
+    if not PAYSTACK_SECRET_KEY:
+        return jsonify({"status": "error", "error": "PAYSTACK_SECRET_KEY not set"}), 500
+
+    if not wa_phone or plan not in PLAN_PRICES:
+        return jsonify({"status": "error", "error": "wa_phone and valid plan required"}), 400
+
+    try:
+        # 1) create local payment record
+        local_payment = create_payment_record(wa_phone, plan)
+        local_ref = local_payment["reference"]
+
+        # 2) initialize Paystack transaction
+        amount_kobo = int(PLAN_PRICES[plan])
+
+        # Paystack expects email. If you don't have user's email yet, use a placeholder.
+        # Later we can collect email inside onboarding or user profile.
+        placeholder_email = f"{wa_phone}@naija-tax-guide.local"
+
+        callback_url = f"{APP_BASE_URL}/paystack/callback" if APP_BASE_URL else None
+
+        payload = {
+            "email": placeholder_email,
+            "amount": amount_kobo,
+            "currency": "NGN",
+            "reference": local_ref,  # we use our generated ref as Paystack ref
+            "metadata": {
+                "wa_phone": wa_phone,
+                "plan": plan,
+                "service": SERVICE_NAME
+            }
+        }
+        if callback_url:
+            payload["callback_url"] = callback_url
+
+        r = requests.post(PAYSTACK_INIT_URL, headers=paystack_headers(), json=payload, timeout=30)
+        resp = r.json()
+
+        if r.status_code >= 400 or not resp.get("status"):
+            # mark failed
+            supabase.table("payments").update({
+                "status": "init_failed",
+                "meta": {"paystack_response": resp}
+            }).eq("reference", local_ref).execute()
+
+            return jsonify({"status": "error", "error": "paystack_init_failed", "detail": resp}), 502
+
+        auth_url = resp["data"]["authorization_url"]
+        reference = resp["data"]["reference"]
+
+        # 3) store paystack reference (same as local_ref here, but keep future-proof)
+        supabase.table("payments").update({
+            "status": "pending",
+            "reference": reference,
+            "meta": {"paystack_init": resp["data"]}
+        }).eq("reference", local_ref).execute()
+
+        return jsonify({
+            "status": "ok",
+            "plan": plan,
+            "reference": reference,
+            "authorization_url": auth_url
+        })
+
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
