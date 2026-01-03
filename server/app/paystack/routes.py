@@ -114,6 +114,10 @@ def paystack_initialize():
         "reference": reference
     }), 200
 
+@paystack_bp.get("/callback")
+def paystack_callback():
+    # Optional UX-only endpoint. Webhook handles activation.
+    return "Payment received. You can return to WhatsApp.", 200
 
 @paystack_bp.post("/webhook")
 def paystack_webhook():
