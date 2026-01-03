@@ -1,61 +1,45 @@
 import os
-import json
 import hmac
 import hashlib
 import uuid
-from datetime import datetime, timedelta, timezone
-
 import requests
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, current_app
+
+from app.subscriptions.service import (
+    upsert_pending_payment,
+    activate_or_extend_subscription,
+)
 
 paystack_bp = Blueprint("paystack_bp", __name__, url_prefix="/paystack")
 
 PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY", "")
 APP_BASE_URL = os.getenv("APP_BASE_URL", "").rstrip("/")
+DEFAULT_PLAN_DAYS = int(os.getenv("DEFAULT_PLAN_DAYS", "30"))
 
 if not PAYSTACK_SECRET_KEY:
     raise RuntimeError("PAYSTACK_SECRET_KEY missing")
-
 if not APP_BASE_URL:
-    raise RuntimeError("APP_BASE_URL missing (e.g. https://your-koyeb-app.koyeb.app)")
+    raise RuntimeError("APP_BASE_URL missing")
 
 PAYSTACK_INIT_URL = "https://api.paystack.co/transaction/initialize"
 
 
-# -----------------------------
-# Helpers
-# -----------------------------
-def _utcnow():
-    return datetime.now(timezone.utc)
-
-
 def _plan_amount_kobo(plan: str) -> int:
-    """
-    Change these to your real pricing.
-    Amount is in KOBO (₦1000 = 100000 kobo).
-    """
-    plan = (plan or "").strip().upper()
+    # adjust to your pricing
     prices = {
         "BASIC": 100000,     # ₦1,000
         "STANDARD": 200000,  # ₦2,000
         "PREMIUM": 500000,   # ₦5,000
     }
-    return prices.get(plan, 0)
+    return prices.get(plan.upper().strip(), 0)
 
 
-def _plan_days(plan: str) -> int:
-    """
-    For now, all are 30-day plans.
-    You can change logic later (weekly/annual).
-    """
-    return 30
+def _safe_email_from_phone(wa_phone: str) -> str:
+    digits = "".join(ch for ch in (wa_phone or "") if ch.isdigit()) or "unknown"
+    return f"{digits}@naijatax.local"
 
 
-def _verify_paystack_signature(raw_body: bytes, signature: str) -> bool:
-    """
-    Paystack sends: x-paystack-signature
-    This should equal HMAC-SHA512(raw_body, secret_key)
-    """
+def _verify_signature(raw_body: bytes, signature: str) -> bool:
     if not signature:
         return False
     computed = hmac.new(
@@ -66,39 +50,8 @@ def _verify_paystack_signature(raw_body: bytes, signature: str) -> bool:
     return hmac.compare_digest(computed, signature)
 
 
-def _safe_email_from_phone(wa_phone: str) -> str:
-    """
-    Paystack requires an email.
-    If user has no email, generate a safe placeholder.
-    """
-    digits = "".join(ch for ch in (wa_phone or "") if ch.isdigit())
-    if not digits:
-        digits = "unknown"
-    return f"{digits}@naijatax.local"
-
-
-# -----------------------------
-# Routes
-# -----------------------------
 @paystack_bp.post("/initialize")
 def paystack_initialize():
-    """
-    Expected JSON:
-    {
-      "wa_phone": "2348012345678",
-      "plan": "BASIC"
-    }
-
-    Returns:
-    {
-      "status": "ok",
-      "authorization_url": "https://checkout.paystack.com/....",
-      "reference": "...."
-    }
-    """
-    supabase = request.app.config["SUPABASE"] if hasattr(request, "app") else None
-    # Flask doesn't attach app to request by default; use current_app instead:
-    from flask import current_app
     supabase = current_app.config["SUPABASE"]
 
     body = request.get_json(silent=True) or {}
@@ -113,37 +66,18 @@ def paystack_initialize():
         return jsonify({"status": "error", "message": f"Unknown plan: {plan}"}), 400
 
     reference = str(uuid.uuid4())
-
-    # 1) Upsert subscription as pending
-    #    (If user already exists, overwrite with pending for this new payment)
-    now = _utcnow().isoformat()
-    upsert_payload = {
-        "wa_phone": wa_phone,
-        "plan": plan,
-        "status": "pending",
-        "paystack_reference": reference,
-        "last_event": "initialize_created",
-        "updated_at": now,
-    }
-
-    # Try to preserve created_at if DB default exists; if not, you can set it
-    # upsert_payload["created_at"] = now
-
-    supabase.table("user_subscriptions").upsert(upsert_payload).execute()
-
-    # 2) Call Paystack initialize
-    email = _safe_email_from_phone(wa_phone)
-    callback_url = f"{APP_BASE_URL}/paystack/callback?ref={reference}"
+    upsert_pending_payment(supabase, wa_phone=wa_phone, plan=plan, reference=reference)
 
     init_payload = {
-        "email": email,
+        "email": _safe_email_from_phone(wa_phone),
         "amount": amount_kobo,
         "reference": reference,
-        "callback_url": callback_url,
+        # Callback URL is optional for WhatsApp-only MVP (safe to keep)
+        "callback_url": f"{APP_BASE_URL}/paystack/callback?ref={reference}",
         "metadata": {
             "wa_phone": wa_phone,
             "plan": plan,
-            "plan_days": _plan_days(plan),
+            "plan_days": DEFAULT_PLAN_DAYS,
         },
     }
 
@@ -161,7 +95,6 @@ def paystack_initialize():
     if r.status_code != 200 or not data.get("status"):
         supabase.table("user_subscriptions").update({
             "last_event": "initialize_failed",
-            "updated_at": _utcnow().isoformat(),
         }).eq("wa_phone", wa_phone).execute()
 
         return jsonify({
@@ -171,35 +104,25 @@ def paystack_initialize():
             "paystack_response": data
         }), 400
 
-    auth_url = data["data"]["authorization_url"]
-
-    # update last_event
     supabase.table("user_subscriptions").update({
         "last_event": "initialize_ok",
-        "updated_at": _utcnow().isoformat(),
     }).eq("wa_phone", wa_phone).execute()
 
     return jsonify({
         "status": "ok",
-        "authorization_url": auth_url,
+        "authorization_url": data["data"]["authorization_url"],
         "reference": reference
     }), 200
 
 
 @paystack_bp.post("/webhook")
 def paystack_webhook():
-    """
-    Paystack Webhook endpoint.
-    - Verifies x-paystack-signature
-    - On charge.success: activates subscription
-    """
-    from flask import current_app
     supabase = current_app.config["SUPABASE"]
 
-    raw_body = request.get_data()  # bytes
+    raw_body = request.get_data()
     signature = request.headers.get("x-paystack-signature", "")
 
-    if not _verify_paystack_signature(raw_body, signature):
+    if not _verify_signature(raw_body, signature):
         return jsonify({"status": "error", "message": "Invalid signature"}), 401
 
     payload = request.get_json(silent=True) or {}
@@ -207,44 +130,25 @@ def paystack_webhook():
     data = payload.get("data", {}) or {}
 
     reference = data.get("reference")
-    metadata = (data.get("metadata") or {}) if isinstance(data.get("metadata"), dict) else {}
-
-    wa_phone = metadata.get("wa_phone")
-    plan = (metadata.get("plan") or "").upper()
-    plan_days = int(metadata.get("plan_days") or _plan_days(plan))
-
-    # If metadata is missing, we can still try to find by reference
+    metadata = data.get("metadata") or {}
     if not reference:
-        return jsonify({"status": "ok"}), 200  # ignore malformed
-
-    # Only act on success payment events
-    if event == "charge.success":
-        # Compute new expiry
-        expires_at = (_utcnow() + timedelta(days=plan_days)).isoformat()
-
-        # Activate
-        # If you want to ensure phone matches, prefer reference-based update:
-        update_payload = {
-            "status": "active",
-            "expires_at": expires_at,
-            "last_event": "charge.success",
-            "paystack_reference": reference,
-            "updated_at": _utcnow().isoformat(),
-        }
-
-        # If plan exists in metadata, update it too
-        if plan:
-            update_payload["plan"] = plan
-
-        # Update by reference (most reliable)
-        supabase.table("user_subscriptions").update(update_payload).eq("paystack_reference", reference).execute()
-
         return jsonify({"status": "ok"}), 200
 
-    # For other events: record and ignore
+    if event == "charge.success":
+        plan = (metadata.get("plan") or "").upper() or "BASIC"
+        plan_days = int(metadata.get("plan_days") or DEFAULT_PLAN_DAYS)
+
+        activate_or_extend_subscription(
+            supabase,
+            reference=reference,
+            plan=plan,
+            plan_days=plan_days,
+        )
+        return jsonify({"status": "ok"}), 200
+
+    # record other events for debugging
     supabase.table("user_subscriptions").update({
         "last_event": event or "unknown_event",
-        "updated_at": _utcnow().isoformat(),
     }).eq("paystack_reference", reference).execute()
 
     return jsonify({"status": "ok"}), 200
