@@ -1,4 +1,5 @@
 import os
+import json
 import hmac
 import hashlib
 from datetime import datetime, timedelta, timezone
@@ -7,6 +8,7 @@ from typing import Any, Dict, Optional, Tuple, List
 import requests
 from flask import Flask, request, jsonify
 from supabase import create_client
+
 
 # ------------------------------------------------------------
 # App / Env
@@ -20,11 +22,17 @@ WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "")
 WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
 WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
 
-PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY", "")  # optional for now
+PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY", "")
+APP_BASE_URL = os.getenv("APP_BASE_URL", "").rstrip("/")
 
 SERVICE_NAME = os.getenv("SERVICE_NAME", "naija-tax-guide-api")
 DEFAULT_SESSION_TTL_HOURS = int(os.getenv("SESSION_TTL_HOURS", "24"))
 OUTBOUND_BATCH_SIZE = int(os.getenv("OUTBOUND_BATCH_SIZE", "20"))
+DEFAULT_PLAN_DURATION_DAYS = int(os.getenv("DEFAULT_PLAN_DURATION_DAYS", "30"))
+
+VAT_RATE = float(os.getenv("VAT_RATE", "0.075"))
+CRA_PCT = float(os.getenv("CRA_PCT", "0"))
+CRA_FIXED_MONTHLY = float(os.getenv("CRA_FIXED_MONTHLY", "0"))
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
     raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
@@ -35,12 +43,9 @@ supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 WA_MESSAGES_URL = f"https://graph.facebook.com/v21.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
 
-# Reuse HTTP connection (faster + more stable)
-_http = requests.Session()
-
 
 # ------------------------------------------------------------
-# Helpers
+# Time Helpers
 # ------------------------------------------------------------
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
@@ -64,6 +69,9 @@ def to_number(s: str) -> Optional[float]:
         return None
 
 
+# ------------------------------------------------------------
+# WhatsApp Messaging
+# ------------------------------------------------------------
 def send_reply(wa_phone: str, text: str) -> None:
     payload = {
         "messaging_product": "whatsapp",
@@ -72,14 +80,7 @@ def send_reply(wa_phone: str, text: str) -> None:
         "text": {"body": text},
     }
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
-    try:
-        r = _http.post(WA_MESSAGES_URL, headers=headers, json=payload, timeout=30)
-        # Do not crash the worker if WA fails
-        if r.status_code >= 400:
-            # Optional: you can log r.text into DB later
-            pass
-    except Exception:
-        pass
+    requests.post(WA_MESSAGES_URL, headers=headers, json=payload, timeout=30)
 
 
 def log_event(wa_phone: str, event: str, meta: Optional[Dict[str, Any]] = None) -> None:
@@ -108,10 +109,15 @@ def upsert_user_profile(wa_phone: str) -> None:
 
 
 def get_user_plan(wa_phone: str) -> str:
+    """
+    Returns plan name if active and not expired. Otherwise 'free'.
+    Assumes user_subscriptions has: wa_phone, plan, status, expires_at.
+    """
     try:
         res = supabase.table("user_subscriptions") \
             .select("plan, status, expires_at") \
             .eq("wa_phone", wa_phone).limit(1).execute()
+
         if not res.data:
             return "free"
 
@@ -136,17 +142,25 @@ def get_user_plan(wa_phone: str) -> str:
         return "free"
 
 
+def activate_user_subscription(wa_phone: str, plan: str) -> None:
+    expires_at = iso(now_utc() + timedelta(days=DEFAULT_PLAN_DURATION_DAYS))
+    supabase.table("user_subscriptions").upsert({
+        "wa_phone": wa_phone,
+        "plan": plan.lower(),
+        "status": "active",
+        "expires_at": expires_at,
+        "updated_at": iso(now_utc())
+    }, on_conflict="wa_phone").execute()
+
+
 # ------------------------------------------------------------
-# BILLING GUARD (keep in app.py for now; move later)
+# BILLING GUARD (keep in app.py for now)
 # ------------------------------------------------------------
 def can_use_flow(user_plan: str, flow_key: str) -> bool:
-    """
-    MVP: allow these flows on free.
-    Later: restrict advanced flows to paid plans.
-    """
     flow_key = (flow_key or "").lower()
     user_plan = (user_plan or "free").lower()
 
+    # Free allowed flows for MVP
     FREE_ALLOWED = {"menu", "vat", "hustler_onboarding", "paye", "guide"}
     if user_plan == "free":
         return flow_key in FREE_ALLOWED
@@ -154,8 +168,7 @@ def can_use_flow(user_plan: str, flow_key: str) -> bool:
 
 
 # ------------------------------------------------------------
-# FLOW SESSIONS (matches your existing schema)
-# - status: active | expired | cancelled | switched_flow | restarted
+# FLOW SESSIONS
 # ------------------------------------------------------------
 def get_active_session(wa_phone: str) -> Optional[Dict[str, Any]]:
     try:
@@ -233,7 +246,7 @@ def handle_command(message_text: str) -> Optional[Dict[str, Any]]:
                 "Commands:\n"
                 "• restart – start over\n"
                 "• cancel – end session\n"
-                "• upgrade – paid plans (foundation)"
+                "• upgrade – paid plans"
             )
         }
 
@@ -263,19 +276,16 @@ def detect_flow_start(message_text: str) -> Optional[str]:
 
 
 # ------------------------------------------------------------
-# BLOCK 1: PAYE CALCULATOR FLOW
+# BLOCK 1: PAYE FLOW
 # ------------------------------------------------------------
 def fetch_paye_brackets() -> List[Dict[str, Any]]:
-    try:
-        res = supabase.table("paye_brackets") \
-            .select("band_min, band_max, rate, sort_order") \
-            .eq("country_code", "NG") \
-            .eq("period", "monthly") \
-            .order("sort_order", desc=False) \
-            .execute()
-        return res.data or []
-    except Exception:
-        return []
+    res = supabase.table("paye_brackets") \
+        .select("band_min, band_max, rate, sort_order") \
+        .eq("country_code", "NG") \
+        .eq("period", "monthly") \
+        .order("sort_order", desc=False) \
+        .execute()
+    return res.data or []
 
 
 def compute_progressive_tax(taxable: float, brackets: List[Dict[str, Any]]) -> float:
@@ -335,7 +345,6 @@ def paye_flow_reply(session: Dict[str, Any], message_text: str) -> Tuple[str, Di
         patch = {"current_step": "PAYE_ASK_OTHER_DED", "step_index": 3, "context": ctx}
         return (
             "Enter *other monthly tax-deductible items* (₦).\n"
-            "Example: NHF, NHIS, approved deductions.\n"
             "If none, reply 0.",
             patch
         )
@@ -349,17 +358,14 @@ def paye_flow_reply(session: Dict[str, Any], message_text: str) -> Tuple[str, Di
         pension_pct = float(ctx.get("pension_pct", 0))
         pension_amt = gross * (pension_pct / 100.0)
 
-        # CRA (config later)
         cra_monthly = 0.0
-        cra_pct = float(os.getenv("CRA_PCT", "0"))
-        cra_fixed_monthly = float(os.getenv("CRA_FIXED_MONTHLY", "0"))
-        if cra_pct > 0:
-            cra_monthly = gross * (cra_pct / 100.0) + cra_fixed_monthly
+        if CRA_PCT > 0:
+            cra_monthly = gross * (CRA_PCT / 100.0) + CRA_FIXED_MONTHLY
 
         taxable = max(0.0, gross - pension_amt - float(other) - cra_monthly)
 
         brackets = fetch_paye_brackets()
-        tax = compute_progressive_tax(taxable, brackets) if brackets else 0.0
+        tax = compute_progressive_tax(taxable, brackets)
 
         ctx.update({
             "other_deductions": float(other),
@@ -419,8 +425,7 @@ def vat_flow_reply(session: Dict[str, Any], message_text: str) -> Tuple[str, Dic
         if input_vat is None or input_vat < 0:
             return "❌ Enter a valid input VAT amount. Example: 0 or 25000", {}
         sales = float(ctx.get("sales", 0))
-        vat_rate = float(os.getenv("VAT_RATE", "0.075"))
-        output_vat = sales * vat_rate
+        output_vat = sales * VAT_RATE
         net = output_vat - float(input_vat)
 
         patch = {"current_step": "VAT_SHOW", "step_index": 3, "context": {
@@ -541,7 +546,7 @@ def guide_flow_reply(session: Dict[str, Any], message_text: str) -> Tuple[str, D
 
 
 # ------------------------------------------------------------
-# BLOCK 3: REMINDERS + OUTBOUND QUEUE
+# BLOCK 3: TASKS (cron-safe)
 # ------------------------------------------------------------
 @app.get("/tasks/expire_sessions")
 def expire_sessions():
@@ -652,25 +657,31 @@ def dispatch_outbound():
 
 
 # ------------------------------------------------------------
-# BLOCK 4: UPGRADE + PAYSTACK FOUNDATION
+# BLOCK 4: PAYSTACK (REAL)
 # ------------------------------------------------------------
-PLAN_PRICES = {
-    "basic": 200000,  # kobo => ₦2,000 placeholder
-    "pro":   500000,  # ₦5,000 placeholder
-}
+PAYSTACK_INIT_URL = "https://api.paystack.co/transaction/initialize"
 
+PLAN_PRICES = {
+    "basic": 200000,  # ₦2,000 (kobo)
+    "pro":   500000,  # ₦5,000 (kobo)
+}
 
 def upgrade_message() -> str:
     return (
-        "💳 *Upgrade Plans* (foundation)\n\n"
+        "💳 *Upgrade Plans*\n\n"
         "Reply:\n"
         "• UPGRADE BASIC\n"
         "• UPGRADE PRO\n\n"
-        "BASIC: ₦2,000/month (placeholder)\n"
-        "PRO: ₦5,000/month (placeholder)\n\n"
+        "BASIC: ₦2,000/month\n"
+        "PRO: ₦5,000/month\n\n"
         "After payment, your plan activates automatically."
     )
 
+def paystack_headers() -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {PAYSTACK_SECRET_KEY}",
+        "Content-Type": "application/json",
+    }
 
 def create_payment_record(wa_phone: str, plan: str) -> Dict[str, Any]:
     plan = plan.lower()
@@ -688,11 +699,10 @@ def create_payment_record(wa_phone: str, plan: str) -> Dict[str, Any]:
         "amount_kobo": int(amount_kobo),
         "currency": "NGN",
         "status": "initiated",
-        "meta": {"mode": "foundation"}
+        "meta": {"mode": "real_paystack"}
     }).execute()
 
     return res.data[0] if res.data else {"reference": reference, "plan": plan, "amount_kobo": amount_kobo}
-
 
 @app.post("/paystack/initialize")
 def paystack_initialize():
@@ -700,38 +710,110 @@ def paystack_initialize():
     wa_phone = safe_text(data.get("wa_phone"))
     plan = safe_text(data.get("plan")).lower()
 
+    if not PAYSTACK_SECRET_KEY:
+        return jsonify({"status": "error", "error": "PAYSTACK_SECRET_KEY not set"}), 500
+    if not APP_BASE_URL:
+        return jsonify({"status": "error", "error": "APP_BASE_URL not set"}), 500
     if not wa_phone or plan not in PLAN_PRICES:
         return jsonify({"status": "error", "error": "wa_phone and valid plan required"}), 400
 
     try:
-        payment = create_payment_record(wa_phone, plan)
+        local_payment = create_payment_record(wa_phone, plan)
+        reference = local_payment["reference"]
+        amount_kobo = int(PLAN_PRICES[plan])
+
+        placeholder_email = f"{wa_phone}@naija-tax-guide.local"
+        callback_url = f"{APP_BASE_URL}/paystack/callback"
+
+        payload = {
+            "email": placeholder_email,
+            "amount": amount_kobo,
+            "currency": "NGN",
+            "reference": reference,
+            "callback_url": callback_url,
+            "metadata": {"wa_phone": wa_phone, "plan": plan, "service": SERVICE_NAME},
+        }
+
+        r = requests.post(PAYSTACK_INIT_URL, headers=paystack_headers(), json=payload, timeout=30)
+        resp = r.json()
+
+        if r.status_code >= 400 or not resp.get("status"):
+            supabase.table("payments").update({
+                "status": "init_failed",
+                "meta": {"paystack_response": resp}
+            }).eq("reference", reference).execute()
+
+            return jsonify({"status": "error", "error": "paystack_init_failed", "detail": resp}), 502
+
+        auth_url = resp["data"]["authorization_url"]
+
+        supabase.table("payments").update({
+            "status": "pending",
+            "meta": {"paystack_init": resp["data"]}
+        }).eq("reference", reference).execute()
+
         return jsonify({
             "status": "ok",
-            "reference": payment["reference"],
             "plan": plan,
-            "amount_kobo": payment["amount_kobo"],
-            "message": "Foundation created. Wire Paystack later."
+            "reference": reference,
+            "authorization_url": auth_url
         })
+
     except Exception as e:
         return jsonify({"status": "error", "error": str(e)}), 500
 
+@app.get("/paystack/callback")
+def paystack_callback():
+    # Optional: Paystack redirects user here after payment.
+    # The webhook is still the source of truth for activation.
+    return jsonify({"status": "ok", "message": "Payment received. You may return to WhatsApp."})
 
 @app.post("/paystack/webhook")
 def paystack_webhook():
     raw = request.get_data() or b""
     sig = request.headers.get("x-paystack-signature", "")
 
-    if PAYSTACK_SECRET_KEY:
-        expected = hmac.new(PAYSTACK_SECRET_KEY.encode("utf-8"), raw, hashlib.sha512).hexdigest()
-        if not hmac.compare_digest(expected, sig):
-            return "invalid signature", 401
+    if not PAYSTACK_SECRET_KEY:
+        return "PAYSTACK_SECRET_KEY not set", 500
 
-    # For now: ACK only
+    expected = hmac.new(PAYSTACK_SECRET_KEY.encode("utf-8"), raw, hashlib.sha512).hexdigest()
+    if not hmac.compare_digest(expected, sig):
+        return "invalid signature", 401
+
+    event = request.get_json(silent=True) or {}
+    event_type = event.get("event")
+    data = event.get("data") or {}
+    reference = data.get("reference")
+
+    if event_type == "charge.success" and reference:
+        pay = supabase.table("payments").select("*").eq("reference", reference).limit(1).execute().data
+        if pay:
+            pay = pay[0]
+            wa_phone = pay.get("wa_phone")
+            plan = (pay.get("plan") or "").lower()
+
+            supabase.table("payments").update({
+                "status": "success",
+                "meta": {"paystack_event": event}
+            }).eq("reference", reference).execute()
+
+            if wa_phone and plan:
+                activate_user_subscription(wa_phone, plan)
+                try:
+                    send_reply(
+                        wa_phone,
+                        "✅ Payment received!\n\n"
+                        f"Your plan is now ACTIVE: *{plan.upper()}*.\n"
+                        "Type *menu* to continue."
+                    )
+                except Exception:
+                    pass
+
     return "ok", 200
 
 
 # ------------------------------------------------------------
-# ROUTER
+# ROUTER: map flow_key -> flow handler
 # ------------------------------------------------------------
 def route_flow(session: Dict[str, Any], message_text: str) -> Tuple[str, Dict[str, Any]]:
     fk = (session.get("flow_key") or "").lower()
@@ -796,7 +878,7 @@ def webhook_receive():
                         send_reply(wa_phone, "Please send a text message. Type *menu* to begin.")
                         continue
 
-                    text = (msg.get("text") or {}).get("body", "")
+                    text = msg.get("text", {}).get("body", "")
                     handle_inbound(wa_phone, text, msg)
 
         return jsonify({"status": "ok"}), 200
@@ -829,8 +911,8 @@ def handle_inbound(wa_phone: str, message_text: str, raw_msg: Dict[str, Any]) ->
         send_reply(wa_phone, cmd["reply"])
         return
 
-    # Upgrade keyword variants
     lower = text.lower()
+
     if lower == "upgrade":
         send_reply(wa_phone, upgrade_message())
         return
@@ -842,21 +924,33 @@ def handle_inbound(wa_phone: str, message_text: str, raw_msg: Dict[str, Any]) ->
             return
 
         try:
-            p = create_payment_record(wa_phone, plan)
+            # Generate payment link by calling our own endpoint
+            r = requests.post(
+                f"{APP_BASE_URL}/paystack/initialize",
+                json={"wa_phone": wa_phone, "plan": plan},
+                timeout=30
+            )
+            resp = r.json()
+            if resp.get("status") != "ok":
+                send_reply(wa_phone, "❌ Could not generate payment link. Try again later.")
+                return
+
             send_reply(
                 wa_phone,
-                "✅ Upgrade initialized.\n\n"
-                f"Plan: {plan.upper()}\n"
-                f"Reference: {p['reference']}\n\n"
-                "Next: we will connect Paystack to generate a payment link.\n"
-                "Type *menu* to continue using the bot."
+                "✅ Almost done.\n\n"
+                f"Plan: *{plan.upper()}*\n"
+                f"Reference: {resp['reference']}\n\n"
+                "Pay using this link:\n"
+                f"{resp['authorization_url']}\n\n"
+                "After payment, your plan activates automatically."
             )
-            log_event(wa_phone, "UPGRADE_INIT", {"plan": plan, "reference": p["reference"]})
+            log_event(wa_phone, "UPGRADE_LINK_SENT", {"plan": plan, "reference": resp["reference"]})
         except Exception:
-            send_reply(wa_phone, "❌ Could not initialize upgrade. Try again later.")
+            send_reply(wa_phone, "❌ Payment link error. Try again later.")
+
         return
 
-    # Active session
+    # Active session handling
     active = get_active_session(wa_phone)
     if active and session_expired(active):
         close_active_session(wa_phone, reason="expired")
@@ -867,12 +961,8 @@ def handle_inbound(wa_phone: str, message_text: str, raw_msg: Dict[str, Any]) ->
     if flow_key:
         user_plan = get_user_plan(wa_phone)
 
-        # Enforcement (before starting a flow)
         if not can_use_flow(user_plan, flow_key):
-            send_reply(
-                wa_phone,
-                "🔒 This feature requires a paid plan.\nReply *UPGRADE* to continue."
-            )
+            send_reply(wa_phone, "🔒 This feature requires a paid plan.\nReply *UPGRADE* to continue.")
             log_event(wa_phone, "GATED_FLOW", {"flow": flow_key, "plan": user_plan})
             return
 
@@ -881,20 +971,15 @@ def handle_inbound(wa_phone: str, message_text: str, raw_msg: Dict[str, Any]) ->
         log_event(wa_phone, "FLOW_STARTED", {"flow": flow_key})
 
         reply, patch = route_flow(session, "")
-        if patch and session.get("id"):
+        if patch:
             update_session(session["id"], patch)
         send_reply(wa_phone, reply)
         return
 
-    # No flow + no session
     if not active:
-        send_reply(
-            wa_phone,
-            "Type *menu* to begin.\n\nQuick start:\n• VAT\n• PAYE\n• BUSINESS\n• GUIDE"
-        )
+        send_reply(wa_phone, "Type *menu* to begin.\n\nQuick start:\n• VAT\n• PAYE\n• BUSINESS\n• GUIDE")
         return
 
-    # Continue flow
     try:
         update_session(active["id"], {"last_inbound_at": iso(now_utc())})
     except Exception:
@@ -902,15 +987,7 @@ def handle_inbound(wa_phone: str, message_text: str, raw_msg: Dict[str, Any]) ->
 
     reply, patch = route_flow(active, text)
     if patch:
-        try:
-            update_session(active["id"], patch)
-        except Exception:
-            pass
+        update_session(active["id"], patch)
 
     send_reply(wa_phone, reply)
     log_event(wa_phone, "OUTBOUND", {"flow": active.get("flow_key")})
-
-
-# Local run (optional)
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
