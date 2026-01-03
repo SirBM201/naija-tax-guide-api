@@ -4,7 +4,8 @@ from flask import Blueprint, request, jsonify, current_app
 
 from app.subscriptions.service import mark_expired_if_needed
 
-whatsapp_bp = Blueprint("whatsapp_bp", __name__, url_prefix="/whatsapp")
+# IMPORTANT: no url_prefix, we will register two URL paths manually
+whatsapp_bp = Blueprint("whatsapp_bp", __name__)
 
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "")
 WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
@@ -32,9 +33,6 @@ def send_whatsapp_text(to_phone: str, text: str):
 
 
 def _get_text_message(payload: dict):
-    """
-    Extract sender and message text from WhatsApp webhook payload.
-    """
     try:
         entry = payload["entry"][0]
         changes = entry["changes"][0]
@@ -50,35 +48,32 @@ def _get_text_message(payload: dict):
         return None, None
 
 
-@whatsapp_bp.get("/webhook")
-def verify_webhook():
+def _verify_webhook_request():
     mode = request.args.get("hub.mode")
     token = request.args.get("hub.verify_token")
     challenge = request.args.get("hub.challenge")
 
-    if mode == "subscribe" and token == WHATSAPP_VERIFY_TOKEN:
+    if mode == "subscribe" and token == WHATSAPP_VERIFY_TOKEN and challenge:
         return challenge, 200
     return "Forbidden", 403
 
 
-@whatsapp_bp.post("/webhook")
-def receive_webhook():
+def _handle_incoming_message():
     supabase = current_app.config["SUPABASE"]
     payload = request.get_json(silent=True) or {}
 
     from_phone, text = _get_text_message(payload)
     if not from_phone or not text:
-        return jsonify({"status": "ok"}), 200  # ignore non-message events
+        return jsonify({"status": "ok"}), 200
 
     msg = text.strip()
     upper = msg.upper()
 
-    # Always do lazy expiry check on every inbound message
+    # Lazy expiry check
     sub = mark_expired_if_needed(supabase, wa_phone=from_phone)
 
     # Commands
     if upper.startswith("UPGRADE"):
-        # Expected: UPGRADE BASIC / UPGRADE STANDARD / UPGRADE PREMIUM
         parts = upper.split()
         if len(parts) < 2:
             send_whatsapp_text(from_phone, "Usage: UPGRADE BASIC | UPGRADE STANDARD | UPGRADE PREMIUM")
@@ -86,8 +81,6 @@ def receive_webhook():
 
         plan = parts[1].strip().upper()
 
-        # Call our own Paystack initialize endpoint internally
-        # (No need for callback page)
         init_res = requests.post(
             f"{os.getenv('APP_BASE_URL','').rstrip('/')}/paystack/initialize",
             json={"wa_phone": from_phone, "plan": plan},
@@ -122,23 +115,23 @@ def receive_webhook():
             )
         return jsonify({"status": "ok"}), 200
 
-    # Example: Protect premium features
-    # (Replace PREMIUM_FEATURE with your real command)
-    if upper.startswith("PREMIUM_FEATURE"):
-        if not sub.is_active:
-            send_whatsapp_text(
-                from_phone,
-                "⚠️ This feature requires an active subscription.\n\nUpgrade:\nUPGRADE BASIC\nUPGRADE STANDARD\nUPGRADE PREMIUM"
-            )
-            return jsonify({"status": "ok"}), 200
-
-        # If active: continue your premium feature logic here
-        send_whatsapp_text(from_phone, "✅ Access granted. Running premium feature...")
-        return jsonify({"status": "ok"}), 200
-
-    # Default reply
-    send_whatsapp_text(
-        from_phone,
-        "Hello. Commands:\nSTATUS\nUPGRADE BASIC\nUPGRADE STANDARD\nUPGRADE PREMIUM"
-    )
+    send_whatsapp_text(from_phone, "Commands:\nSTATUS\nUPGRADE BASIC\nUPGRADE STANDARD\nUPGRADE PREMIUM")
     return jsonify({"status": "ok"}), 200
+
+
+# Accept BOTH webhook URLs:
+@whatsapp_bp.get("/whatsapp/webhook")
+def verify_webhook_new():
+    return _verify_webhook_request()
+
+@whatsapp_bp.post("/whatsapp/webhook")
+def receive_webhook_new():
+    return _handle_incoming_message()
+
+@whatsapp_bp.get("/webhook")
+def verify_webhook_old():
+    return _verify_webhook_request()
+
+@whatsapp_bp.post("/webhook")
+def receive_webhook_old():
+    return _handle_incoming_message()
