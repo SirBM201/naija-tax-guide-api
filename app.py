@@ -2,52 +2,56 @@ import os
 import json
 import hmac
 import hashlib
-import logging
 import requests
 from datetime import datetime, timedelta
+
 from flask import Flask, request, jsonify
 from supabase import create_client
 
-# --------------------------------------------------
-# APP
-# --------------------------------------------------
 app = Flask(__name__)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 # --------------------------------------------------
 # ENV
 # --------------------------------------------------
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "")  # must match Meta Webhook verify token
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "")  # must match Meta webhook verify token
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "")
-PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
-META_APP_SECRET = os.getenv("META_APP_SECRET", "")
+PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")  # REQUIRED (this is what you send messages with)
+META_APP_SECRET = os.getenv("META_APP_SECRET", "")  # REQUIRED for signature verification
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")  # service role for server-side writes
 
 PAYSTACK_SECRET = os.getenv("PAYSTACK_SECRET_KEY", "")
-BASE_URL = os.getenv("BASE_URL", "").rstrip("/")  # koyeb public url
-
-if not SUPABASE_URL or not SUPABASE_KEY:
-    raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY in env")
+BASE_URL = os.getenv("BASE_URL", "").rstrip("/")  # e.g. https://developed-lizabeth-bmsconcept-e65bfd1d.koyeb.app
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
 # --------------------------------------------------
-# UTILITIES
+# HELPERS
 # --------------------------------------------------
+def utcnow_iso() -> str:
+    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+def sb_safe_insert(table: str, row: dict):
+    """Never let Supabase logging crash the webhook."""
+    try:
+        supabase.table(table).insert(row).execute()
+    except Exception:
+        pass
+
+
 def verify_meta_signature(req) -> bool:
     """
-    Verify Meta webhook signature (X-Hub-Signature-256).
-    If META_APP_SECRET is not set, we fail closed (return False).
+    Meta sends header: X-Hub-Signature-256: sha256=<hash>
+    Hash = HMAC_SHA256(app_secret, raw_request_body)
     """
     if not META_APP_SECRET:
-        logging.error("META_APP_SECRET missing. Cannot verify signature.")
         return False
 
-    signature = req.headers.get("X-Hub-Signature-256", "")
-    if not signature.startswith("sha256="):
+    sig = req.headers.get("X-Hub-Signature-256", "")
+    if not sig.startswith("sha256="):
         return False
 
     expected = hmac.new(
@@ -56,15 +60,15 @@ def verify_meta_signature(req) -> bool:
         hashlib.sha256
     ).hexdigest()
 
-    received = signature.split("=", 1)[1]
+    received = sig.split("=", 1)[1]
     return hmac.compare_digest(received, expected)
 
 
-def send_whatsapp(to: str, text: str) -> dict:
-    """
-    Send a WhatsApp text message using Cloud API.
-    Returns response JSON for debugging.
-    """
+def send_whatsapp(to: str, text: str):
+    """Send a simple text message via WhatsApp Cloud API."""
+    if not PHONE_NUMBER_ID or not WHATSAPP_TOKEN:
+        return
+
     url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
     headers = {
         "Authorization": f"Bearer {WHATSAPP_TOKEN}",
@@ -79,30 +83,100 @@ def send_whatsapp(to: str, text: str) -> dict:
 
     try:
         r = requests.post(url, headers=headers, json=payload, timeout=20)
-        try:
-            data = r.json()
-        except Exception:
-            data = {"raw": r.text}
-
-        if r.status_code >= 300:
-            logging.error("WhatsApp send failed: %s %s", r.status_code, data)
-        else:
-            logging.info("WhatsApp sent OK: %s", data)
-
-        return data
+        sb_safe_insert("webhook_logs", {
+            "source": "send_whatsapp",
+            "created_at": utcnow_iso(),
+            "payload": {"to": to, "status_code": r.status_code, "resp": safe_json(r)}
+        })
     except Exception as e:
-        logging.exception("WhatsApp send exception: %s", e)
-        return {"error": str(e)}
+        sb_safe_insert("webhook_logs", {
+            "source": "send_whatsapp_error",
+            "created_at": utcnow_iso(),
+            "payload": {"to": to, "err": str(e)}
+        })
+
+
+def safe_json(resp):
+    try:
+        return resp.json()
+    except Exception:
+        return {"text": resp.text[:500]}
+
+
+def dedup_seen(message_id: str) -> bool:
+    """
+    Your table is: webhook_dedup(message_id text primary key, created_at timestamptz default now())
+    If message_id already exists -> duplicate.
+    """
+    if not message_id:
+        return False
+
+    try:
+        exists = supabase.table("webhook_dedup").select("message_id").eq("message_id", message_id).execute()
+        if exists.data:
+            return True
+        supabase.table("webhook_dedup").insert({"message_id": message_id}).execute()
+        return False
+    except Exception as e:
+        # If dedup fails, do NOT crash webhook
+        sb_safe_insert("webhook_logs", {
+            "source": "dedup_error",
+            "created_at": utcnow_iso(),
+            "payload": {"message_id": message_id, "err": str(e)}
+        })
+        return False
+
+
+def get_plan(plan: str):
+    """plans table expected: plan (basic/standard/premium), amount_kobo, duration_days"""
+    try:
+        return supabase.table("plans").select("*").eq("plan", plan).single().execute().data
+    except Exception:
+        return None
+
+
+def get_active_subscription(wa_phone: str):
+    """
+    user_subscriptions expected: wa_phone, status, expires_at, plan
+    """
+    try:
+        row = (
+            supabase.table("user_subscriptions")
+            .select("status, expires_at, plan")
+            .eq("wa_phone", wa_phone)
+            .single()
+            .execute()
+            .data
+        )
+        if not row:
+            return None
+
+        status = (row.get("status") or "").lower()
+        expires_at = row.get("expires_at")
+
+        # If expires_at exists, check if it is in the past
+        if expires_at:
+            try:
+                exp = datetime.fromisoformat(expires_at.replace("Z", ""))
+                if exp < datetime.utcnow():
+                    return None
+            except Exception:
+                pass
+
+        if status == "active":
+            return row
+        return None
+    except Exception:
+        return None
 
 
 def init_paystack(reference: str, amount_kobo: int, phone: str) -> str:
     """
-    Create Paystack payment link.
+    Paystack initialization.
+    Note: Paystack will append reference and status to callback redirect itself.
     """
     if not PAYSTACK_SECRET:
-        raise RuntimeError("PAYSTACK_SECRET_KEY missing in env")
-    if not BASE_URL:
-        raise RuntimeError("BASE_URL missing in env (must be your Koyeb public URL)")
+        return ""
 
     url = "https://api.paystack.co/transaction/initialize"
     headers = {
@@ -111,254 +185,268 @@ def init_paystack(reference: str, amount_kobo: int, phone: str) -> str:
     }
     payload = {
         "reference": reference,
-        "amount": int(amount_kobo),
+        "amount": amount_kobo,
         "email": f"{phone}@naijatax.app",
-        "callback_url": f"{BASE_URL}/paystack/callback",
+        "callback_url": f"{BASE_URL}/paystack/callback" if BASE_URL else None,
+        "metadata": {"wa_phone": phone},
     }
 
     r = requests.post(url, headers=headers, json=payload, timeout=20)
     data = r.json()
-
-    if r.status_code >= 300 or not data.get("status"):
-        raise RuntimeError(f"Paystack init failed: {data}")
+    if not data.get("status"):
+        sb_safe_insert("webhook_logs", {
+            "source": "paystack_init_failed",
+            "created_at": utcnow_iso(),
+            "payload": data
+        })
+        return ""
 
     return data["data"]["authorization_url"]
 
 
-def _extract_whatsapp_message(payload: dict):
+def verify_paystack_signature(req) -> bool:
     """
-    Safely extract WhatsApp message fields from Meta webhook payload.
-    Returns None if this is a status-only update or unsupported event.
+    Paystack header: x-paystack-signature = HMAC_SHA512(secret_key, raw_body)
     """
-    try:
-        entry = payload.get("entry", [])[0]
-        changes = entry.get("changes", [])[0]
-        value = changes.get("value", {})
+    signature = req.headers.get("x-paystack-signature", "")
+    if not signature or not PAYSTACK_SECRET:
+        return False
 
-        # If this payload has no messages, it's usually a status update (delivery/read)
-        messages = value.get("messages", [])
-        if not messages:
-            return None
+    computed = hmac.new(
+        PAYSTACK_SECRET.encode("utf-8"),
+        req.data,
+        hashlib.sha512
+    ).hexdigest()
 
-        msg = messages[0]
-        msg_id = msg.get("id")                 # WhatsApp message unique id
-        sender = msg.get("from")              # sender phone (wa id)
-        text = (msg.get("text", {}) or {}).get("body", "")
-        return {
-            "msg_id": msg_id,
-            "sender": sender,
-            "text": text,
-        }
-    except Exception:
-        return None
+    return hmac.compare_digest(signature, computed)
 
 
 # --------------------------------------------------
-# HEALTH
+# ROUTES
 # --------------------------------------------------
 @app.route("/", methods=["GET"])
 def health():
     return "OK", 200
 
 
-# --------------------------------------------------
-# WEBHOOK (META / WHATSAPP)
-# --------------------------------------------------
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
-    # --------------- VERIFY (GET)
+    # ---------------------------
+    # VERIFY (GET) - Meta Challenge
+    # ---------------------------
     if request.method == "GET":
-        mode = request.args.get("hub.mode", "")
-        token = request.args.get("hub.verify_token", "")
-        challenge = request.args.get("hub.challenge", "")
+        mode = request.args.get("hub.mode")
+        token = request.args.get("hub.verify_token")
+        challenge = request.args.get("hub.challenge")
 
         if mode == "subscribe" and token == VERIFY_TOKEN and challenge:
             return challenge, 200
 
+        # Browser opening /webhook will show Forbidden (normal)
         return "Forbidden", 403
 
-    # --------------- SECURITY (POST)
-    # Meta sends webhook to /webhook with signature header
+    # ---------------------------
+    # SECURITY (POST) - Signature
+    # ---------------------------
     if not verify_meta_signature(request):
         return "Invalid signature", 403
 
-    data = request.get_json(silent=True) or {}
-    logging.info("Webhook received: %s", json.dumps(data)[:1500])
-
-    # --------------- Parse message (ignore status-only callbacks)
-    extracted = _extract_whatsapp_message(data)
-    if not extracted:
-        # Status updates should still return 200 to stop retries
-        return jsonify({"status": "ignored_non_message"}), 200
-
-    msg_id = extracted["msg_id"]
-    sender = extracted["sender"]
-    incoming_text = (extracted["text"] or "").strip()
-
-    if not msg_id or not sender:
-        return jsonify({"status": "ignored_missing_fields"}), 200
-
-    # --------------- DEDUP (IMPORTANT FIX: use webhook_dedup.message_id)
+    # ---------------------------
+    # PARSE
+    # ---------------------------
     try:
-        exists = (
-            supabase.table("webhook_dedup")
-            .select("message_id")
-            .eq("message_id", msg_id)
-            .execute()
-        )
-        if exists.data:
-            return jsonify({"status": "duplicate"}), 200
+        data = request.get_json(force=True)
+    except Exception:
+        return jsonify({"status": "bad_json"}), 200
 
-        supabase.table("webhook_dedup").insert({"message_id": msg_id}).execute()
-    except Exception as e:
-        # If dedup table misconfigured, don't crash webhook (return 200)
-        logging.exception("Dedup error (webhook_dedup): %s", e)
+    # Optional logging (create webhook_logs table if you want)
+    sb_safe_insert("webhook_logs", {
+        "source": "meta_webhook_in",
+        "created_at": utcnow_iso(),
+        "payload": data
+    })
 
-    # --------------- Ensure user exists
+    # Meta structure:
+    # entry[] -> changes[] -> value -> messages[] OR statuses[]
     try:
-        supabase.table("wa_users").upsert({"wa_phone": sender}).execute()
-    except Exception as e:
-        logging.exception("wa_users upsert failed: %s", e)
+        entries = data.get("entry", [])
+        for entry in entries:
+            changes = entry.get("changes", [])
+            for change in changes:
+                value = change.get("value", {})
 
-    # --------------- Command handling
-    text_upper = incoming_text.upper()
+                # 1) DELIVERY RECEIPTS / STATUSES
+                statuses = value.get("statuses", [])
+                for st in statuses:
+                    sb_safe_insert("wa_delivery", {
+                        "created_at": utcnow_iso(),
+                        "message_id": st.get("id"),
+                        "status": st.get("status"),
+                        "recipient_id": st.get("recipient_id"),
+                        "raw": st
+                    })
 
-    # HELP MENU
-    if text_upper in ["HELP", "MENU", "START"]:
-        send_whatsapp(
-            sender,
-            "📌 *Naija Tax Guide*\n\n"
-            "1️⃣ BASIC – ₦3,000 (30 days)\n"
-            "2️⃣ STANDARD – ₦8,000 (90 days)\n"
-            "3️⃣ PREMIUM – ₦30,000 (1 year)\n\n"
-            "Reply with:\n"
-            "BASIC\n"
-            "STANDARD\n"
-            "PREMIUM"
-        )
-        return jsonify({"status": "menu"}), 200
+                # 2) INCOMING MESSAGES
+                messages = value.get("messages", [])
+                for msg in messages:
+                    message_id = msg.get("id")  # THIS is the correct dedup key
+                    if message_id and dedup_seen(message_id):
+                        continue
 
-    # SUBSCRIBE FLOW
-    if text_upper in ["BASIC", "STANDARD", "PREMIUM"]:
-        plan = text_upper.lower()
+                    sender = msg.get("from", "")
+                    text = (msg.get("text", {}) or {}).get("body", "") or ""
+                    text_up = text.strip().upper()
 
-        try:
-            plan_row = (
-                supabase.table("plans")
-                .select("*")
-                .eq("plan", plan)
-                .single()
-                .execute()
-                .data
-            )
-            if not plan_row:
-                send_whatsapp(sender, "⚠️ Plan not found. Reply HELP to see plans.")
-                return jsonify({"status": "plan_missing"}), 200
+                    # Save/Upsert user
+                    try:
+                        supabase.table("wa_users").upsert({"wa_phone": sender}).execute()
+                    except Exception:
+                        pass
 
-            reference = f"NTG-{sender}-{int(datetime.utcnow().timestamp())}"
+                    # ---------------------------
+                    # MAIN BOT LOGIC
+                    # ---------------------------
+                    if text_up in ["HELP", "MENU", "START"]:
+                        send_whatsapp(
+                            sender,
+                            (
+                                "*Naija Tax Guide*\n\n"
+                                "1) BASIC – ₦3,000 (30 days)\n"
+                                "2) STANDARD – ₦8,000 (90 days)\n"
+                                "3) PREMIUM – ₦30,000 (1 year)\n\n"
+                                "Reply with: BASIC or STANDARD or PREMIUM"
+                            )
+                        )
+                        continue
 
-            supabase.table("payments").insert({
-                "wa_phone": sender,
-                "provider": "paystack",
-                "reference": reference,
-                "plan": plan,
-                "amount_kobo": plan_row["amount_kobo"],
-                "currency": "NGN",
-                "status": "pending"
-            }).execute()
+                    # If active subscription, allow access (placeholder)
+                    active = get_active_subscription(sender)
+                    if active:
+                        # You can replace this with your real tax assistant logic
+                        send_whatsapp(sender, "✅ Subscription active. Ask your tax question now.")
+                        continue
 
-            pay_url = init_paystack(reference, int(plan_row["amount_kobo"]), sender)
+                    # Subscription purchase flow
+                    if text_up in ["BASIC", "STANDARD", "PREMIUM"]:
+                        plan = text_up.lower()
+                        plan_row = get_plan(plan)
 
-            send_whatsapp(sender, f"💳 Pay to activate *{plan.upper()}*:\n{pay_url}")
-            return jsonify({"status": "payment_link"}), 200
+                        if not plan_row:
+                            send_whatsapp(sender, "❌ Plan not found. Reply HELP to see plans.")
+                            continue
 
-        except Exception as e:
-            logging.exception("Subscription flow error: %s", e)
-            send_whatsapp(sender, "⚠️ Something went wrong creating payment link. Try again later.")
-            return jsonify({"status": "error_subscribe"}), 200
+                        reference = f"NTG-{sender}-{int(datetime.utcnow().timestamp())}"
 
-    # Default response
-    send_whatsapp(sender, "Reply HELP to continue.")
-    return jsonify({"status": "ok"}), 200
+                        # record pending payment
+                        try:
+                            supabase.table("payments").insert({
+                                "wa_phone": sender,
+                                "provider": "paystack",
+                                "reference": reference,
+                                "plan": plan,
+                                "amount_kobo": plan_row["amount_kobo"],
+                                "currency": "NGN",
+                                "status": "pending",
+                                "created_at": utcnow_iso(),
+                            }).execute()
+                        except Exception as e:
+                            send_whatsapp(sender, f"❌ Payment record error. Try again. ({str(e)[:40]})")
+                            continue
 
+                        pay_url = init_paystack(reference, int(plan_row["amount_kobo"]), sender)
+                        if not pay_url:
+                            send_whatsapp(sender, "❌ Paystack init failed. Reply HELP and try again.")
+                            continue
 
-# --------------------------------------------------
-# PAYSTACK WEBHOOK
-# --------------------------------------------------
-@app.route("/paystack/webhook", methods=["POST"])
-def paystack_webhook():
-    # Verify Paystack signature
-    signature = request.headers.get("x-paystack-signature", "")
-    computed = hmac.new(
-        PAYSTACK_SECRET.encode("utf-8"),
-        request.data,
-        hashlib.sha512
-    ).hexdigest()
+                        send_whatsapp(sender, f"💳 Pay to activate *{plan.upper()}*:\n{pay_url}")
+                        continue
 
-    if not signature or not hmac.compare_digest(signature, computed):
-        return "Invalid", 403
+                    # Default response for non-subscribed users
+                    send_whatsapp(sender, "Reply HELP to see plans and activate your subscription.")
 
-    event = request.get_json(silent=True) or {}
-    logging.info("Paystack webhook: %s", json.dumps(event)[:1500])
-
-    try:
-        if event.get("event") == "charge.success":
-            ref = event["data"]["reference"]
-            email = event["data"]["customer"]["email"]
-            phone = email.split("@")[0]
-
-            payment = (
-                supabase.table("payments")
-                .select("plan")
-                .eq("reference", ref)
-                .single()
-                .execute()
-                .data
-            )
-            if not payment:
-                return "OK", 200
-
-            plan = payment["plan"]
-
-            duration_row = (
-                supabase.table("plans")
-                .select("duration_days")
-                .eq("plan", plan)
-                .single()
-                .execute()
-                .data
-            )
-            duration_days = int(duration_row["duration_days"]) if duration_row else 30
-            expires = datetime.utcnow() + timedelta(days=duration_days)
-
-            supabase.table("user_subscriptions").upsert({
-                "wa_phone": phone,
-                "plan": plan,
-                "status": "active",
-                "expires_at": expires.isoformat(),
-                "paystack_reference": ref,
-                "last_event": "charge.success"
-            }).execute()
-
-            # Mark payment as success (optional but recommended)
-            supabase.table("payments").update({
-                "status": "success"
-            }).eq("reference", ref).execute()
-
-            send_whatsapp(phone, f"✅ *{plan.upper()}* activated!\nExpires: {expires.date()}")
+        return jsonify({"status": "ok"}), 200
 
     except Exception as e:
-        logging.exception("Paystack handler error: %s", e)
+        # Never crash Meta webhook; always 200
+        sb_safe_insert("webhook_logs", {
+            "source": "meta_webhook_error",
+            "created_at": utcnow_iso(),
+            "payload": {"err": str(e)}
+        })
+        return jsonify({"status": "error"}), 200
 
-    return "OK", 200
 
-
-# --------------------------------------------------
-# PAYSTACK CALLBACK (OPTIONAL)
-# --------------------------------------------------
 @app.route("/paystack/callback", methods=["GET"])
 def paystack_callback():
-    # Paystack redirects here after payment.
-    # You can show a simple message. Activation is done by /paystack/webhook.
-    ref = request.args.get("reference") or request.args.get("trxref") or ""
-    return f"Payment received. Reference: {ref}. You can return to WhatsApp.", 200
+    # This is only for Paystack redirect after payment (webhook is what activates subscription)
+    return "Payment received. You can return to WhatsApp.", 200
+
+
+@app.route("/paystack/webhook", methods=["POST"])
+def paystack_webhook():
+    if not verify_paystack_signature(request):
+        return "Invalid", 403
+
+    event = request.get_json(force=True)
+    sb_safe_insert("webhook_logs", {
+        "source": "paystack_in",
+        "created_at": utcnow_iso(),
+        "payload": event
+    })
+
+    try:
+        if event.get("event") != "charge.success":
+            return "OK", 200
+
+        data = event.get("data", {})
+        ref = data.get("reference")
+        customer = data.get("customer", {}) or {}
+        email = customer.get("email", "")
+        phone = email.split("@")[0] if "@" in email else ""
+
+        if not ref or not phone:
+            return "OK", 200
+
+        # Mark payment success
+        try:
+            supabase.table("payments").update({
+                "status": "success",
+                "paid_at": utcnow_iso(),
+                "raw_event": event
+            }).eq("reference", ref).execute()
+        except Exception:
+            pass
+
+        # Determine plan & duration
+        pay_row = supabase.table("payments").select("plan").eq("reference", ref).single().execute().data
+        plan = pay_row.get("plan") if pay_row else None
+        if not plan:
+            return "OK", 200
+
+        plan_row = supabase.table("plans").select("duration_days").eq("plan", plan).single().execute().data
+        duration = int(plan_row.get("duration_days", 30)) if plan_row else 30
+
+        expires = datetime.utcnow() + timedelta(days=duration)
+
+        # Activate subscription
+        supabase.table("user_subscriptions").upsert({
+            "wa_phone": phone,
+            "plan": plan,
+            "status": "active",
+            "expires_at": expires.replace(microsecond=0).isoformat() + "Z",
+            "paystack_reference": ref,
+            "last_event": "charge.success",
+            "updated_at": utcnow_iso(),
+        }).execute()
+
+        send_whatsapp(phone, f"✅ *{plan.upper()}* activated!\nExpires: {expires.date()}")
+
+        return "OK", 200
+
+    except Exception as e:
+        sb_safe_insert("webhook_logs", {
+            "source": "paystack_error",
+            "created_at": utcnow_iso(),
+            "payload": {"err": str(e)}
+        })
+        return "OK", 200
