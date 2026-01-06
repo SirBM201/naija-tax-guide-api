@@ -342,5 +342,101 @@ def paystack_webhook():
     if event_type not in ("charge.success",):
         return jsonify({"ok": True})
 
-    reference = data.get("re
+    reference = data.get("reference")
+    paid = data.get("status") == "success"
 
+    if not reference or not paid:
+        return jsonify({"ok": True})
+
+    # Find pending subscription
+    sub_res = (
+        supabase.table("subscriptions")
+        .select("*")
+        .eq("paystack_ref", reference)
+        .limit(1)
+        .execute()
+    )
+    if not sub_res.data:
+        return jsonify({"ok": True})
+
+    sub = sub_res.data[0]
+    plan = sub["plan"]
+    user_id = sub["user_id"]
+
+    # expire any existing active subscription first
+    supabase.table("subscriptions").update({"status": "expired"}).eq("user_id", user_id).eq("status", "active").execute()
+
+    start_at = now_utc()
+    end_at = start_at + timedelta(days=PLAN_DAYS.get(plan, 30))
+
+    supabase.table("subscriptions").update({
+        "status": "active",
+        "start_at": start_at.isoformat(),
+        "end_at": end_at.isoformat(),
+    }).eq("id", sub["id"]).execute()
+
+    # Notify user on WhatsApp
+    user = supabase.table("users").select("wa_phone").eq("id", user_id).limit(1).execute()
+    if user.data:
+        wa_phone = user.data[0]["wa_phone"]
+        send_whatsapp_message(wa_phone,
+            f"Payment confirmed. Your {plan} subscription is now ACTIVE.\n"
+            f"Valid until: {end_at.strftime('%Y-%m-%d')}\n\n"
+            "You can now send your tax questions."
+        )
+
+    return jsonify({"ok": True})
+
+
+# =========================================================
+# Optional: Daily Expiry Endpoint (hit with cron)
+# =========================================================
+@app.post("/cron/expire")
+def cron_expire():
+    # simple shared secret protection
+    secret = request.headers.get("x-cron-secret", "")
+    expected = os.getenv("CRON_SECRET", "")
+    if expected and secret != expected:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    # expire all subs past end_at
+    now_iso = now_utc().isoformat()
+    # fetch active subs that ended
+    res = (
+        supabase.table("subscriptions")
+        .select("id")
+        .eq("status", "active")
+        .lt("end_at", now_iso)
+        .execute()
+    )
+    if res.data:
+        ids = [r["id"] for r in res.data]
+        supabase.table("subscriptions").update({"status": "expired"}).in_("id", ids).execute()
+
+    return jsonify({"ok": True, "expired_count": len(res.data or [])})
+
+
+# =========================================================
+# Admin read endpoint
+# =========================================================
+@app.get("/admin/users")
+def admin_users():
+    # simple protection
+    key = request.headers.get("x-admin-key", "")
+    expected = os.getenv("ADMIN_KEY", "")
+    if expected and key != expected:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    # optional filters: status=active/expired/pending
+    status = request.args.get("status")
+    q = supabase.table("v_admin_users").select("*").order("created_at", desc=True).limit(200)
+    if status:
+        q = q.eq("subscription_status", status)
+    data = q.execute().data
+    return jsonify({"ok": True, "data": data})
+
+
+if __name__ == "__main__":
+    # local
+    port = int(os.getenv("PORT", "8000"))
+    app.run(host="0.0.0.0", port=port)
