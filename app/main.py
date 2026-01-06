@@ -2,14 +2,20 @@ import os
 import json
 import hmac
 import hashlib
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple
 
 import requests
-from flask import Flask, request, jsonify, abort
+from flask import Flask, request, jsonify
 from supabase import create_client
 
+# ------------------------------------------------------------
+# App
+# ------------------------------------------------------------
 app = Flask(__name__)
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 # -----------------------------
 # ENV
@@ -18,7 +24,7 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "")
-WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "")  # MUST match Meta verify token exactly
+WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
 WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
 
 PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY", "")
@@ -35,17 +41,12 @@ PLAN_PRICES_KOBO = {
     "yearly": 30000 * 100,
 }
 
-PLAN_DAYS = {
-    "monthly": 30,
-    "quarterly": 90,
-    "yearly": 365,
-}
+PLAN_DAYS = {"monthly": 30, "quarterly": 90, "yearly": 365}
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
     raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
-
 
 # -----------------------------
 # Helpers
@@ -53,45 +54,20 @@ supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
-
 def parse_wa_phone(raw: str) -> str:
-    return str(raw).strip().replace("+", "").replace(" ", "")
-
+    return str(raw or "").strip().replace("+", "").replace(" ", "")
 
 def paystack_headers() -> Dict[str, str]:
-    return {
-        "Authorization": f"Bearer {PAYSTACK_SECRET_KEY}",
-        "Content-Type": "application/json",
-    }
-
+    if not PAYSTACK_SECRET_KEY:
+        raise RuntimeError("PAYSTACK_SECRET_KEY missing in environment")
+    return {"Authorization": f"Bearer {PAYSTACK_SECRET_KEY}", "Content-Type": "application/json"}
 
 def verify_paystack_signature(raw_body: bytes, signature: str) -> bool:
     if not signature:
         return False
-    mac = hmac.new(PAYSTACK_WEBHOOK_SECRET.encode("utf-8"), raw_body, hashlib.sha512).hexdigest()
+    secret = (PAYSTACK_WEBHOOK_SECRET or "").encode("utf-8")
+    mac = hmac.new(secret, raw_body, hashlib.sha512).hexdigest()
     return hmac.compare_digest(mac, signature)
-
-
-def send_whatsapp_message(to_phone: str, text: str) -> None:
-    if not (WHATSAPP_TOKEN and WHATSAPP_PHONE_NUMBER_ID):
-        return
-
-    url = f"https://graph.facebook.com/v20.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to_phone,
-        "type": "text",
-        "text": {"body": text},
-    }
-    headers = {
-        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-        "Content-Type": "application/json",
-    }
-    try:
-        requests.post(url, headers=headers, json=payload, timeout=15)
-    except Exception:
-        pass
-
 
 def safe_json() -> Dict[str, Any]:
     try:
@@ -99,6 +75,25 @@ def safe_json() -> Dict[str, Any]:
     except Exception:
         return {}
 
+def send_whatsapp_message(to_phone: str, text: str) -> None:
+    if not (WHATSAPP_TOKEN and WHATSAPP_PHONE_NUMBER_ID):
+        logging.warning("WhatsApp credentials missing; skipping send.")
+        return
+
+    url = f"https://graph.facebook.com/v20.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": parse_wa_phone(to_phone),
+        "type": "text",
+        "text": {"body": text},
+    }
+    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=15)
+        if r.status_code >= 300:
+            logging.warning("WhatsApp send failed: %s %s", r.status_code, r.text[:300])
+    except Exception as e:
+        logging.exception("WhatsApp send exception: %s", e)
 
 def upsert_user(wa_phone: str) -> Dict[str, Any]:
     wa_phone = parse_wa_phone(wa_phone)
@@ -117,7 +112,6 @@ def upsert_user(wa_phone: str) -> Dict[str, Any]:
     created = supabase.table("users").insert(insert).execute()
     return created.data[0]
 
-
 def get_active_subscription(user_id: str) -> Optional[Dict[str, Any]]:
     res = (
         supabase.table("subscriptions")
@@ -130,102 +124,84 @@ def get_active_subscription(user_id: str) -> Optional[Dict[str, Any]]:
     )
     return res.data[0] if res.data else None
 
-
 def expire_if_needed(user_id: str) -> None:
     sub = get_active_subscription(user_id)
     if not sub:
         return
-
     end_at = sub.get("end_at")
     if not end_at:
         return
-
-    end_dt = datetime.fromisoformat(str(end_at).replace("Z", "+00:00"))
+    end_dt = datetime.fromisoformat(end_at.replace("Z", "+00:00"))
     if now_utc() >= end_dt:
         supabase.table("subscriptions").update({"status": "expired"}).eq("id", sub["id"]).execute()
-
 
 def is_subscribed(user_id: str) -> Tuple[bool, Optional[Dict[str, Any]]]:
     expire_if_needed(user_id)
     sub = get_active_subscription(user_id)
     return (sub is not None, sub)
 
-
 def make_pay_link_payload(wa_phone: str, plan: str, email: str) -> Dict[str, Any]:
     if plan not in PLAN_PRICES_KOBO:
         raise ValueError("Invalid plan")
-
-    payload = {
+    amount = PLAN_PRICES_KOBO[plan]
+    payload: Dict[str, Any] = {
         "email": email,
-        "amount": PLAN_PRICES_KOBO[plan],
+        "amount": amount,
         "currency": "NGN",
         "reference": f"NTG_{wa_phone}_{int(now_utc().timestamp())}",
-        "metadata": {
-            "wa_phone": wa_phone,
-            "plan": plan,
-            "product": "Naija Tax Guide",
-        },
+        "metadata": {"wa_phone": wa_phone, "plan": plan, "product": "Naija Tax Guide"},
     }
-
     if APP_PUBLIC_BASE_URL:
         payload["callback_url"] = f"{APP_PUBLIC_BASE_URL}/payment-success"
-
     return payload
-
 
 # -----------------------------
 # Routes
 # -----------------------------
+@app.get("/")
+def home():
+    return jsonify({"ok": True, "service": "naija-tax-guide-api", "routes": ["/health", "/webhook", "/paystack/initialize", "/paystack/webhook"]})
+
 @app.get("/health")
 def health():
-    # Use this to keep the service warm if needed
-    return jsonify({"ok": True, "service": "naija-tax-guide-api"}), 200
-
+    return jsonify({"ok": True, "service": "naija-tax-guide-api"})
 
 # =========================================================
 # WhatsApp webhook (verification + inbound)
 # =========================================================
-@app.route("/webhook", methods=["GET", "POST"])
-def webhook():
-    # ---- META VERIFICATION ----
-    if request.method == "GET":
-        mode = request.args.get("hub.mode", "")
-        token = request.args.get("hub.verify_token", "")
-        challenge = request.args.get("hub.challenge", "")
+@app.get("/webhook")
+def whatsapp_verify():
+    mode = request.args.get("hub.mode", "")
+    token = request.args.get("hub.verify_token", "")
+    challenge = request.args.get("hub.challenge", "")
 
-        # If your env var is empty, verification will ALWAYS fail
-        if not WHATSAPP_VERIFY_TOKEN:
-            return abort(500, description="WHATSAPP_VERIFY_TOKEN is missing in env vars")
+    if mode == "subscribe" and token == WHATSAPP_VERIFY_TOKEN:
+        return challenge, 200
+    return "Forbidden", 403
 
-        if mode == "subscribe" and token == WHATSAPP_VERIFY_TOKEN:
-            # Must return the raw challenge only
-            return str(challenge), 200
-
-        return abort(403)
-
-    # ---- INBOUND EVENTS ----
+@app.post("/webhook")
+def whatsapp_inbound():
     payload = safe_json()
 
     try:
         entry = (payload.get("entry") or [])[0]
         changes = (entry.get("changes") or [])[0]
         value = changes.get("value") or {}
-
         messages = value.get("messages") or []
         if not messages:
-            return jsonify({"ok": True}), 200
+            return jsonify({"ok": True})
 
         msg = messages[0]
-        from_phone = msg.get("from", "")
-        text = (msg.get("text") or {}).get("body", "").strip()
+        from_phone = msg.get("from") or ""
+        text = ((msg.get("text") or {}).get("body") or "").strip()
 
         if not from_phone:
-            return jsonify({"ok": True}), 200
+            return jsonify({"ok": True})
 
         user = upsert_user(from_phone)
         user_id = user["id"]
 
-        subscribed, _sub = is_subscribed(user_id)
+        subscribed, _ = is_subscribed(user_id)
 
         if not subscribed:
             reply = (
@@ -247,32 +223,25 @@ def webhook():
                 )
 
             send_whatsapp_message(parse_wa_phone(from_phone), reply)
-            return jsonify({"ok": True}), 200
+            return jsonify({"ok": True})
 
         if text.lower() in ("help", "menu"):
-            send_whatsapp_message(
-                parse_wa_phone(from_phone),
-                "You are active.\nSend your tax question now, or type MENU anytime."
-            )
-            return jsonify({"ok": True}), 200
+            send_whatsapp_message(parse_wa_phone(from_phone), "You are active.\nSend your tax question now, or type MENU anytime.")
+            return jsonify({"ok": True})
 
-        send_whatsapp_message(
-            parse_wa_phone(from_phone),
-            "Received. Your request is being processed.\n\n(Next step: connect your Tax Q&A engine here.)"
-        )
-        return jsonify({"ok": True}), 200
+        send_whatsapp_message(parse_wa_phone(from_phone), "Received. Your request is being processed.\n\n(Next step: connect your Tax Q&A engine here.)")
+        return jsonify({"ok": True})
 
-    except Exception:
-        # Always 200 to prevent retry storms
-        return jsonify({"ok": True}), 200
-
+    except Exception as e:
+        logging.exception("Webhook inbound error: %s", e)
+        return jsonify({"ok": True})
 
 # =========================================================
 # Paystack Initialize
 # =========================================================
 def create_paystack_transaction(wa_phone: str, plan: str, email: str) -> Dict[str, Any]:
     wa_phone = parse_wa_phone(wa_phone)
-    plan = plan.lower().strip()
+    plan = (plan or "").lower().strip()
 
     if plan not in PLAN_PRICES_KOBO:
         raise ValueError("Invalid plan")
@@ -280,6 +249,7 @@ def create_paystack_transaction(wa_phone: str, plan: str, email: str) -> Dict[st
     user = upsert_user(wa_phone)
 
     payload = make_pay_link_payload(wa_phone, plan, email)
+
     r = requests.post(
         "https://api.paystack.co/transaction/initialize",
         headers=paystack_headers(),
@@ -292,8 +262,7 @@ def create_paystack_transaction(wa_phone: str, plan: str, email: str) -> Dict[st
 
     ref = data["data"]["reference"]
 
-    # NOTE: your DB screenshot shows subscriptions table might not have amount_kobo
-    # We will insert ONLY what we know is safe. (You can add amount_kobo later if you want.)
+    # create pending subscription record (do NOT depend on amount_kobo unless you add that column)
     supabase.table("subscriptions").insert({
         "user_id": user["id"],
         "plan": plan,
@@ -308,7 +277,6 @@ def create_paystack_transaction(wa_phone: str, plan: str, email: str) -> Dict[st
         "reference": ref,
     }
 
-
 @app.post("/paystack/initialize")
 def paystack_initialize():
     body = safe_json()
@@ -321,10 +289,9 @@ def paystack_initialize():
 
     try:
         result = create_paystack_transaction(wa_phone, plan, email)
-        return jsonify({"ok": True, **result}), 200
+        return jsonify({"ok": True, **result})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 400
-
 
 # =========================================================
 # Paystack Webhook (activate subscription)
@@ -341,29 +308,23 @@ def paystack_webhook():
     event_type = event.get("event", "")
     data = event.get("data", {}) or {}
 
-    if event_type not in ("charge.success",):
-        return jsonify({"ok": True}), 200
+    if event_type != "charge.success":
+        return jsonify({"ok": True})
 
     reference = data.get("reference")
     paid = data.get("status") == "success"
-
     if not reference or not paid:
-        return jsonify({"ok": True}), 200
+        return jsonify({"ok": True})
 
-    sub_res = (
-        supabase.table("subscriptions")
-        .select("*")
-        .eq("paystack_ref", reference)
-        .limit(1)
-        .execute()
-    )
+    sub_res = supabase.table("subscriptions").select("*").eq("paystack_ref", reference).limit(1).execute()
     if not sub_res.data:
-        return jsonify({"ok": True}), 200
+        return jsonify({"ok": True})
 
     sub = sub_res.data[0]
     plan = sub["plan"]
     user_id = sub["user_id"]
 
+    # expire any existing active subscription first
     supabase.table("subscriptions").update({"status": "expired"}).eq("user_id", user_id).eq("status", "active").execute()
 
     start_at = now_utc()
@@ -375,9 +336,9 @@ def paystack_webhook():
         "end_at": end_at.isoformat(),
     }).eq("id", sub["id"]).execute()
 
-    user = supabase.table("users").select("wa_phone").eq("id", user_id).limit(1).execute()
-    if user.data:
-        wa_phone = user.data[0]["wa_phone"]
+    user_res = supabase.table("users").select("wa_phone").eq("id", user_id).limit(1).execute()
+    if user_res.data:
+        wa_phone = user_res.data[0]["wa_phone"]
         send_whatsapp_message(
             wa_phone,
             f"Payment confirmed. Your {plan} subscription is now ACTIVE.\n"
@@ -385,8 +346,7 @@ def paystack_webhook():
             "You can now send your tax questions."
         )
 
-    return jsonify({"ok": True}), 200
-
+    return jsonify({"ok": True})
 
 # =========================================================
 # Optional: Daily Expiry Endpoint (hit with cron)
@@ -406,12 +366,11 @@ def cron_expire():
         .lt("end_at", now_iso)
         .execute()
     )
-    if res.data:
-        ids = [r["id"] for r in res.data]
+    ids = [r["id"] for r in (res.data or [])]
+    if ids:
         supabase.table("subscriptions").update({"status": "expired"}).in_("id", ids).execute()
 
-    return jsonify({"ok": True, "expired_count": len(res.data or [])}), 200
-
+    return jsonify({"ok": True, "expired_count": len(ids)})
 
 # =========================================================
 # Admin read endpoint
@@ -428,8 +387,7 @@ def admin_users():
     if status:
         q = q.eq("subscription_status", status)
     data = q.execute().data
-    return jsonify({"ok": True, "data": data}), 200
-
+    return jsonify({"ok": True, "data": data})
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
