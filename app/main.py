@@ -14,7 +14,6 @@ from supabase import create_client
 # App
 # ------------------------------------------------------------
 app = Flask(__name__)
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 # -----------------------------
@@ -54,8 +53,22 @@ supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
+def iso(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).isoformat()
+
 def parse_wa_phone(raw: str) -> str:
     return str(raw or "").strip().replace("+", "").replace(" ", "")
+
+def normalize_plan(plan: str) -> str:
+    p = (plan or "").strip().lower()
+    # tolerate common variants
+    if p in ("month", "1month", "1_month", "m", "monthly"):
+        return "monthly"
+    if p in ("quarter", "3months", "3_months", "q", "quarterly"):
+        return "quarterly"
+    if p in ("year", "12months", "12_months", "y", "yearly", "annual"):
+        return "yearly"
+    return p
 
 def paystack_headers() -> Dict[str, str]:
     if not PAYSTACK_SECRET_KEY:
@@ -66,6 +79,8 @@ def verify_paystack_signature(raw_body: bytes, signature: str) -> bool:
     if not signature:
         return False
     secret = (PAYSTACK_WEBHOOK_SECRET or "").encode("utf-8")
+    if not secret:
+        return False
     mac = hmac.new(secret, raw_body, hashlib.sha512).hexdigest()
     return hmac.compare_digest(mac, signature)
 
@@ -101,39 +116,69 @@ def upsert_user(wa_phone: str) -> Dict[str, Any]:
     res = supabase.table("users").select("*").eq("wa_phone", wa_phone).limit(1).execute()
     if res.data:
         user = res.data[0]
-        supabase.table("users").update({"last_seen_at": now_utc().isoformat()}).eq("id", user["id"]).execute()
+        supabase.table("users").update({"last_seen_at": iso(now_utc())}).eq("id", user["id"]).execute()
         return user
 
     insert = {
         "wa_phone": wa_phone,
         "state": "idle",
-        "last_seen_at": now_utc().isoformat(),
+        "last_seen_at": iso(now_utc()),
     }
     created = supabase.table("users").insert(insert).execute()
     return created.data[0]
 
 def get_active_subscription(user_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Active means:
+    - status = 'active'
+    - end_at is in the future (if end_at exists)
+    """
     res = (
         supabase.table("subscriptions")
         .select("*")
         .eq("user_id", user_id)
         .eq("status", "active")
-        .order("created_at", desc=True)
+        .order("updated_at", desc=True)
         .limit(1)
         .execute()
     )
-    return res.data[0] if res.data else None
+    if not res.data:
+        return None
+
+    sub = res.data[0]
+    end_at = sub.get("end_at")
+    if not end_at:
+        return sub
+
+    try:
+        end_dt = datetime.fromisoformat(str(end_at).replace("Z", "+00:00"))
+        if now_utc() < end_dt:
+            return sub
+    except Exception:
+        # if parsing fails, still treat as active (safer than blocking)
+        return sub
+
+    return None
 
 def expire_if_needed(user_id: str) -> None:
     sub = get_active_subscription(user_id)
     if not sub:
         return
+
     end_at = sub.get("end_at")
     if not end_at:
         return
-    end_dt = datetime.fromisoformat(end_at.replace("Z", "+00:00"))
+
+    try:
+        end_dt = datetime.fromisoformat(str(end_at).replace("Z", "+00:00"))
+    except Exception:
+        return
+
     if now_utc() >= end_dt:
-        supabase.table("subscriptions").update({"status": "expired"}).eq("id", sub["id"]).execute()
+        supabase.table("subscriptions").update({
+            "status": "expired",
+            "updated_at": iso(now_utc())
+        }).eq("id", sub["id"]).execute()
 
 def is_subscribed(user_id: str) -> Tuple[bool, Optional[Dict[str, Any]]]:
     expire_if_needed(user_id)
@@ -141,8 +186,10 @@ def is_subscribed(user_id: str) -> Tuple[bool, Optional[Dict[str, Any]]]:
     return (sub is not None, sub)
 
 def make_pay_link_payload(wa_phone: str, plan: str, email: str) -> Dict[str, Any]:
+    plan = normalize_plan(plan)
     if plan not in PLAN_PRICES_KOBO:
         raise ValueError("Invalid plan")
+
     amount = PLAN_PRICES_KOBO[plan]
     payload: Dict[str, Any] = {
         "email": email,
@@ -160,7 +207,11 @@ def make_pay_link_payload(wa_phone: str, plan: str, email: str) -> Dict[str, Any
 # -----------------------------
 @app.get("/")
 def home():
-    return jsonify({"ok": True, "service": "naija-tax-guide-api", "routes": ["/health", "/webhook", "/paystack/initialize", "/paystack/webhook"]})
+    return jsonify({
+        "ok": True,
+        "service": "naija-tax-guide-api",
+        "routes": ["/health", "/webhook", "/paystack/initialize", "/paystack/webhook"]
+    })
 
 @app.get("/health")
 def health():
@@ -213,7 +264,7 @@ def whatsapp_inbound():
                 "Reply with: monthly / quarterly / yearly"
             )
 
-            plan = text.lower()
+            plan = normalize_plan(text.lower())
             if plan in PLAN_PRICES_KOBO:
                 email = f"{parse_wa_phone(from_phone)}@naijatax.local"
                 init = create_paystack_transaction(parse_wa_phone(from_phone), plan, email)
@@ -241,7 +292,7 @@ def whatsapp_inbound():
 # =========================================================
 def create_paystack_transaction(wa_phone: str, plan: str, email: str) -> Dict[str, Any]:
     wa_phone = parse_wa_phone(wa_phone)
-    plan = (plan or "").lower().strip()
+    plan = normalize_plan(plan)
 
     if plan not in PLAN_PRICES_KOBO:
         raise ValueError("Invalid plan")
@@ -262,13 +313,16 @@ def create_paystack_transaction(wa_phone: str, plan: str, email: str) -> Dict[st
 
     ref = data["data"]["reference"]
 
-    # create pending subscription record (do NOT depend on amount_kobo unless you add that column)
+    # Create a PENDING subscription record in public.subscriptions
+    # This is what the webhook will later "activate".
     supabase.table("subscriptions").insert({
         "user_id": user["id"],
         "plan": plan,
         "status": "pending",
         "paystack_ref": ref,
+        "amount_kobo": PLAN_PRICES_KOBO[plan],
         "currency": "NGN",
+        "updated_at": iso(now_utc()),
     }).execute()
 
     return {
@@ -281,7 +335,7 @@ def create_paystack_transaction(wa_phone: str, plan: str, email: str) -> Dict[st
 def paystack_initialize():
     body = safe_json()
     wa_phone = parse_wa_phone(str(body.get("wa_phone", "")).strip())
-    plan = str(body.get("plan", "")).strip().lower()
+    plan = normalize_plan(str(body.get("plan", "")).strip())
     email = str(body.get("email", "")).strip().lower()
 
     if not wa_phone or not plan or not email:
@@ -298,7 +352,7 @@ def paystack_initialize():
 # =========================================================
 @app.post("/paystack/webhook")
 def paystack_webhook():
-    raw = request.get_data()
+    raw = request.get_data() or b""
     signature = request.headers.get("x-paystack-signature", "")
 
     if not verify_paystack_signature(raw, signature):
@@ -308,40 +362,72 @@ def paystack_webhook():
     event_type = event.get("event", "")
     data = event.get("data", {}) or {}
 
+    # Only process successful charges
     if event_type != "charge.success":
         return jsonify({"ok": True})
 
     reference = data.get("reference")
-    paid = data.get("status") == "success"
-    if not reference or not paid:
+    if not reference:
         return jsonify({"ok": True})
 
-    sub_res = supabase.table("subscriptions").select("*").eq("paystack_ref", reference).limit(1).execute()
+    # Paystack sends "success" for successful charge
+    status = str(data.get("status", "")).lower()
+    if status != "success":
+        return jsonify({"ok": True})
+
+    # Locate the pending subscription by reference
+    sub_res = (
+        supabase.table("subscriptions")
+        .select("*")
+        .eq("paystack_ref", reference)
+        .limit(1)
+        .execute()
+    )
     if not sub_res.data:
         return jsonify({"ok": True})
 
     sub = sub_res.data[0]
-    plan = sub["plan"]
-    user_id = sub["user_id"]
+    plan = normalize_plan(sub.get("plan"))
+    user_id = sub.get("user_id")
 
-    # expire any existing active subscription first
-    supabase.table("subscriptions").update({"status": "expired"}).eq("user_id", user_id).eq("status", "active").execute()
+    if not user_id or not plan:
+        return jsonify({"ok": True})
 
+    # Expire any existing ACTIVE subscription for this user (only active)
+    supabase.table("subscriptions").update({
+        "status": "expired",
+        "updated_at": iso(now_utc())
+    }).eq("user_id", user_id).eq("status", "active").execute()
+
+    # Compute validity
     start_at = now_utc()
     end_at = start_at + timedelta(days=PLAN_DAYS.get(plan, 30))
 
+    # Prefer Paystack event amount/currency if present
+    amount_kobo = data.get("amount")  # usually integer kobo
+    currency = data.get("currency") or "NGN"
+
+    if amount_kobo is None:
+        amount_kobo = PLAN_PRICES_KOBO.get(plan)
+
+    # Activate THIS subscription row (idempotent update)
     supabase.table("subscriptions").update({
         "status": "active",
-        "start_at": start_at.isoformat(),
-        "end_at": end_at.isoformat(),
+        "start_at": iso(start_at),
+        "end_at": iso(end_at),
+        "amount_kobo": amount_kobo,
+        "currency": currency,
+        "updated_at": iso(now_utc()),
     }).eq("id", sub["id"]).execute()
 
+    # Notify user on WhatsApp
     user_res = supabase.table("users").select("wa_phone").eq("id", user_id).limit(1).execute()
     if user_res.data:
         wa_phone = user_res.data[0]["wa_phone"]
         send_whatsapp_message(
             wa_phone,
-            f"Payment confirmed. Your {plan} subscription is now ACTIVE.\n"
+            f"✅ Payment confirmed.\n\n"
+            f"Your *{plan.upper()}* subscription is now ACTIVE.\n"
             f"Valid until: {end_at.strftime('%Y-%m-%d')}\n\n"
             "You can now send your tax questions."
         )
@@ -358,7 +444,7 @@ def cron_expire():
     if expected and secret != expected:
         return jsonify({"ok": False, "error": "forbidden"}), 403
 
-    now_iso = now_utc().isoformat()
+    now_iso = iso(now_utc())
     res = (
         supabase.table("subscriptions")
         .select("id")
@@ -368,7 +454,10 @@ def cron_expire():
     )
     ids = [r["id"] for r in (res.data or [])]
     if ids:
-        supabase.table("subscriptions").update({"status": "expired"}).in_("id", ids).execute()
+        supabase.table("subscriptions").update({
+            "status": "expired",
+            "updated_at": iso(now_utc())
+        }).in_("id", ids).execute()
 
     return jsonify({"ok": True, "expired_count": len(ids)})
 
