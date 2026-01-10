@@ -1,13 +1,3 @@
-def activate_user_subscription(wa_phone: str, plan: str) -> None:
-    expires_at = iso(now_utc() + timedelta(days=DEFAULT_PLAN_DURATION_DAYS))
-    supabase.table("user_subscriptions").upsert({
-        "wa_phone": wa_phone,
-        "plan": plan,
-        "status": "active",
-        "expires_at": expires_at,
-        "updated_at": iso(now_utc())
-    }, on_conflict="wa_phone").execute()
-
 @app.post("/paystack/webhook")
 def paystack_webhook():
     raw = request.get_data() or b""
@@ -29,7 +19,6 @@ def paystack_webhook():
 
     # We only activate on charge.success
     if event_type == "charge.success" and reference:
-        # read our payment record
         pay = supabase.table("payments").select("*").eq("reference", reference).limit(1).execute().data
         if pay:
             pay = pay[0]
@@ -39,7 +28,8 @@ def paystack_webhook():
             # update payment
             supabase.table("payments").update({
                 "status": "success",
-                "meta": {"paystack_event": event}
+                "paid_at": iso(now_utc()),
+                "raw_event": {"source": "webhook", "paystack_event": event}
             }).eq("reference", reference).execute()
 
             # activate subscription
@@ -57,5 +47,4 @@ def paystack_webhook():
                 except Exception:
                     pass
 
-    # Always ACK quickly
     return "ok", 200
