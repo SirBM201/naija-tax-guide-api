@@ -34,22 +34,23 @@ APP_PUBLIC_BASE_URL = os.getenv("APP_PUBLIC_BASE_URL", "").rstrip("/")
 SUPPORT_EMAIL = os.getenv("SUPPORT_EMAIL", "info@thecre8hub.com")
 SUPPORT_PHONE = os.getenv("SUPPORT_PHONE", "+2347034941158")
 
-PLAN_PRICES_KOBO = {
-    "monthly": 3000 * 100,
-    "quarterly": 8000 * 100,
-    "yearly": 30000 * 100,
-}
+# Optional (recommended)
+PAYSTACK_CALLBACK_URL = os.getenv("PAYSTACK_CALLBACK_URL", "").strip()  # e.g. https://thecre8hub.com/payment-success
 
-PLAN_DAYS = {
-    "monthly": 30,
-    "quarterly": 90,
-    "yearly": 365,
+# Mapping: what users type in WhatsApp -> what exists in DB (public.plans.plan)
+PLAN_ALIAS_TO_DB = {
+    "monthly": "basic",
+    "quarterly": "standard",
+    "yearly": "premium",
+    # allow direct DB plan names too
+    "basic": "basic",
+    "standard": "standard",
+    "premium": "premium",
 }
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
     raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
 
-# Paystack key should exist if you want payment links to work
 if not PAYSTACK_SECRET_KEY:
     log.warning("PAYSTACK_SECRET_KEY is missing. /paystack/initialize will fail until set.")
 
@@ -60,6 +61,15 @@ supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 # ------------------------------------------------------------
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
+
+def iso(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+
+def parse_iso(s: str) -> Optional[datetime]:
+    try:
+        return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    except Exception:
+        return None
 
 def parse_wa_phone(raw: str) -> str:
     return raw.strip().replace("+", "").replace(" ", "")
@@ -83,10 +93,14 @@ def safe_json() -> Dict[str, Any]:
         return {}
 
 def send_whatsapp_message(to_phone: str, text: str) -> None:
+    """
+    WhatsApp Cloud API expects phone number without '+'
+    """
     if not (WHATSAPP_TOKEN and WHATSAPP_PHONE_NUMBER_ID):
         log.warning("WhatsApp credentials missing. Skipping send.")
         return
 
+    to_phone = parse_wa_phone(to_phone)
     url = f"https://graph.facebook.com/v20.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
     payload = {
         "messaging_product": "whatsapp",
@@ -112,13 +126,13 @@ def upsert_user(wa_phone: str) -> Dict[str, Any]:
     res = supabase.table("users").select("*").eq("wa_phone", wa_phone).limit(1).execute()
     if res.data:
         user = res.data[0]
-        supabase.table("users").update({"last_seen_at": now_utc().isoformat()}).eq("id", user["id"]).execute()
+        supabase.table("users").update({"last_seen_at": iso(now_utc())}).eq("id", user["id"]).execute()
         return user
 
     created = supabase.table("users").insert({
         "wa_phone": wa_phone,
         "state": "idle",
-        "last_seen_at": now_utc().isoformat(),
+        "last_seen_at": iso(now_utc()),
     }).execute()
     return created.data[0]
 
@@ -141,8 +155,8 @@ def expire_if_needed(user_id: str) -> None:
     end_at = sub.get("end_at")
     if not end_at:
         return
-    end_dt = datetime.fromisoformat(str(end_at).replace("Z", "+00:00"))
-    if now_utc() >= end_dt:
+    end_dt = parse_iso(end_at)
+    if end_dt and now_utc() >= end_dt:
         supabase.table("subscriptions").update({"status": "expired"}).eq("id", sub["id"]).execute()
 
 def is_subscribed(user_id: str) -> Tuple[bool, Optional[Dict[str, Any]]]:
@@ -150,24 +164,79 @@ def is_subscribed(user_id: str) -> Tuple[bool, Optional[Dict[str, Any]]]:
     sub = get_active_subscription(user_id)
     return (sub is not None, sub)
 
-def make_pay_link_payload(wa_phone: str, plan: str, email: str) -> Dict[str, Any]:
-    if plan not in PLAN_PRICES_KOBO:
-        raise ValueError("Invalid plan")
-    amount = PLAN_PRICES_KOBO[plan]
+# ------------------------------------------------------------
+# Plans (single source of truth)
+# Table: public.plans
+# Expected columns:
+#   plan (text)  -> e.g. basic/standard/premium
+#   title (text) -> BASIC, STANDARD, PREMIUM
+#   amount_kobo (int)
+#   currency (text) -> NGN
+# Optional but recommended:
+#   duration_days (int) -> 30/90/365
+# ------------------------------------------------------------
+FALLBACK_DURATION_DAYS = {
+    "basic": 30,
+    "standard": 90,
+    "premium": 365,
+}
+
+def normalize_plan(plan_raw: str) -> str:
+    p = (plan_raw or "").strip().lower()
+    return PLAN_ALIAS_TO_DB.get(p, "")
+
+def get_plan_row(plan_db: str) -> Dict[str, Any]:
+    res = (
+        supabase.table("plans")
+        .select("plan,title,amount_kobo,currency,duration_days")
+        .eq("plan", plan_db)
+        .single()
+        .execute()
+    )
+    row = res.data
+    if not row:
+        raise ValueError(f"Plan not found in DB: {plan_db}")
+
+    if row.get("amount_kobo") is None:
+        raise ValueError(f"Plan has no amount_kobo: {plan_db}")
+
+    currency = row.get("currency") or "NGN"
+    duration_days = row.get("duration_days")
+    if duration_days is None:
+        duration_days = FALLBACK_DURATION_DAYS.get(plan_db)
+    if duration_days is None:
+        raise ValueError(f"duration_days missing for plan '{plan_db}' and no fallback exists")
+
+    row["amount_kobo"] = int(row["amount_kobo"])
+    row["currency"] = str(currency)
+    row["duration_days"] = int(duration_days)
+    return row
+
+# ------------------------------------------------------------
+# Paystack initialize payload (DB-driven)
+# ------------------------------------------------------------
+def make_pay_link_payload(wa_phone: str, plan_user_input: str, email: str) -> Dict[str, Any]:
+    plan_db = normalize_plan(plan_user_input)
+    if not plan_db:
+        raise ValueError("Invalid plan. Use monthly / quarterly / yearly")
+
+    plan_row = get_plan_row(plan_db)
 
     payload = {
         "email": email,
-        "amount": amount,
-        "currency": "NGN",
+        "amount": plan_row["amount_kobo"],  # already kobo. DO NOT multiply.
+        "currency": plan_row["currency"],
         "reference": f"NTG_{wa_phone}_{int(now_utc().timestamp())}",
         "metadata": {
             "wa_phone": wa_phone,
-            "plan": plan,
+            "plan": plan_db,  # store canonical DB plan here
             "product": "Naija Tax Guide",
         },
     }
 
-    if APP_PUBLIC_BASE_URL:
+    if PAYSTACK_CALLBACK_URL:
+        payload["callback_url"] = PAYSTACK_CALLBACK_URL
+    elif APP_PUBLIC_BASE_URL:
         payload["callback_url"] = f"{APP_PUBLIC_BASE_URL}/payment-success"
 
     return payload
@@ -236,12 +305,12 @@ def whatsapp_inbound():
                     "Reply with: monthly / quarterly / yearly"
                 )
 
-                plan = text.lower().strip()
-                if plan in PLAN_PRICES_KOBO:
+                plan_input = text.lower().strip()
+                if normalize_plan(plan_input):
                     email = f"{parse_wa_phone(from_phone)}@naijatax.local"
-                    init = create_paystack_transaction(parse_wa_phone(from_phone), plan, email)
+                    init = create_paystack_transaction(parse_wa_phone(from_phone), plan_input, email)
                     reply = (
-                        f"Great. Click to pay for {plan} plan:\n{init['authorization_url']}\n\n"
+                        f"Great. Click to pay for {plan_input} plan:\n{init['authorization_url']}\n\n"
                         "After payment, your subscription activates automatically."
                     )
 
@@ -276,16 +345,14 @@ def whatsapp_inbound():
 # =========================================================
 def create_paystack_transaction(wa_phone: str, plan: str, email: str) -> Dict[str, Any]:
     wa_phone = parse_wa_phone(wa_phone)
-    plan = plan.lower().strip()
 
     if not PAYSTACK_SECRET_KEY:
         raise RuntimeError("PAYSTACK_SECRET_KEY missing")
 
-    if plan not in PLAN_PRICES_KOBO:
-        raise ValueError("Invalid plan")
-
+    # Ensure user exists
     user = upsert_user(wa_phone)
 
+    # DB-driven pricing
     payload = make_pay_link_payload(wa_phone, plan, email)
 
     r = requests.post(
@@ -295,20 +362,23 @@ def create_paystack_transaction(wa_phone: str, plan: str, email: str) -> Dict[st
         timeout=20
     )
 
-    data = r.json()
+    data = r.json() if r.content else {}
     if not data.get("status"):
         raise RuntimeError(data.get("message", "Paystack initialize failed"))
 
     ref = data["data"]["reference"]
+    plan_db = payload["metadata"]["plan"]
+    plan_row = get_plan_row(plan_db)
 
-    # NOTE: this insert will fail unless your DB allows status='pending'
+    # Keep your existing flow: create a pending subscription row
+    # NOTE: ensure your subscriptions table allows status='pending'
     supabase.table("subscriptions").insert({
         "user_id": user["id"],
-        "plan": plan,
+        "plan": plan_db,  # canonical DB plan stored
         "status": "pending",
         "paystack_ref": ref,
-        "amount_kobo": PLAN_PRICES_KOBO[plan],
-        "currency": "NGN",
+        "amount_kobo": plan_row["amount_kobo"],
+        "currency": plan_row["currency"],
     }).execute()
 
     return {
@@ -338,7 +408,7 @@ def paystack_initialize():
 # =========================================================
 @app.post("/paystack/webhook")
 def paystack_webhook():
-    raw = request.get_data()
+    raw = request.get_data() or b""
     signature = request.headers.get("x-paystack-signature", "")
 
     if not verify_paystack_signature(raw, signature):
@@ -348,15 +418,16 @@ def paystack_webhook():
     event_type = event.get("event", "")
     data = event.get("data", {}) or {}
 
-    if event_type not in ("charge.success",):
+    if event_type != "charge.success":
         return jsonify({"ok": True})
 
     reference = data.get("reference")
-    paid = data.get("status") == "success"
+    paid = (data.get("status") == "success")
 
     if not reference or not paid:
         return jsonify({"ok": True})
 
+    # Find the pending subscription row by reference
     sub_res = (
         supabase.table("subscriptions")
         .select("*")
@@ -368,31 +439,51 @@ def paystack_webhook():
         return jsonify({"ok": True})
 
     sub = sub_res.data[0]
-    plan = sub["plan"]
-    user_id = sub["user_id"]
 
+    # Idempotency: if already active, do nothing
+    if sub.get("status") == "active":
+        return jsonify({"ok": True})
+
+    plan_db = sub.get("plan") or ""
+    user_id = sub.get("user_id")
+    if not plan_db or not user_id:
+        return jsonify({"ok": True})
+
+    # Expire any other active subscriptions first (your original logic)
     supabase.table("subscriptions").update({"status": "expired"}).eq("user_id", user_id).eq("status", "active").execute()
 
-    start_at = now_utc()
-    end_at = start_at + timedelta(days=PLAN_DAYS.get(plan, 30))
+    # Determine duration from DB (with fallback)
+    plan_row = get_plan_row(plan_db)
+    duration_days = plan_row["duration_days"]
 
+    start_at = now_utc()
+    end_at = start_at + timedelta(days=int(duration_days))
+
+    # Activate this subscription
     supabase.table("subscriptions").update({
         "status": "active",
-        "start_at": start_at.isoformat(),
-        "end_at": end_at.isoformat(),
+        "start_at": iso(start_at),
+        "end_at": iso(end_at),
+        "amount_kobo": plan_row["amount_kobo"],
+        "currency": plan_row["currency"],
     }).eq("id", sub["id"]).execute()
 
+    # Notify user on WhatsApp
     user = supabase.table("users").select("wa_phone").eq("id", user_id).limit(1).execute()
     if user.data:
         wa_phone = user.data[0]["wa_phone"]
         send_whatsapp_message(wa_phone,
-            f"Payment confirmed. Your {plan} subscription is now ACTIVE.\n"
+            f"Payment confirmed. Your subscription is now ACTIVE.\n"
+            f"Plan: {plan_db}\n"
             f"Valid until: {end_at.strftime('%Y-%m-%d')}\n\n"
             "You can now send your tax questions."
         )
 
     return jsonify({"ok": True})
 
+# ------------------------------------------------------------
+# Run
+# ------------------------------------------------------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     app.run(host="0.0.0.0", port=port)
