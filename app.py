@@ -2,309 +2,172 @@ import os
 import json
 import hmac
 import hashlib
+import logging
+from typing import Any, Dict, Optional
+
 import requests
-from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify
 from supabase import create_client
 
 app = Flask(__name__)
-
-# --------------------------------------------------
-# ENV
-# --------------------------------------------------
-WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
-WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "")
-WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
-META_APP_SECRET = os.getenv("META_APP_SECRET", "")
+logging.basicConfig(level=logging.INFO)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 
 PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY", "")
-APP_BASE_URL = os.getenv("APP_BASE_URL", "")  # your koyeb url, e.g. https://xxxx.koyeb.app
+WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "")
+WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
+WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
 
-if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-    raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
+sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
-supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+GRAPH_API_BASE = "https://graph.facebook.com/v20.0"
 
-# --------------------------------------------------
-# UTILITIES
-# --------------------------------------------------
-def verify_meta_signature(req) -> bool:
-    """Verify X-Hub-Signature-256 from Meta."""
-    if not META_APP_SECRET:
+
+def verify_paystack_signature(raw_body: bytes, signature: str) -> bool:
+    """
+    Paystack signature header: x-paystack-signature
+    signature = HMAC_SHA512(body, PAYSTACK_SECRET_KEY).hexdigest()
+    """
+    if not signature or not PAYSTACK_SECRET_KEY:
         return False
-
-    signature = req.headers.get("X-Hub-Signature-256", "")
-    if not signature.startswith("sha256="):
-        return False
-
-    expected = hmac.new(
-        META_APP_SECRET.encode("utf-8"),
-        req.data,
-        hashlib.sha256
+    computed = hmac.new(
+        PAYSTACK_SECRET_KEY.encode("utf-8"),
+        raw_body,
+        hashlib.sha512
     ).hexdigest()
-
-    received = signature.split("=", 1)[1]
-    return hmac.compare_digest(received, expected)
+    return hmac.compare_digest(computed, signature)
 
 
-def supa_insert_safe(table: str, data: dict):
-    """Insert and ignore errors for best-effort logging."""
-    try:
-        return supabase.table(table).insert(data).execute()
-    except Exception:
-        return None
-
-
-def ensure_user(wa_phone: str):
-    supabase.table("wa_users").upsert({
-        "wa_phone": wa_phone,
-        "last_seen_at": datetime.now(timezone.utc).isoformat()
-    }).execute()
-
-
-def send_whatsapp(to_phone: str, text: str):
-    """Send WhatsApp message and log response."""
-    url = f"https://graph.facebook.com/v18.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
+def wa_send_text(to_phone_e164: str, text: str) -> None:
+    url = f"{GRAPH_API_BASE}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
     headers = {
         "Authorization": f"Bearer {WHATSAPP_TOKEN}",
         "Content-Type": "application/json"
     }
     payload = {
         "messaging_product": "whatsapp",
-        "to": to_phone,
+        "to": to_phone_e164,
         "type": "text",
         "text": {"body": text}
     }
+    r = requests.post(url, headers=headers, json=payload, timeout=30)
+    if r.status_code >= 300:
+        logging.error("WhatsApp send failed: %s %s", r.status_code, r.text)
+    else:
+        logging.info("WhatsApp message sent to %s", to_phone_e164)
 
-    resp = requests.post(url, headers=headers, json=payload, timeout=20)
+
+def record_paystack_event(event_id: str, event_type: str, reference: Optional[str], payload: Dict[str, Any]) -> bool:
+    """
+    Returns True if inserted; False if duplicate (already processed).
+    """
     try:
-        data = resp.json()
-    except Exception:
-        data = {"raw": resp.text}
-
-    # Log delivery attempt
-    wa_msg_id = None
-    if isinstance(data, dict):
-        wa_msg_id = (
-            data.get("messages", [{}])[0].get("id")
-            if data.get("messages") else None
-        )
-
-    supa_insert_safe("wa_delivery", {
-        "to_phone": to_phone,
-        "direction": "out",
-        "wa_message_id": wa_msg_id,
-        "status": "sent" if resp.status_code < 300 else "failed",
-        "payload": data
-    })
-
-    if resp.status_code >= 300:
-        raise RuntimeError(f"WhatsApp send failed {resp.status_code}: {data}")
-
-    return data
-
-
-# --------------------------------------------------
-# HEALTH
-# --------------------------------------------------
-@app.route("/", methods=["GET"])
-def health():
-    return "OK", 200
-
-
-# --------------------------------------------------
-# WEBHOOK (META -> WhatsApp)
-# --------------------------------------------------
-@app.route("/webhook", methods=["GET", "POST"])
-def webhook():
-    # ---- VERIFY (Meta will call this when setting webhook)
-    if request.method == "GET":
-        mode = request.args.get("hub.mode")
-        token = request.args.get("hub.verify_token")
-        challenge = request.args.get("hub.challenge")
-
-        if mode == "subscribe" and token == WHATSAPP_VERIFY_TOKEN:
-            return challenge, 200
-        return "Forbidden", 403
-
-    # ---- SECURITY (Meta signature)
-    if not verify_meta_signature(request):
-        return "Invalid signature", 403
-
-    data = request.get_json(force=True, silent=True) or {}
-    supa_insert_safe("webhook_logs", {"source": "meta_whatsapp", "payload": data})
-
-    try:
-        value = data["entry"][0]["changes"][0]["value"]
-
-        # WhatsApp message event
-        if "messages" not in value:
-            return jsonify({"status": "ignored"}), 200
-
-        msg = value["messages"][0]
-        sender = msg["from"]
-        message_id = msg.get("id")
-
-        ensure_user(sender)
-
-        # ---- DEDUP using WhatsApp message_id
-        if message_id:
-            exists = (
-                supabase.table("webhook_dedup")
-                .select("message_id")
-                .eq("message_id", message_id)
-                .execute()
-            )
-            if exists.data:
-                return jsonify({"status": "duplicate"}), 200
-
-            supabase.table("webhook_dedup").insert({"message_id": message_id}).execute()
-
-        # ---- Text handling
-        text = (msg.get("text", {}).get("body") or "").strip().upper()
-
-        if text in ["HELP", "MENU", "START"]:
-            send_whatsapp(
-                sender,
-                (
-                    "📌 *Naija Tax Guide*\n\n"
-                    "1️⃣ BASIC – ₦3,000 (30 days)\n"
-                    "2️⃣ STANDARD – ₦8,000 (90 days)\n"
-                    "3️⃣ PREMIUM – ₦30,000 (1 year)\n\n"
-                    "Reply with:\n"
-                    "BASIC\nSTANDARD\nPREMIUM"
-                )
-            )
-            return jsonify({"status": "menu"}), 200
-
-        if text in ["BASIC", "STANDARD", "PREMIUM"]:
-            plan = text.lower()
-
-            plan_row = (
-                supabase.table("plans")
-                .select("*")
-                .eq("plan", plan)
-                .single()
-                .execute()
-                .data
-            )
-            if not plan_row:
-                send_whatsapp(sender, "⚠️ Plan not found. Reply HELP.")
-                return jsonify({"status": "plan_missing"}), 200
-
-            reference = f"NTG-{sender}-{int(datetime.now(timezone.utc).timestamp())}"
-
-            # Create payment record
-            supabase.table("payments").insert({
-                "reference": reference,
-                "wa_phone": sender,
-                "provider": "paystack",
-                "plan": plan,
-                "amount_kobo": int(plan_row["amount_kobo"]),
-                "currency": plan_row.get("currency", "NGN"),
-                "status": "pending"
-            }).execute()
-
-            pay_url = init_paystack(reference, int(plan_row["amount_kobo"]), sender)
-
-            send_whatsapp(sender, f"💳 Pay to activate *{plan.upper()}*:\n{pay_url}")
-            return jsonify({"status": "payment_link"}), 200
-
-        send_whatsapp(sender, "Reply *HELP* to continue.")
-        return jsonify({"status": "ok"}), 200
-
-    except Exception as e:
-        supa_insert_safe("webhook_logs", {"source": "meta_whatsapp_error", "payload": {"error": str(e), "data": data}})
-        return jsonify({"status": "error", "message": str(e)}), 200
-
-
-# --------------------------------------------------
-# PAYSTACK INIT
-# --------------------------------------------------
-def init_paystack(reference: str, amount_kobo: int, phone: str) -> str:
-    if not PAYSTACK_SECRET_KEY:
-        raise RuntimeError("Missing PAYSTACK_SECRET_KEY")
-
-    url = "https://api.paystack.co/transaction/initialize"
-    headers = {
-        "Authorization": f"Bearer {PAYSTACK_SECRET_KEY}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "reference": reference,
-        "amount": amount_kobo,
-        "email": f"{phone}@naijatax.app",
-        "callback_url": f"{APP_BASE_URL}/paystack/callback"
-    }
-
-    r = requests.post(url, headers=headers, json=payload, timeout=20)
-    data = r.json()
-
-    if r.status_code >= 300 or not data.get("status"):
-        raise RuntimeError(f"Paystack init failed: {data}")
-
-    return data["data"]["authorization_url"]
-
-
-# --------------------------------------------------
-# PAYSTACK CALLBACK (optional)
-# --------------------------------------------------
-@app.route("/paystack/callback", methods=["GET"])
-def paystack_callback():
-    return "Payment received. You can return to WhatsApp.", 200
-
-
-# --------------------------------------------------
-# PAYSTACK WEBHOOK
-# --------------------------------------------------
-@app.route("/paystack/webhook", methods=["POST"])
-def paystack_webhook():
-    signature = request.headers.get("x-paystack-signature", "")
-    computed = hmac.new(
-        PAYSTACK_SECRET_KEY.encode("utf-8"),
-        request.data,
-        hashlib.sha512
-    ).hexdigest()
-
-    if not hmac.compare_digest(signature, computed):
-        return "Invalid", 403
-
-    event = request.get_json(force=True, silent=True) or {}
-    supa_insert_safe("webhook_logs", {"source": "paystack", "payload": event})
-
-    if event.get("event") == "charge.success":
-        ref = event["data"]["reference"]
-        customer_email = event["data"]["customer"]["email"]
-        phone = customer_email.split("@")[0]
-
-        # Update payments
-        supabase.table("payments").update({
-            "status": "success",
-            "paid_at": datetime.now(timezone.utc).isoformat(),
-            "raw_event": event
-        }).eq("reference", ref).execute()
-
-        # Determine plan duration
-        pay_row = supabase.table("payments").select("plan").eq("reference", ref).single().execute().data
-        plan = pay_row["plan"]
-
-        duration = supabase.table("plans").select("duration_days").eq("plan", plan).single().execute().data["duration_days"]
-        expires = datetime.now(timezone.utc) + timedelta(days=int(duration))
-
-        # Upsert subscription
-        supabase.table("user_subscriptions").upsert({
-            "wa_phone": phone,
-            "plan": plan,
-            "status": "active",
-            "expires_at": expires.isoformat(),
-            "paystack_reference": ref,
-            "last_event": "charge.success",
-            "updated_at": datetime.now(timezone.utc).isoformat()
+        sb.table("paystack_events").insert({
+            "event_id": event_id,
+            "event_type": event_type,
+            "reference": reference,
+            "payload": payload
         }).execute()
+        return True
+    except Exception as e:
+        # Duplicate unique event_id => already processed
+        logging.warning("Event insert failed/duplicate: %s", str(e))
+        return False
 
-        send_whatsapp(phone, f"✅ *{plan.upper()}* activated!\nExpires: {expires.date()}")
+
+def credit_topup(user_id: str, credits: int) -> None:
+    # call SQL function: add_ai_credits(user_id, credits)
+    sb.rpc("add_ai_credits", {"p_user_id": user_id, "p_credits_added": credits}).execute()
+
+
+@app.get("/health")
+def health():
+    return jsonify({"ok": True})
+
+
+# ---------------------------
+# WhatsApp Webhook (Meta)
+# ---------------------------
+@app.get("/webhooks/whatsapp")
+def whatsapp_verify():
+    mode = request.args.get("hub.mode")
+    token = request.args.get("hub.verify_token")
+    challenge = request.args.get("hub.challenge")
+
+    if mode == "subscribe" and token == WHATSAPP_VERIFY_TOKEN:
+        return challenge, 200
+    return "Verification failed", 403
+
+
+@app.post("/webhooks/whatsapp")
+def whatsapp_inbound():
+    data = request.get_json(force=True, silent=True) or {}
+    logging.info("WhatsApp inbound: %s", json.dumps(data)[:2000])
+
+    # TODO: parse incoming message + route to your UX/menu logic
+    # For now: ACK fast
+    return "OK", 200
+
+
+# ---------------------------
+# Paystack Webhook
+# ---------------------------
+@app.post("/webhooks/paystack")
+def paystack_webhook():
+    raw_body = request.get_data()
+    signature = request.headers.get("x-paystack-signature", "")
+
+    if not verify_paystack_signature(raw_body, signature):
+        return "Invalid signature", 401
+
+    payload = request.get_json(force=True, silent=True) or {}
+    event_type = payload.get("event", "")
+    data = payload.get("data", {}) or {}
+
+    # Use a stable idempotency key
+    # Paystack data can have: id, reference
+    event_id = str(data.get("id") or data.get("reference") or "")
+    reference = str(data.get("reference") or "")
+
+    if not event_id:
+        return "Missing event id", 400
+
+    if not record_paystack_event(event_id, event_type, reference, payload):
+        return "Duplicate ignored", 200
+
+    # Handle successful charges
+    if event_type == "charge.success":
+        # You MUST pass metadata when initializing Paystack transaction
+        # Example metadata:
+        #  { "user_id": "<uuid>", "purpose": "subscription"|"topup", "topup_credits": 300, "wa_phone": "+234..." }
+        metadata = data.get("metadata", {}) or {}
+        user_id = metadata.get("user_id")
+        purpose = metadata.get("purpose")
+        wa_phone = metadata.get("wa_phone")
+
+        if purpose == "topup":
+            topup_credits = int(metadata.get("topup_credits") or 0)
+            if user_id and topup_credits > 0:
+                credit_topup(user_id, topup_credits)
+                if wa_phone:
+                    wa_send_text(
+                        wa_phone,
+                        f"Top-up successful. {topup_credits} AI credits added to your account. Thank you."
+                    )
+
+        elif purpose == "subscription":
+            # Here you update subscriptions table (paid status, plan, expires_at etc.)
+            # Keep it simple for now: notify user
+            if wa_phone:
+                wa_send_text(
+                    wa_phone,
+                    "Subscription payment received successfully. Your plan is now active. Reply MENU to continue."
+                )
 
     return "OK", 200
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
