@@ -1,3 +1,4 @@
+# app/main.py
 import os
 import re
 import json
@@ -25,27 +26,26 @@ SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
 
 PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY", "").strip()
 
-# Your public website base URL (must be https in production)
-APP_BASE_URL = os.getenv("APP_BASE_URL", "").strip().rstrip("/")
+# Your public website base URL (Paystack callback goes here)
+APP_BASE_URL = os.getenv("APP_BASE_URL", "").rstrip("/")
 
-# Optional: if plan.duration_days is null, use this fallback
-DEFAULT_PLAN_DURATION_DAYS = int(os.getenv("DEFAULT_PLAN_DURATION_DAYS", "30"))
-
-# CORS allowlist (comma-separated)
+# CORS - you said you are using FRONTEND_ORIGINS (comma-separated)
 FRONTEND_ORIGINS = os.getenv("FRONTEND_ORIGINS", "").strip()
 
-# ------------------------------------------------------------
-# Constants
-# ------------------------------------------------------------
+# Optional settings
+DEFAULT_PLAN_DURATION_DAYS = int(os.getenv("DEFAULT_PLAN_DURATION_DAYS", "30"))
+SERVICE_NAME = os.getenv("SERVICE_NAME", "Naija Tax Guide")
+
 PAYSTACK_INIT_URL = "https://api.paystack.co/transaction/initialize"
 PAYSTACK_VERIFY_URL = "https://api.paystack.co/transaction/verify/"
 
 # ------------------------------------------------------------
-# Supabase client
+# Clients
 # ------------------------------------------------------------
 if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-    logging.warning("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set. Requests will fail.")
-supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+    logging.warning("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY missing. Supabase calls will fail.")
+
+supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY) if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY else None
 
 
 # ------------------------------------------------------------
@@ -58,16 +58,33 @@ def iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat()
 
 def safe_text(v: Any) -> str:
-    return str(v or "").strip()
+    return (str(v) if v is not None else "").strip()
 
 def normalize_wa_phone(wa_phone: str) -> str:
-    """
-    Normalize to digits only (your DB matching depends on consistent format).
-    Example: "+234 815-101-8785" -> "2348151018785"
-    """
     s = safe_text(wa_phone)
-    s = re.sub(r"\D", "", s)
+    s = re.sub(r"[^\d+]", "", s)
     return s
+
+def cors_origin_allowed(origin: str) -> bool:
+    if not origin:
+        return False
+    allowed = [o.strip() for o in (FRONTEND_ORIGINS or "").split(",") if o.strip()]
+    return origin in allowed
+
+@app.after_request
+def add_cors_headers(resp):
+    origin = request.headers.get("Origin", "")
+    if cors_origin_allowed(origin):
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Vary"] = "Origin"
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+        resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+    return resp
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"ok": True}), 200
 
 def paystack_headers() -> Dict[str, str]:
     return {
@@ -75,42 +92,15 @@ def paystack_headers() -> Dict[str, str]:
         "Content-Type": "application/json",
     }
 
-def cors_headers() -> Dict[str, str]:
+def get_plan_from_supabase(plan: str) -> Tuple[int, int, str]:
     """
-    Minimal CORS for your Next.js frontend. If FRONTEND_ORIGINS is empty,
-    we will not send allow-origin, which is safer.
+    Reads plan pricing from Supabase `plans` table.
+    Expected columns: plan (text), amount_kobo (int), duration_days (int), currency (text)
     """
-    origin = request.headers.get("Origin", "")
-    allowed = [o.strip() for o in FRONTEND_ORIGINS.split(",") if o.strip()]
-    if origin and origin in allowed:
-        return {
-            "Access-Control-Allow-Origin": origin,
-            "Vary": "Origin",
-            "Access-Control-Allow-Headers": "Content-Type, Authorization",
-            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-        }
-    return {}
+    if not supabase:
+        raise RuntimeError("Supabase client not configured")
 
-@app.after_request
-def apply_cors(resp):
-    for k, v in cors_headers().items():
-        resp.headers[k] = v
-    return resp
-
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"ok": True, "ts": iso(now_utc())})
-
-
-# ------------------------------------------------------------
-# DB helpers
-# ------------------------------------------------------------
-def get_plan_from_db(plan: str) -> Tuple[int, int, str]:
-    """
-    Reads public.plans where plan=eq.<plan>
-    Must return: amount_kobo, duration_days, currency
-    """
-    plan = plan.lower().strip()
+    plan = safe_text(plan).lower()
     res = (
         supabase.table("plans")
         .select("amount_kobo,duration_days,currency")
@@ -118,52 +108,48 @@ def get_plan_from_db(plan: str) -> Tuple[int, int, str]:
         .limit(1)
         .execute()
     )
-    rows = res.data or []
-    if not rows:
-        raise ValueError(f"Unknown plan '{plan}'. Check public.plans table.")
-    row = rows[0]
-    amount_kobo = int(row.get("amount_kobo") or 0)
-    duration_days = int(row.get("duration_days") or DEFAULT_PLAN_DURATION_DAYS)
-    currency = safe_text(row.get("currency") or "NGN") or "NGN"
+    row = (res.data or [])
+    if not row:
+        raise ValueError(f"Unknown plan: {plan}")
+
+    amount_kobo = int(row[0].get("amount_kobo") or 0)
+    duration_days = int(row[0].get("duration_days") or DEFAULT_PLAN_DURATION_DAYS)
+    currency = safe_text(row[0].get("currency") or "NGN")
+
     if amount_kobo <= 0:
-        raise ValueError("Plan amount_kobo must be > 0 in public.plans.")
-    if duration_days <= 0:
-        duration_days = DEFAULT_PLAN_DURATION_DAYS
+        raise ValueError(f"Invalid plan amount_kobo for plan={plan}")
+
     return amount_kobo, duration_days, currency
 
-def upsert_pending_subscription(
-    wa_phone: str,
-    email: str,
-    plan: str,
-    amount_kobo: int,
-    currency: str,
-    duration_days: int,
-    paystack_reference: str,
-) -> None:
-    """
-    Upserts into public.user_subscriptions using columns you showed:
-    wa_phone, plan, status, expires_at, paystack_reference, last_event, updated_at,
-    amount_kobo, currency, duration_days, email, reference (optional if present)
-    """
-    payload: Dict[str, Any] = {
+def upsert_pending_subscription(wa_phone: str, email: str, plan: str, amount_kobo: int, duration_days: int, currency: str, paystack_reference: str):
+    if not supabase:
+        raise RuntimeError("Supabase client not configured")
+
+    # IMPORTANT: only include columns you truly have in user_subscriptions
+    payload = {
         "wa_phone": wa_phone,
+        "email": email,
         "plan": plan,
         "status": "pending",
-        "expires_at": None,
+        "amount_kobo": amount_kobo,
+        "currency": currency,
+        "duration_days": duration_days,
         "paystack_reference": paystack_reference,
         "last_event": "charge.initialize",
         "updated_at": iso(now_utc()),
-        "amount_kobo": int(amount_kobo),
-        "currency": currency,
-        "duration_days": int(duration_days),
-        "email": email,
-        # Some schemas also have "reference". If yours exists, this helps.
-        "reference": paystack_reference,
     }
-    supabase.table("user_subscriptions").upsert(payload, on_conflict="wa_phone").execute()
 
-def activate_user_subscription(wa_phone: str, plan: str, duration_days: int) -> None:
+    supabase.table("user_subscriptions").upsert(
+        payload,
+        on_conflict="wa_phone"
+    ).execute()
+
+def activate_user_subscription(wa_phone: str, plan: str, duration_days: int):
+    if not supabase:
+        raise RuntimeError("Supabase client not configured")
+
     expires_at = iso(now_utc() + timedelta(days=int(duration_days)))
+
     supabase.table("user_subscriptions").upsert(
         {
             "wa_phone": wa_phone,
@@ -173,61 +159,33 @@ def activate_user_subscription(wa_phone: str, plan: str, duration_days: int) -> 
             "updated_at": iso(now_utc()),
             "last_event": "charge.success",
         },
-        on_conflict="wa_phone",
+        on_conflict="wa_phone"
     ).execute()
 
-def mark_failed_subscription(wa_phone: str, reason: str = "charge.failed") -> None:
-    supabase.table("user_subscriptions").update(
+def mark_failed(wa_phone: str, reason: str):
+    if not supabase:
+        raise RuntimeError("Supabase client not configured")
+
+    supabase.table("user_subscriptions").upsert(
         {
+            "wa_phone": wa_phone,
             "status": "failed",
             "last_event": reason,
             "updated_at": iso(now_utc()),
-        }
-    ).eq("wa_phone", wa_phone).execute()
-
-def find_subscription_by_reference(reference: str) -> Optional[Dict[str, Any]]:
-    """
-    Find row using paystack_reference OR reference (some schemas keep both).
-    """
-    reference = safe_text(reference)
-    if not reference:
-        return None
-
-    # Try paystack_reference first
-    res = (
-        supabase.table("user_subscriptions")
-        .select("*")
-        .eq("paystack_reference", reference)
-        .limit(1)
-        .execute()
-    )
-    rows = res.data or []
-    if rows:
-        return rows[0]
-
-    # Fallback to reference column (if your schema uses it)
-    res2 = (
-        supabase.table("user_subscriptions")
-        .select("*")
-        .eq("reference", reference)
-        .limit(1)
-        .execute()
-    )
-    rows2 = res2.data or []
-    if rows2:
-        return rows2[0]
-
-    return None
+        },
+        on_conflict="wa_phone"
+    ).execute()
 
 
 # ------------------------------------------------------------
-# Paystack endpoints
+# Paystack: Initialize
 # ------------------------------------------------------------
-@app.route("/paystack/initialize", methods=["POST", "OPTIONS"])
+@app.post("/paystack/initialize")
 def paystack_initialize():
-    if request.method == "OPTIONS":
-        return ("", 204)
-
+    """
+    Creates a Paystack transaction and redirects Paystack to:
+    {APP_BASE_URL}/payment-success?reference=...
+    """
     data = request.get_json(silent=True) or {}
     wa_phone = normalize_wa_phone(data.get("wa_phone"))
     email = safe_text(data.get("email")).lower()
@@ -235,40 +193,41 @@ def paystack_initialize():
 
     if not PAYSTACK_SECRET_KEY:
         return jsonify({"ok": False, "error": "PAYSTACK_SECRET_KEY not set"}), 500
-
     if not APP_BASE_URL:
         return jsonify({"ok": False, "error": "APP_BASE_URL not set"}), 500
-
     if not wa_phone or not email or not plan:
         return jsonify({"ok": False, "error": "wa_phone, email, plan required"}), 400
 
     try:
-        amount_kobo, duration_days, currency = get_plan_from_db(plan)
+        amount_kobo, duration_days, currency = get_plan_from_supabase(plan)
 
-        # Use Paystack reference that matches your DB row and webhook
-        paystack_reference = f"ntg_{wa_phone}_{int(now_utc().timestamp())}"
+        # Use Paystack reference generated by Paystack OR a custom one.
+        # Paystack allows custom, but we can let Paystack generate to reduce issues.
+        # However, webhook + verify returns `reference` always.
+        # We'll generate our own short reference:
+        reference = f"ntg_{re.sub(r'\\D','',wa_phone)}_{int(now_utc().timestamp())}"
 
-        # 1) record pending subscription in Supabase
+        # Save pending in Supabase BEFORE calling Paystack
         upsert_pending_subscription(
             wa_phone=wa_phone,
             email=email,
             plan=plan,
             amount_kobo=amount_kobo,
-            currency=currency,
             duration_days=duration_days,
-            paystack_reference=paystack_reference,
+            currency=currency,
+            paystack_reference=reference,
         )
 
-        # 2) initialize Paystack with callback_url to YOUR success page
         payload = {
             "email": email,
-            "amount": amount_kobo,
+            "amount": int(amount_kobo),
             "currency": currency,
-            "reference": paystack_reference,
+            "reference": reference,
             "callback_url": f"{APP_BASE_URL}/payment-success",
             "metadata": {
                 "wa_phone": wa_phone,
                 "plan": plan,
+                "service": SERVICE_NAME,
             },
         }
 
@@ -277,95 +236,119 @@ def paystack_initialize():
 
         if r.status_code >= 400 or not resp.get("status"):
             logging.error("Paystack init failed: %s", resp)
-            mark_failed_subscription(wa_phone, "initialize.failed")
-            return jsonify({"ok": False, "error": "paystack_initialize_failed", "detail": resp}), 502
+            mark_failed(wa_phone, "charge.initialize_failed")
+            return jsonify({"ok": False, "error": "paystack_init_failed", "detail": resp}), 502
 
         auth_url = resp["data"]["authorization_url"]
-        ref = resp["data"].get("reference") or paystack_reference
+        paystack_ref = resp["data"].get("reference") or reference
 
-        # Update stored reference if Paystack changes it (rare)
-        if ref != paystack_reference:
-            supabase.table("user_subscriptions").update(
-                {"paystack_reference": ref, "reference": ref, "updated_at": iso(now_utc())}
-            ).eq("wa_phone", wa_phone).execute()
+        # Keep the final reference
+        supabase.table("user_subscriptions").upsert(
+            {
+                "wa_phone": wa_phone,
+                "paystack_reference": paystack_ref,
+                "last_event": "charge.initialize",
+                "updated_at": iso(now_utc()),
+            },
+            on_conflict="wa_phone"
+        ).execute()
 
-        return jsonify({"ok": True, "authorization_url": auth_url, "reference": ref}), 200
+        return jsonify({
+            "ok": True,
+            "authorization_url": auth_url,
+            "reference": paystack_ref
+        }), 200
 
     except Exception as e:
-        logging.exception("initialize error")
+        logging.exception("Initialize error")
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
-@app.route("/paystack/verify", methods=["POST", "OPTIONS"])
+# ------------------------------------------------------------
+# Paystack: Verify (called by frontend success page)
+# ------------------------------------------------------------
+@app.post("/paystack/verify")
 def paystack_verify():
     """
-    Called by frontend success page: verifies transaction and activates subscription.
+    Frontend calls this after Paystack redirects to /payment-success.
     """
-    if request.method == "OPTIONS":
-        return ("", 204)
+    data = request.get_json(silent=True) or {}
+    reference = safe_text(data.get("reference") or data.get("trxref"))
 
     if not PAYSTACK_SECRET_KEY:
         return jsonify({"ok": False, "error": "PAYSTACK_SECRET_KEY not set"}), 500
-
-    data = request.get_json(silent=True) or {}
-    reference = safe_text(data.get("reference"))
-
     if not reference:
         return jsonify({"ok": False, "error": "reference required"}), 400
 
     try:
-        vr = requests.get(
-            f"{PAYSTACK_VERIFY_URL}{reference}",
-            headers=paystack_headers(),
-            timeout=30,
-        )
-        payload = vr.json() if vr.content else {}
+        url = f"{PAYSTACK_VERIFY_URL}{reference}"
+        r = requests.get(url, headers=paystack_headers(), timeout=30)
+        resp = r.json() if r.content else {}
 
-        if vr.status_code != 200 or not payload.get("status"):
-            return jsonify({"ok": False, "error": "verify_failed", "detail": payload}), 502
+        if r.status_code >= 400 or not resp.get("status"):
+            return jsonify({"ok": False, "error": "paystack_verify_failed", "detail": resp}), 502
 
-        v = payload.get("data") or {}
-        if v.get("status") != "success":
-            return jsonify({"ok": False, "error": f"payment_not_success: {v.get('status')}", "detail": v}), 400
+        data2 = resp.get("data") or {}
+        status = safe_text(data2.get("status"))  # "success", "failed", "abandoned"
+        metadata = data2.get("metadata") or {}
+        wa_phone = normalize_wa_phone(metadata.get("wa_phone"))
+        plan = safe_text(metadata.get("plan")).lower()
 
-        sub = find_subscription_by_reference(reference)
-        if not sub:
-            # if metadata contains phone, try using it
-            meta = v.get("metadata") or {}
-            wa_phone = normalize_wa_phone(meta.get("wa_phone"))
-            if wa_phone:
-                # attempt load by phone
-                res = supabase.table("user_subscriptions").select("*").eq("wa_phone", wa_phone).limit(1).execute()
-                rows = res.data or []
-                sub = rows[0] if rows else None
+        # If metadata missing, try to find wa_phone from DB by reference
+        if (not wa_phone) and supabase:
+            q = (
+                supabase.table("user_subscriptions")
+                .select("wa_phone,plan,duration_days")
+                .eq("paystack_reference", reference)
+                .limit(1)
+                .execute()
+            )
+            row = (q.data or [])
+            if row:
+                wa_phone = safe_text(row[0].get("wa_phone"))
+                if not plan:
+                    plan = safe_text(row[0].get("plan")).lower()
 
-        if not sub:
-            return jsonify({"ok": False, "error": "subscription_not_found_for_reference"}), 404
+        if not wa_phone:
+            return jsonify({"ok": False, "error": "Could not resolve wa_phone for this reference"}), 400
 
-        wa_phone = sub["wa_phone"]
-        plan = sub.get("plan") or (v.get("metadata") or {}).get("plan") or "monthly"
-        duration_days = int(sub.get("duration_days") or DEFAULT_PLAN_DURATION_DAYS)
+        # Update last_event always for traceability
+        if supabase:
+            supabase.table("user_subscriptions").upsert(
+                {
+                    "wa_phone": wa_phone,
+                    "paystack_reference": reference,
+                    "last_event": f"verify.{status}",
+                    "updated_at": iso(now_utc()),
+                },
+                on_conflict="wa_phone"
+            ).execute()
 
-        activate_user_subscription(wa_phone, plan, duration_days)
+        if status == "success":
+            # compute duration_days from plans
+            amount_kobo, duration_days, currency = get_plan_from_supabase(plan)
+            activate_user_subscription(wa_phone=wa_phone, plan=plan, duration_days=duration_days)
 
-        # keep audit
-        supabase.table("user_subscriptions").update(
-            {"last_event": "verify.success", "updated_at": iso(now_utc())}
-        ).eq("wa_phone", wa_phone).execute()
+            return jsonify({
+                "ok": True,
+                "status": "success",
+                "wa_phone": wa_phone,
+                "plan": plan
+            }), 200
 
-        return jsonify({"ok": True, "wa_phone": wa_phone, "plan": plan, "reference": reference}), 200
+        # not successful
+        return jsonify({"ok": False, "error": f"Payment not successful: {status}", "status": status}), 200
 
     except Exception as e:
-        logging.exception("verify error")
+        logging.exception("Verify error")
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
-@app.route("/paystack/webhook", methods=["POST"])
+# ------------------------------------------------------------
+# Paystack: Webhook (server-to-server)
+# ------------------------------------------------------------
+@app.post("/paystack/webhook")
 def paystack_webhook():
-    """
-    Paystack sends events here.
-    We MUST validate the signature: x-paystack-signature (HMAC SHA512).
-    """
     raw = request.get_data() or b""
     sig = request.headers.get("x-paystack-signature", "")
 
@@ -376,67 +359,39 @@ def paystack_webhook():
     if not hmac.compare_digest(expected, sig):
         return "invalid signature", 401
 
-    try:
-        event = json.loads(raw.decode("utf-8") or "{}")
-    except Exception:
-        return "invalid json", 400
-
+    event = request.get_json(silent=True) or {}
     event_type = safe_text(event.get("event"))
     data = event.get("data") or {}
+    metadata = data.get("metadata") or {}
+
     reference = safe_text(data.get("reference"))
-    status = safe_text(data.get("status"))
+    wa_phone = normalize_wa_phone(metadata.get("wa_phone"))
+    plan = safe_text(metadata.get("plan")).lower()
 
-    logging.info("Paystack webhook event=%s reference=%s status=%s", event_type, reference, status)
+    logging.info("Webhook received: %s ref=%s wa=%s plan=%s", event_type, reference, wa_phone, plan)
 
-    # We only activate on successful charge
-    if event_type in ("charge.success", "transaction.success") and status == "success":
-        sub = find_subscription_by_reference(reference)
+    try:
+        # Trace event
+        if supabase and wa_phone:
+            supabase.table("user_subscriptions").upsert(
+                {
+                    "wa_phone": wa_phone,
+                    "paystack_reference": reference or None,
+                    "last_event": event_type or "webhook",
+                    "updated_at": iso(now_utc()),
+                },
+                on_conflict="wa_phone"
+            ).execute()
 
-        # If not found, attempt metadata wa_phone
-        if not sub:
-            meta = data.get("metadata") or {}
-            wa_phone = normalize_wa_phone(meta.get("wa_phone"))
-            if wa_phone:
-                res = supabase.table("user_subscriptions").select("*").eq("wa_phone", wa_phone).limit(1).execute()
-                rows = res.data or []
-                sub = rows[0] if rows else None
-
-        if not sub:
-            logging.warning("Webhook success but no subscription found for reference=%s", reference)
-            return "ok", 200  # don't retry forever; you can reconcile later
-
-        wa_phone = sub["wa_phone"]
-        plan = sub.get("plan") or (data.get("metadata") or {}).get("plan") or "monthly"
-        duration_days = int(sub.get("duration_days") or DEFAULT_PLAN_DURATION_DAYS)
-
-        activate_user_subscription(wa_phone, plan, duration_days)
-
-        # Store that we processed webhook
-        supabase.table("user_subscriptions").update(
-            {
-                "last_event": event_type,
-                "updated_at": iso(now_utc()),
-                "paystack_reference": reference,
-                "reference": reference,
-            }
-        ).eq("wa_phone", wa_phone).execute()
+        # Activate on success event
+        if event_type in ("charge.success", "subscription.create", "invoice.payment_succeeded"):
+            if wa_phone and plan:
+                _, duration_days, _ = get_plan_from_supabase(plan)
+                activate_user_subscription(wa_phone=wa_phone, plan=plan, duration_days=duration_days)
+                return "ok", 200
 
         return "ok", 200
 
-    # Optional: mark failed
-    if event_type in ("charge.failed", "transaction.failed"):
-        sub = find_subscription_by_reference(reference)
-        if sub:
-            mark_failed_subscription(sub["wa_phone"], event_type)
-        return "ok", 200
-
-    # Ignore other events
-    return "ok", 200
-
-
-# ------------------------------------------------------------
-# Entrypoint (local)
-# ------------------------------------------------------------
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8000"))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    except Exception:
+        logging.exception("Webhook handling error")
+        return "error", 500
