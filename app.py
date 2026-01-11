@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional
 import requests
 from flask import Flask, request, jsonify
 from supabase import create_client
+from flask_cors import CORS
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
