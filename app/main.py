@@ -3,14 +3,10 @@ import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
-# --------------------------------------------------
+# -------------------------------------------------
 # ENV
-# --------------------------------------------------
+# -------------------------------------------------
 PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY", "").strip()
-
-# Optional: comma-separated allowed origins
-# Example:
-# CORS_ORIGINS="http://localhost:3000,https://thecre8hub.com,https://www.thecre8hub.com"
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "").strip()
 
 DEFAULT_ORIGINS = [
@@ -23,16 +19,13 @@ DEFAULT_ORIGINS = [
 def parse_origins(value: str):
     if not value:
         return DEFAULT_ORIGINS
-    return [x.strip() for x in value.split(",") if x.strip()]
+    return [v.strip() for v in value.split(",") if v.strip()]
 
-# --------------------------------------------------
+# -------------------------------------------------
 # APP
-# --------------------------------------------------
+# -------------------------------------------------
 app = Flask(__name__)
 
-# --------------------------------------------------
-# CORS (FIXED & SAFE)
-# --------------------------------------------------
 CORS(
     app,
     resources={r"/*": {"origins": parse_origins(CORS_ORIGINS)}},
@@ -41,34 +34,20 @@ CORS(
     max_age=86400,
 )
 
-# --------------------------------------------------
-# HEALTH CHECK
-# --------------------------------------------------
+# -------------------------------------------------
+# ROUTES
+# -------------------------------------------------
 @app.get("/health")
 def health():
     return jsonify({"ok": True})
 
-# --------------------------------------------------
-# PAYSTACK VERIFY
-# --------------------------------------------------
 @app.post("/paystack/verify")
 def paystack_verify():
     """
     Body:
-    {
-      "reference": "xxxx"
-    }
-
-    Returns:
-    {
-      ok: true,
-      paid: true/false,
-      reference,
-      status,
-      amount,
-      currency,
-      customer_email
-    }
+      {
+        "reference": "paystack_reference_here"
+      }
     """
 
     if not PAYSTACK_SECRET_KEY:
@@ -83,19 +62,17 @@ def paystack_verify():
     if not reference:
         return jsonify({
             "ok": False,
-            "error": "reference required"
+            "error": "reference_required"
         }), 400
 
-    try:
-        url = f"https://api.paystack.co/transaction/verify/{reference}"
-        headers = {
-            "Authorization": f"Bearer {PAYSTACK_SECRET_KEY}",
-            "Content-Type": "application/json",
-        }
+    url = f"https://api.paystack.co/transaction/verify/{reference}"
+    headers = {
+        "Authorization": f"Bearer {PAYSTACK_SECRET_KEY}"
+    }
 
+    try:
         resp = requests.get(url, headers=headers, timeout=30)
         payload = resp.json()
-
     except Exception as e:
         return jsonify({
             "ok": False,
@@ -103,33 +80,37 @@ def paystack_verify():
             "detail": str(e)
         }), 502
 
-    # Paystack logical failure
-    if not payload or payload.get("status") is not True:
+    if resp.status_code != 200:
+        return jsonify({
+            "ok": False,
+            "error": "paystack_http_error",
+            "detail": payload
+        }), 502
+
+    if payload.get("status") is not True:
         return jsonify({
             "ok": False,
             "error": "paystack_verify_failed",
             "detail": payload
         }), 400
 
-    d = payload.get("data") or {}
-    status = str(d.get("status", "")).lower()  # success / failed / abandoned
+    data = payload.get("data", {})
+    status = data.get("status", "").lower()
     paid = status == "success"
 
-    # amount is in kobo
-    amount_kobo = d.get("amount")
+    amount_kobo = data.get("amount")
     amount = amount_kobo / 100 if isinstance(amount_kobo, (int, float)) else None
 
-    customer = d.get("customer") or {}
-    customer_email = customer.get("email")
+    customer = data.get("customer") or {}
 
     return jsonify({
         "ok": True,
         "paid": paid,
         "reference": reference,
         "status": status,
-        "currency": d.get("currency"),
-        "amount_kobo": amount_kobo,
         "amount": amount,
-        "customer_email": customer_email,
-        "gateway_response": d.get("gateway_response"),
-    }), 200
+        "currency": data.get("currency"),
+        "gateway_response": data.get("gateway_response"),
+        "customer_email": customer.get("email"),
+        "raw": data
+    })
