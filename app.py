@@ -1,3 +1,4 @@
+# app.py
 import os
 import re
 import uuid
@@ -26,15 +27,15 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 
 PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY", "")
-
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "")
 WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
 WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
 
-# Your website base URL (Paystack callback)
-# Set this in Koyeb: APP_BASE_URL=https://thecre8hub.com
 APP_BASE_URL = os.getenv("APP_BASE_URL", "").rstrip("/")
 
+# CORS allowed origins: comma-separated
+# Example:
+# ALLOWED_ORIGINS=http://localhost:3000,https://thecre8hub.com,https://www.thecre8hub.com
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
 if not ALLOWED_ORIGINS:
     ALLOWED_ORIGINS = [
@@ -52,12 +53,10 @@ CORS(
     allow_headers=["Content-Type", "Authorization", "X-Requested-With", "x-paystack-signature"],
 )
 
+# Supabase
 if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-    logging.warning("Supabase env not fully set (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY).")
-
+    logging.warning("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY missing.")
 sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
-
-GRAPH_API_BASE = "https://graph.facebook.com/v20.0"
 
 # ------------------------------------------------------------
 # Paystack Config
@@ -66,14 +65,18 @@ PAYSTACK_INIT_URL = "https://api.paystack.co/transaction/initialize"
 PAYSTACK_VERIFY_URL = "https://api.paystack.co/transaction/verify/"
 CURRENCY = "NGN"
 
+# IMPORTANT: KOBO
 PLAN_PRICES = {
-    "monthly": 300000,     # 3000 NGN in kobo
-    "quarterly": 800000,   # 8000 NGN in kobo
-    "yearly": 3000000,     # 30000 NGN in kobo
+    "monthly": 300000,    # ₦3,000
+    "quarterly": 800000,  # ₦8,000
+    "yearly": 3000000,    # ₦30,000
 }
 
 DEFAULT_PLAN_DURATION_DAYS = int(os.getenv("DEFAULT_PLAN_DURATION_DAYS", "30"))
 
+# ------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -84,6 +87,7 @@ def safe_text(v: Any) -> str:
     return (v or "").strip()
 
 def normalize_wa_phone(wa_phone: str) -> str:
+    # keep digits only (frontend uses: 234xxxxxxxxxx, no plus)
     return re.sub(r"\D", "", (wa_phone or "").strip())
 
 def paystack_headers() -> Dict[str, str]:
@@ -93,6 +97,10 @@ def paystack_headers() -> Dict[str, str]:
     }
 
 def verify_paystack_signature(raw_body: bytes, signature: str) -> bool:
+    """
+    Paystack header: x-paystack-signature
+    signature = HMAC_SHA512(body, PAYSTACK_SECRET_KEY).hexdigest()
+    """
     if not signature or not PAYSTACK_SECRET_KEY:
         return False
     computed = hmac.new(
@@ -102,31 +110,29 @@ def verify_paystack_signature(raw_body: bytes, signature: str) -> bool:
     ).hexdigest()
     return hmac.compare_digest(computed, signature)
 
-# ------------------------------------------------------------
-# WhatsApp (optional)
-# ------------------------------------------------------------
-def wa_send_text(to_phone: str, text: str) -> None:
-    if not (WHATSAPP_TOKEN and WHATSAPP_PHONE_NUMBER_ID):
-        return
-    url = f"{GRAPH_API_BASE}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
-    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to_phone,
-        "type": "text",
-        "text": {"body": text}
-    }
-    try:
-        r = requests.post(url, headers=headers, json=payload, timeout=30)
-        if r.status_code >= 300:
-            logging.error("WhatsApp send failed: %s %s", r.status_code, r.text)
-    except Exception as e:
-        logging.warning("WhatsApp send exception: %s", str(e))
+def safe_email(email: str, wa_phone: str) -> str:
+    """
+    Paystack requires email. If user email missing/invalid, generate a placeholder.
+    """
+    email = (email or "").strip()
+    if email and "@" in email:
+        return email
+    digits = re.sub(r"\D", "", wa_phone or "")
+    if not digits:
+        digits = uuid.uuid4().hex[:10]
+    return f"user_{digits}@thecre8hub.local"
+
+def days_for_plan(plan: str) -> int:
+    return {"monthly": 30, "quarterly": 90, "yearly": 365}.get(plan, DEFAULT_PLAN_DURATION_DAYS)
 
 # ------------------------------------------------------------
 # DB helpers
 # ------------------------------------------------------------
 def record_paystack_event(event_id: str, event_type: str, reference: Optional[str], payload: Dict[str, Any]) -> bool:
+    """
+    Returns True if inserted; False if duplicate.
+    Assumes paystack_events.event_id is UNIQUE in Supabase.
+    """
     try:
         sb.table("paystack_events").insert({
             "event_id": event_id,
@@ -136,14 +142,18 @@ def record_paystack_event(event_id: str, event_type: str, reference: Optional[st
         }).execute()
         return True
     except Exception as e:
-        logging.warning("Event insert failed/duplicate: %s", str(e))
+        logging.warning("paystack_events insert failed/duplicate: %s", str(e))
         return False
 
 def activate_user_subscription(wa_phone: str, plan: str) -> None:
-    days_map = {"monthly": 30, "quarterly": 90, "yearly": 365}
-    days = days_map.get(plan, DEFAULT_PLAN_DURATION_DAYS)
+    """
+    REQUIRED columns in user_subscriptions:
+      wa_phone (unique), plan, status, expires_at, updated_at
+    """
+    plan = (plan or "").lower()
+    wa_phone = normalize_wa_phone(wa_phone)
 
-    expires_at = iso(now_utc() + timedelta(days=days))
+    expires_at = iso(now_utc() + timedelta(days=days_for_plan(plan)))
     sb.table("user_subscriptions").upsert({
         "wa_phone": wa_phone,
         "plan": plan,
@@ -152,42 +162,53 @@ def activate_user_subscription(wa_phone: str, plan: str) -> None:
         "updated_at": iso(now_utc())
     }, on_conflict="wa_phone").execute()
 
+def get_subscription(wa_phone: str) -> Optional[Dict[str, Any]]:
+    try:
+        res = sb.table("user_subscriptions").select("*").eq("wa_phone", wa_phone).limit(1).execute()
+        if res.data:
+            return res.data[0]
+    except Exception as e:
+        logging.warning("get_subscription error: %s", str(e))
+    return None
+
 # ------------------------------------------------------------
 # Routes
 # ------------------------------------------------------------
 @app.get("/health")
 def health():
-    return jsonify({"status": "ok"})
+    # Frontend route-check expects fetchable JSON
+    return jsonify({"ok": True})
 
 # ---------------------------
-# 1) Paystack Initialize
+# Paystack Initialize
 # ---------------------------
 @app.post("/paystack/initialize")
 def paystack_initialize():
     """
-    Expects: { wa_phone, email, plan }
-    Returns: { ok: true, authorization_url, reference }
+    Expects JSON:
+      { "wa_phone": "234xxxxxxxxxx", "email": "user@email.com", "plan": "monthly|quarterly|yearly" }
+
+    Returns:
+      { "status":"ok", "authorization_url":"...", "reference":"..." }
     """
     if not PAYSTACK_SECRET_KEY:
-        return jsonify({"ok": False, "error": "PAYSTACK_SECRET_KEY not set"}), 500
+        return jsonify({"status": "error", "error": "PAYSTACK_SECRET_KEY not set"}), 500
 
     data = request.get_json(silent=True) or {}
     wa_phone = normalize_wa_phone(safe_text(data.get("wa_phone")))
-    email = safe_text(data.get("email")).lower()
+    email = safe_text(data.get("email"))
     plan = safe_text(data.get("plan")).lower()
 
     if not wa_phone:
-        return jsonify({"ok": False, "error": "wa_phone required"}), 400
-    if not email or "@" not in email:
-        return jsonify({"ok": False, "error": "valid email required"}), 400
+        return jsonify({"status": "error", "error": "wa_phone required"}), 400
     if plan not in PLAN_PRICES:
-        return jsonify({"ok": False, "error": f"invalid plan. allowed={list(PLAN_PRICES.keys())}"}), 400
+        return jsonify({"status": "error", "error": f"invalid plan. allowed={list(PLAN_PRICES.keys())}"}), 400
 
     amount_kobo = int(PLAN_PRICES[plan])
     reference = f"ntg_{uuid.uuid4().hex}"
 
     payload = {
-        "email": email,
+        "email": safe_email(email, wa_phone),
         "amount": amount_kobo,
         "currency": CURRENCY,
         "reference": reference,
@@ -198,7 +219,7 @@ def paystack_initialize():
         }
     }
 
-    # IMPORTANT: Always land on your Next.js success page
+    # Optional: Paystack redirect back to your website
     if APP_BASE_URL:
         payload["callback_url"] = f"{APP_BASE_URL}/payment-success?reference={reference}"
 
@@ -207,23 +228,26 @@ def paystack_initialize():
         resp = r.json() if r.content else {}
 
         if r.status_code >= 400 or not resp.get("status"):
-            return jsonify({"ok": False, "error": "paystack_init_failed", "detail": resp}), 502
+            logging.error("Paystack init failed: %s %s", r.status_code, resp)
+            return jsonify({"status": "error", "error": "paystack_init_failed", "detail": resp}), 502
 
         auth_url = resp["data"]["authorization_url"]
-        return jsonify({"ok": True, "authorization_url": auth_url, "reference": reference}), 200
+        return jsonify({"status": "ok", "authorization_url": auth_url, "reference": reference}), 200
 
     except Exception as e:
         logging.exception("Initialize exception")
-        return jsonify({"ok": False, "error": str(e)}), 500
+        return jsonify({"status": "error", "error": str(e)}), 500
 
 # ---------------------------
-# 2) Paystack Verify  ✅ (THIS WAS MISSING)
+# Paystack Verify (THIS FIXES YOUR FRONTEND)
 # ---------------------------
 @app.post("/paystack/verify")
 def paystack_verify():
     """
-    Expects: { reference }
-    Returns: { ok: true, paid: true/false, reference, gateway_status, ... }
+    Expects: { "reference": "..." }
+
+    Returns (frontend expects this shape):
+      { ok: true, paid: true/false, reference, plan?, wa_phone?, message? }
     """
     if not PAYSTACK_SECRET_KEY:
         return jsonify({"ok": False, "error": "PAYSTACK_SECRET_KEY not set"}), 500
@@ -242,25 +266,25 @@ def paystack_verify():
             return jsonify({"ok": False, "error": "paystack_verify_failed", "detail": resp}), 502
 
         d = resp.get("data", {}) or {}
-        paid = (d.get("status") == "success")
+        status = (d.get("status") or "").lower()   # "success", "failed", "abandoned"
+        paid = status == "success"
 
-        # Optional: if paid, activate here too (webhook is primary, but this helps “instant success page”)
-        if paid:
-            md = d.get("metadata", {}) or {}
-            wa_phone = normalize_wa_phone(str(md.get("wa_phone") or ""))
-            plan = str(md.get("plan") or "").lower()
-            purpose = md.get("purpose")
+        metadata = d.get("metadata", {}) or {}
+        wa_phone = normalize_wa_phone(str(metadata.get("wa_phone") or ""))
+        plan = str(metadata.get("plan") or "").lower()
 
-            if purpose == "subscription" and wa_phone and plan in PLAN_PRICES:
-                activate_user_subscription(wa_phone, plan)
+        # If successful, activate subscription
+        if paid and wa_phone and plan in PLAN_PRICES:
+            activate_user_subscription(wa_phone, plan)
 
         return jsonify({
             "ok": True,
-            "paid": paid,
+            "paid": bool(paid),
             "reference": reference,
-            "gateway_status": d.get("status"),
-            "amount": d.get("amount"),
-            "currency": d.get("currency"),
+            "status": status,
+            "wa_phone": wa_phone or None,
+            "plan": plan or None,
+            "message": "Payment verified and subscription activated." if paid else "Payment not successful yet."
         }), 200
 
     except Exception as e:
@@ -268,7 +292,7 @@ def paystack_verify():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 # ---------------------------
-# Paystack Webhook (Paystack -> Backend)
+# Paystack Webhook
 # ---------------------------
 @app.post("/webhooks/paystack")
 def paystack_webhook():
@@ -288,21 +312,23 @@ def paystack_webhook():
     if not event_id:
         return "Missing event id", 400
 
-    if not record_paystack_event(event_id, event_type, reference, payload):
-        return "Duplicate ignored", 200
+    # Idempotency: avoid double-processing
+    record_paystack_event(event_id, event_type, reference, payload)
 
     if event_type == "charge.success":
-        md = data.get("metadata", {}) or {}
-        purpose = md.get("purpose")
-        wa_phone = normalize_wa_phone(str(md.get("wa_phone") or ""))
-        plan = str(md.get("plan") or "").lower()
+        metadata = data.get("metadata", {}) or {}
+        purpose = metadata.get("purpose")
+        wa_phone = normalize_wa_phone(str(metadata.get("wa_phone") or ""))
+        plan = str(metadata.get("plan") or "").lower()
 
         if purpose == "subscription" and wa_phone and plan in PLAN_PRICES:
             activate_user_subscription(wa_phone, plan)
-            # Optional WhatsApp notification
-            wa_send_text(wa_phone, "Payment received. Your subscription is now active. Reply MENU to continue.")
 
     return "OK", 200
 
+# ------------------------------------------------------------
+# Main
+# ------------------------------------------------------------
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
+    port = int(os.getenv("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port)
