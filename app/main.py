@@ -41,6 +41,86 @@ CORS(
 def health():
     return jsonify({"ok": True})
 
+@app.post("/paystack/initialize")
+def paystack_initialize():
+    """
+    Body:
+    {
+      "email": "user@email.com",
+      "amount": 3000,
+      "callback_url": "https://thecre8hub.com/payment-success"
+    }
+    """
+
+    if not PAYSTACK_SECRET_KEY:
+        return jsonify({
+            "ok": False,
+            "error": "PAYSTACK_SECRET_KEY not set"
+        }), 500
+
+    data = request.get_json(silent=True) or {}
+
+    email = str(data.get("email", "")).strip()
+    amount = data.get("amount")
+    callback_url = str(data.get("callback_url", "")).strip()
+
+    if not email or not amount:
+        return jsonify({
+            "ok": False,
+            "error": "email_and_amount_required"
+        }), 400
+
+    try:
+        amount_kobo = int(float(amount) * 100)
+    except Exception:
+        return jsonify({
+            "ok": False,
+            "error": "invalid_amount"
+        }), 400
+
+    payload = {
+        "email": email,
+        "amount": amount_kobo,
+        "callback_url": callback_url,
+        "currency": "NGN"
+    }
+
+    headers = {
+        "Authorization": f"Bearer {PAYSTACK_SECRET_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    try:
+        resp = requests.post(
+            "https://api.paystack.co/transaction/initialize",
+            json=payload,
+            headers=headers,
+            timeout=30
+        )
+        result = resp.json()
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "error": "paystack_unreachable",
+            "detail": str(e)
+        }), 502
+
+    if resp.status_code != 200 or result.get("status") is not True:
+        return jsonify({
+            "ok": False,
+            "error": "paystack_initialize_failed",
+            "detail": result
+        }), 400
+
+    data = result.get("data", {})
+
+    return jsonify({
+        "ok": True,
+        "authorization_url": data.get("authorization_url"),
+        "access_code": data.get("access_code"),
+        "reference": data.get("reference")
+    })
+
 @app.post("/paystack/verify")
 def paystack_verify():
     """
