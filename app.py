@@ -293,11 +293,14 @@ def admin_payments():
 
     res = (
         sb.table("payments")
-        .select("*")
+        .select(
+            "reference, wa_phone, provider, plan, amount_kobo, currency, status, created_at, paid_at"
+        )
         .order("created_at", desc=True)
         .limit(2000)
         .execute()
     )
+
     return jsonify(res.data or []), 200
 
 
