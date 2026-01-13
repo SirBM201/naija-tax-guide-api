@@ -10,22 +10,15 @@ from typing import Any, Optional
 
 import requests
 from flask import Flask, request, jsonify
-from flask_cors import CORS
 from supabase import create_client
+
+# Optional but strongly recommended for CORS stability
+from flask_cors import CORS
 
 # ------------------------------------------------------------
 # App
 # ------------------------------------------------------------
 app = Flask(__name__)
-
-# CORS (safe for now; tighten later)
-CORS(
-    app,
-    resources={r"/*": {"origins": "*"}},
-    allow_headers=["Content-Type", "Authorization", "x-admin-key"],
-    methods=["GET", "POST", "OPTIONS"],
-)
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 # ------------------------------------------------------------
@@ -38,7 +31,23 @@ PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY", "")
 PAYSTACK_WEBHOOK_SECRET = os.getenv("PAYSTACK_WEBHOOK_SECRET", PAYSTACK_SECRET_KEY)
 
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
+
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")  # e.g. https://xxxx.koyeb.app
 PAYSTACK_CALLBACK_URL = os.getenv("PAYSTACK_CALLBACK_URL", "")
+
+# Comma-separated origins. Example:
+# CORS_ALLOW_ORIGINS=http://localhost:3000,https://thecre8hub.com
+CORS_ALLOW_ORIGINS = os.getenv("CORS_ALLOW_ORIGINS", "http://localhost:3000").strip()
+allowed_origins = [o.strip() for o in CORS_ALLOW_ORIGINS.split(",") if o.strip()]
+
+# CORS
+CORS(
+    app,
+    resources={r"/*": {"origins": allowed_origins}},
+    supports_credentials=False,
+    allow_headers=["Content-Type", "x-admin-key"],
+    methods=["GET", "POST", "OPTIONS"],
+)
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
     logging.warning("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY missing. Admin/Paystack will fail.")
@@ -89,50 +98,6 @@ def upsert_pending_subscription(wa_phone: str, plan: str) -> None:
         "updated_at": iso(now_utc())
     }, on_conflict="wa_phone").execute()
 
-def _format_amount_ngn(amount_kobo: int) -> str:
-    # Example: 300000 -> "NGN 3000.00"
-    return f"NGN {amount_kobo / 100:.2f}"
-
-def insert_payment_row(reference: str, wa_phone: str, plan: str, email: str, rule: dict) -> None:
-    """
-    This function is intentionally tolerant:
-    - If your table has amount_kobo/currency/email columns, it will use them.
-    - If your table only has amount (string) and lacks new columns, it falls back cleanly.
-    """
-    base_row = {
-        "reference": reference,
-        "wa_phone": wa_phone,
-        "provider": "paystack",
-        "plan": plan,
-        "status": "pending",
-        "created_at": iso(now_utc()),
-        "paid_at": None,
-    }
-
-    # Try "new schema" first
-    row_new = {
-        **base_row,
-        "amount_kobo": rule["amount_kobo"],
-        "currency": rule["currency"],
-        "email": email,
-        # also store display amount if column exists
-        "amount": _format_amount_ngn(rule["amount_kobo"]),
-    }
-
-    try:
-        supabase.table("payments").insert(row_new).execute()
-        return
-    except Exception as e:
-        logging.warning(f"payments insert (new schema) failed, falling back: {e}")
-
-    # Fallback "old schema": minimal columns + amount text
-    row_old = {
-        **base_row,
-        "amount": _format_amount_ngn(rule["amount_kobo"]),
-    }
-
-    supabase.table("payments").insert(row_old).execute()
-
 # ------------------------------------------------------------
 # Health
 # ------------------------------------------------------------
@@ -145,77 +110,76 @@ def health():
 # ------------------------------------------------------------
 @app.post("/paystack/initialize")
 def paystack_initialize():
+    if not PAYSTACK_SECRET_KEY:
+        return jsonify({"ok": False, "error": "PAYSTACK_SECRET_KEY not set"}), 500
+
+    body = request.get_json(silent=True) or {}
+    email = (body.get("email") or "").strip().lower()
+    wa_phone = (body.get("wa_phone") or "").strip()
+    plan = (body.get("plan") or "").strip().lower()
+
+    if not email or "@" not in email:
+        return jsonify({"ok": False, "error": "Valid email is required"}), 400
+    if not wa_phone:
+        return jsonify({"ok": False, "error": "wa_phone is required"}), 400
+    if plan not in PLAN_RULES:
+        return jsonify({"ok": False, "error": f"Invalid plan. Use {list(PLAN_RULES.keys())}"}), 400
+
+    rule = PLAN_RULES[plan]
+    reference = uuid.uuid4().hex[:12]
+
+    # IMPORTANT: write BOTH amount_kobo and amount (numeric) to prevent schema mismatch forever
+    amount_kobo = int(rule["amount_kobo"])
+    amount = amount_kobo / 100.0
+
+    # 1) Create/Upsert payment row as pending
     try:
-        if not PAYSTACK_SECRET_KEY:
-            return jsonify({"ok": False, "error": "PAYSTACK_SECRET_KEY not set on server"}), 500
-
-        body = request.get_json(silent=True) or {}
-        email = (body.get("email") or "").strip().lower()
-        wa_phone = (body.get("wa_phone") or "").strip()
-        plan = (body.get("plan") or "").strip().lower()
-
-        if not email or "@" not in email:
-            return jsonify({"ok": False, "error": "Valid email is required"}), 400
-        if not wa_phone:
-            return jsonify({"ok": False, "error": "wa_phone is required"}), 400
-        if plan not in PLAN_RULES:
-            return jsonify({"ok": False, "error": f"Invalid plan. Use {list(PLAN_RULES.keys())}"}), 400
-
-        rule = PLAN_RULES[plan]
-        reference = uuid.uuid4().hex[:10]
-
-        # 1) Insert payment row (schema-tolerant)
-        insert_payment_row(reference, wa_phone, plan, email, rule)
-
-        # 2) Pending subscription
-        upsert_pending_subscription(wa_phone, plan)
-
-        # 3) Paystack init
-        headers = {
-            "Authorization": f"Bearer {PAYSTACK_SECRET_KEY}",
-            "Content-Type": "application/json"
-        }
-
-        payload = {
-            "email": email,
-            "amount": rule["amount_kobo"],
+        supabase.table("payments").insert({
             "reference": reference,
-            "metadata": {"wa_phone": wa_phone, "plan": plan},
-        }
-
-        if PAYSTACK_CALLBACK_URL:
-            payload["callback_url"] = PAYSTACK_CALLBACK_URL
-
-        r = requests.post(
-            "https://api.paystack.co/transaction/initialize",
-            headers=headers,
-            json=payload,
-            timeout=25
-        )
-
-        # If Paystack fails, return readable message
-        try:
-            data = r.json()
-        except Exception:
-            return jsonify({"ok": False, "error": f"Paystack non-JSON response: {r.text[:200]}"}), 502
-
-        if r.status_code >= 300 or not data.get("status"):
-            # mark payment failed (best effort)
-            try:
-                supabase.table("payments").update({"status": "failed"}).eq("reference", reference).execute()
-            except Exception as e:
-                logging.warning(f"Could not mark payment failed: {e}")
-
-            msg = data.get("message") or f"HTTP {r.status_code}"
-            return jsonify({"ok": False, "error": f"Paystack init failed: {msg}"}), 400
-
-        auth_url = (data.get("data") or {}).get("authorization_url")
-        return jsonify({"ok": True, "reference": reference, "authorization_url": auth_url})
-
+            "wa_phone": wa_phone,
+            "provider": "paystack",
+            "plan": plan,
+            "amount_kobo": amount_kobo,
+            "amount": amount,
+            "currency": rule["currency"],
+            "status": "pending",
+            "created_at": iso(now_utc()),
+            "paid_at": None,
+            "email": email,
+        }).execute()
     except Exception as e:
-        # This is the part that turns your “500” into something understandable
-        logging.exception("paystack_initialize crashed")
-        return jsonify({"ok": False, "error": f"server_error: {str(e)}"}), 500
+        logging.exception("Failed inserting payment row")
+        return jsonify({"ok": False, "error": f"db_insert_failed: {str(e)[:300]}"}), 500
+
+    # 2) Subscription pending
+    upsert_pending_subscription(wa_phone, plan)
+
+    # 3) Initialize Paystack transaction
+    headers = {"Authorization": f"Bearer {PAYSTACK_SECRET_KEY}", "Content-Type": "application/json"}
+    payload = {
+        "email": email,
+        "amount": amount_kobo,
+        "reference": reference,
+        "metadata": {"wa_phone": wa_phone, "plan": plan}
+    }
+    if PAYSTACK_CALLBACK_URL:
+        payload["callback_url"] = PAYSTACK_CALLBACK_URL
+
+    r = requests.post("https://api.paystack.co/transaction/initialize", headers=headers, json=payload, timeout=25)
+
+    try:
+        data = r.json()
+    except Exception:
+        supabase.table("payments").update({"status": "failed"}).eq("reference", reference).execute()
+        return jsonify({"ok": False, "error": f"Paystack non-JSON response: {r.text[:200]}"}), 502
+
+    if r.status_code >= 300 or not data.get("status"):
+        supabase.table("payments").update({"status": "failed"}).eq("reference", reference).execute()
+        msg = data.get("message") or f"HTTP {r.status_code}"
+        return jsonify({"ok": False, "error": f"Paystack init failed: {msg}"}), 400
+
+    auth_url = (data.get("data") or {}).get("authorization_url")
+    return jsonify({"ok": True, "reference": reference, "authorization_url": auth_url})
 
 # ------------------------------------------------------------
 # Paystack: Webhook
@@ -240,56 +204,57 @@ def paystack_webhook():
     event_type = event.get("event", "")
     data = event.get("data") or {}
     reference = data.get("reference") or ""
+    is_success = event_type in ("charge.success", "transaction.success")
+
     if not reference:
         return "ok", 200
 
-    is_success = event_type in ("charge.success", "transaction.success")
-    if not is_success:
-        return "ok", 200
-
-    # Get payment row
     pay_row = supabase.table("payments").select("*").eq("reference", reference).limit(1).execute()
-    pay_list = pay_row.data or []
-    if not pay_list:
+    rows = pay_row.data or []
+    if not rows:
         logging.warning(f"Webhook reference not found in payments: {reference}")
         return "ok", 200
 
-    pay = pay_list[0]
-    wa_phone = pay.get("wa_phone") or (data.get("metadata") or {}).get("wa_phone")
-    plan = pay.get("plan") or (data.get("metadata") or {}).get("plan")
+    pay = rows[0]
+    wa_phone = pay.get("wa_phone")
+    plan = pay.get("plan")
+
+    meta = data.get("metadata") or {}
+    wa_phone = wa_phone or meta.get("wa_phone")
+    plan = plan or meta.get("plan")
+
     if not wa_phone or not plan:
         logging.warning(f"Webhook missing wa_phone/plan for reference={reference}")
         return "ok", 200
 
-    # Update payment success (best effort; schema-tolerant)
-    update_fields = {
-        "status": "success",
-        "paid_at": iso(now_utc()),
-    }
-    # Optional if columns exist
-    update_fields["currency"] = data.get("currency") or pay.get("currency") or "NGN"
-    update_fields["amount_kobo"] = data.get("amount") or pay.get("amount_kobo")
-    update_fields["amount"] = pay.get("amount") or _format_amount_ngn(int(update_fields["amount_kobo"] or 0))
+    if is_success:
+        amount_kobo = int(data.get("amount") or pay.get("amount_kobo") or 0)
+        amount = amount_kobo / 100.0
 
-    try:
-        supabase.table("payments").update(update_fields).eq("reference", reference).execute()
-    except Exception as e:
-        logging.warning(f"payments update failed (schema mismatch likely): {e}")
-        # minimal update
-        supabase.table("payments").update({"status": "success", "paid_at": iso(now_utc())}).eq("reference", reference).execute()
+        supabase.table("payments").update({
+            "status": "success",
+            "paid_at": iso(now_utc()),
+            "amount_kobo": amount_kobo,
+            "amount": amount,
+            "currency": data.get("currency") or pay.get("currency") or "NGN",
+        }).eq("reference", reference).execute()
 
-    activate_user_subscription(wa_phone, plan)
+        activate_user_subscription(wa_phone, plan)
+
     return "ok", 200
 
 # ------------------------------------------------------------
-# Admin APIs
+# Admin
 # ------------------------------------------------------------
 @app.get("/admin/subscriptions")
 def admin_subscriptions():
     auth = require_admin(request)
     if auth:
         return auth
-    res = supabase.table("user_subscriptions").select("*").order("updated_at", desc=True).execute()
+
+    res = supabase.table("user_subscriptions") \
+        .select("wa_phone,plan,status,expires_at,updated_at") \
+        .order("updated_at", desc=True).execute()
     return jsonify(res.data or [])
 
 @app.get("/admin/payments")
@@ -297,5 +262,8 @@ def admin_payments():
     auth = require_admin(request)
     if auth:
         return auth
-    res = supabase.table("payments").select("*").order("created_at", desc=True).execute()
+
+    res = supabase.table("payments") \
+        .select("reference,wa_phone,provider,plan,amount,amount_kobo,currency,status,created_at,paid_at") \
+        .order("created_at", desc=True).execute()
     return jsonify(res.data or [])
