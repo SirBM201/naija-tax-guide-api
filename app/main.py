@@ -9,8 +9,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 import requests
-from flask import Flask, request, jsonify
-from flask_cors import CORS
+from flask import Flask, request, jsonify, make_response
 from supabase import create_client
 
 # ------------------------------------------------------------
@@ -20,47 +19,25 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 # ------------------------------------------------------------
-# CORS
-# ------------------------------------------------------------
-# IMPORTANT:
-# - Your browser calls from localhost:3000 to koyeb.app will be BLOCKED unless CORS allows it.
-# - This also allows "x-admin-key" header and preflight OPTIONS requests.
-#
-# You can control origins via env var:
-#   CORS_ORIGINS=http://localhost:3000,https://thecre8hub.com,https://www.thecre8hub.com
-#
-cors_origins_env = os.getenv("CORS_ORIGINS", "")
-default_origins = [
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-    # Add your production frontend domain(s) here:
-    "https://thecre8hub.com",
-    "https://www.thecre8hub.com",
-]
-CORS_ORIGINS = [o.strip() for o in cors_origins_env.split(",") if o.strip()] or default_origins
-
-CORS(
-    app,
-    resources={r"/*": {"origins": CORS_ORIGINS}},
-    allow_headers=["Content-Type", "x-admin-key"],
-    methods=["GET", "POST", "OPTIONS"],
-)
-
-# ------------------------------------------------------------
 # ENV
 # ------------------------------------------------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 
 PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY", "")
-# Paystack uses the same secret key for webhook signature verification.
 PAYSTACK_WEBHOOK_SECRET = os.getenv("PAYSTACK_WEBHOOK_SECRET", PAYSTACK_SECRET_KEY)
 
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
 
 # Optional
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")  # e.g. https://...koyeb.app
-PAYSTACK_CALLBACK_URL = os.getenv("PAYSTACK_CALLBACK_URL", "")  # optional redirect URL (can be blank)
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")  # e.g. https://developed-lizabeth-bmsconcept-e65bfd1d.koyeb.app
+PAYSTACK_CALLBACK_URL = os.getenv("PAYSTACK_CALLBACK_URL", "")
+
+# CORS
+# Comma-separated allowlist. Example:
+# CORS_ALLOW_ORIGINS=http://localhost:3000,https://thecre8hub.com,https://www.thecre8hub.com
+CORS_ALLOW_ORIGINS = os.getenv("CORS_ALLOW_ORIGINS", "")
+ALLOW_ALL_CORS = os.getenv("ALLOW_ALL_CORS", "").strip().lower() in ("1", "true", "yes")
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
     logging.warning("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY missing. Admin/Paystack will fail.")
@@ -85,6 +62,56 @@ def now_utc() -> datetime:
 def iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat()
 
+def _allowed_origins_list() -> list[str]:
+    if not CORS_ALLOW_ORIGINS.strip():
+        return []
+    return [o.strip() for o in CORS_ALLOW_ORIGINS.split(",") if o.strip()]
+
+def _is_origin_allowed(origin: str) -> bool:
+    if ALLOW_ALL_CORS:
+        return True
+    allowed = _allowed_origins_list()
+    if not allowed:
+        return False
+
+    # Exact match allowlist
+    if origin in allowed:
+        return True
+
+    # Optional: allow any Vercel preview if you add "*.vercel.app" style entries.
+    # We support a simple suffix rule: if an allowed origin starts with "*."
+    # Example allowed entry: "*.vercel.app"  -> allows https://anything.vercel.app
+    for a in allowed:
+        if a.startswith("*.") and origin.endswith(a[1:]):  # ".vercel.app"
+            return True
+
+    return False
+
+@app.after_request
+def add_cors_headers(resp):
+    """
+    Adds CORS headers for browser calls (fixes 'Failed to fetch' / preflight).
+    """
+    origin = request.headers.get("Origin", "")
+    if origin and _is_origin_allowed(origin):
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Vary"] = "Origin"
+        resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, x-admin-key, x-paystack-signature"
+        # Usually not needed; keep off unless you later use cookies/credentials:
+        # resp.headers["Access-Control-Allow-Credentials"] = "true"
+    return resp
+
+@app.before_request
+def handle_preflight():
+    """
+    Handles OPTIONS preflight requests globally.
+    """
+    if request.method == "OPTIONS":
+        resp = make_response("", 204)
+        return resp
+    return None
+
 def require_admin(req) -> Optional[Any]:
     key = req.headers.get("x-admin-key", "")
     if not ADMIN_API_KEY or key != ADMIN_API_KEY:
@@ -92,7 +119,6 @@ def require_admin(req) -> Optional[Any]:
     return None
 
 def activate_user_subscription(wa_phone: str, plan: str) -> None:
-    # REQUIRED structure you provided (kept exactly, only using PLAN_RULES duration)
     days = PLAN_RULES.get(plan, {}).get("days", 30)
     expires_at = iso(now_utc() + timedelta(days=days))
     supabase.table("user_subscriptions").upsert({
@@ -104,7 +130,6 @@ def activate_user_subscription(wa_phone: str, plan: str) -> None:
     }, on_conflict="wa_phone").execute()
 
 def upsert_pending_subscription(wa_phone: str, plan: str) -> None:
-    # Keep pending until Paystack webhook confirms success
     supabase.table("user_subscriptions").upsert({
         "wa_phone": wa_phone,
         "plan": plan,
@@ -165,23 +190,20 @@ def paystack_initialize():
         "email": email,
     }).execute()
 
-    # 2) Create/Upsert subscription as pending
+    # 2) Pending subscription
     upsert_pending_subscription(wa_phone, plan)
 
-    # 3) Initialize Paystack transaction
+    # 3) Initialize Paystack
     headers = {
         "Authorization": f"Bearer {PAYSTACK_SECRET_KEY}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
     }
 
     payload = {
         "email": email,
         "amount": rule["amount_kobo"],
         "reference": reference,
-        "metadata": {
-            "wa_phone": wa_phone,
-            "plan": plan
-        }
+        "metadata": {"wa_phone": wa_phone, "plan": plan},
     }
 
     if PAYSTACK_CALLBACK_URL:
@@ -191,7 +213,7 @@ def paystack_initialize():
         "https://api.paystack.co/transaction/initialize",
         headers=headers,
         json=payload,
-        timeout=25
+        timeout=25,
     )
 
     try:
@@ -200,22 +222,15 @@ def paystack_initialize():
         return jsonify({"ok": False, "error": f"Paystack non-JSON response: {r.text[:200]}"}), 502
 
     if r.status_code >= 300 or not data.get("status"):
-        supabase.table("payments").update({
-            "status": "failed",
-        }).eq("reference", reference).execute()
-
+        supabase.table("payments").update({"status": "failed"}).eq("reference", reference).execute()
         msg = data.get("message") or f"HTTP {r.status_code}"
         return jsonify({"ok": False, "error": f"Paystack init failed: {msg}"}), 400
 
     auth_url = (data.get("data") or {}).get("authorization_url")
-    return jsonify({
-        "ok": True,
-        "reference": reference,
-        "authorization_url": auth_url
-    })
+    return jsonify({"ok": True, "reference": reference, "authorization_url": auth_url})
 
 # ------------------------------------------------------------
-# Paystack: Webhook (Paystack calls server-to-server, CORS not needed here)
+# Paystack: Webhook
 # ------------------------------------------------------------
 @app.post("/paystack/webhook")
 def paystack_webhook():
@@ -283,10 +298,12 @@ def admin_subscriptions():
     if auth:
         return auth
 
-    res = supabase.table("user_subscriptions") \
-        .select("wa_phone,plan,status,expires_at,updated_at") \
-        .order("updated_at", desc=True) \
+    res = (
+        supabase.table("user_subscriptions")
+        .select("wa_phone,plan,status,expires_at,updated_at")
+        .order("updated_at", desc=True)
         .execute()
+    )
     return jsonify(res.data or [])
 
 @app.get("/admin/payments")
@@ -295,8 +312,10 @@ def admin_payments():
     if auth:
         return auth
 
-    res = supabase.table("payments") \
-        .select("reference,wa_phone,provider,plan,amount_kobo,currency,status,created_at,paid_at") \
-        .order("created_at", desc=True) \
+    res = (
+        supabase.table("payments")
+        .select("reference,wa_phone,provider,plan,amount_kobo,currency,status,created_at,paid_at")
+        .order("created_at", desc=True)
         .execute()
+    )
     return jsonify(res.data or [])
