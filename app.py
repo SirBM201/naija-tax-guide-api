@@ -291,16 +291,15 @@ def admin_payments():
     if not require_admin(request):
         return jsonify({"ok": False, "error": "unauthorized"}), 401
 
-    # Assumes table name "payments"
-    # If your payments table is different, change ONLY this table name + fields.
     res = (
         sb.table("payments")
-        .select("reference, wa_phone, amount, status, created_at")
+        .select("*")
         .order("created_at", desc=True)
         .limit(2000)
         .execute()
     )
     return jsonify(res.data or []), 200
+
 
 # ---------------------------
 # Paystack Initialize
