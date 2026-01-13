@@ -40,9 +40,17 @@ APP_BASE_URL = os.getenv("APP_BASE_URL", "").rstrip("/")
 # Admin key for protected admin/cron endpoints
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
 
+# -----------------------------
+# SMTP (Email receipts)
+# -----------------------------
+SMTP_HOST = os.getenv("SMTP_HOST", "").strip()
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USERNAME = os.getenv("SMTP_USERNAME", "").strip()
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "").strip()
+SMTP_FROM_NAME = os.getenv("SMTP_FROM_NAME", "Naija Tax Guide").strip()
+SMTP_FROM_EMAIL = os.getenv("SMTP_FROM_EMAIL", SMTP_USERNAME).strip()
+
 # CORS allowed origins: comma-separated
-# Example:
-# ALLOWED_ORIGINS=http://localhost:3000,https://thecre8hub.com,https://www.thecre8hub.com
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
 if not ALLOWED_ORIGINS:
     ALLOWED_ORIGINS = [
@@ -62,7 +70,7 @@ CORS(
         "Authorization",
         "X-Requested-With",
         "x-paystack-signature",
-        "x-admin-key",  # IMPORTANT for admin dashboard + cron
+        "x-admin-key",
     ],
 )
 
@@ -100,7 +108,6 @@ def safe_text(v: Any) -> str:
     return (v or "").strip()
 
 def normalize_wa_phone(wa_phone: str) -> str:
-    # keep digits only (frontend uses: 234xxxxxxxxxx, no plus)
     return re.sub(r"\D", "", (wa_phone or "").strip())
 
 def paystack_headers() -> Dict[str, str]:
@@ -110,10 +117,6 @@ def paystack_headers() -> Dict[str, str]:
     }
 
 def verify_paystack_signature(raw_body: bytes, signature: str) -> bool:
-    """
-    Paystack header: x-paystack-signature
-    signature = HMAC_SHA512(body, PAYSTACK_SECRET_KEY).hexdigest()
-    """
     if not signature or not PAYSTACK_SECRET_KEY:
         return False
     computed = hmac.new(
@@ -124,9 +127,6 @@ def verify_paystack_signature(raw_body: bytes, signature: str) -> bool:
     return hmac.compare_digest(computed, signature)
 
 def safe_email(email: str, wa_phone: str) -> str:
-    """
-    Paystack requires email. If user email missing/invalid, generate a placeholder.
-    """
     email = (email or "").strip()
     if email and "@" in email:
         return email
@@ -142,22 +142,109 @@ def days_for_plan(plan: str) -> int:
 # Admin Security Helpers
 # ------------------------------------------------------------
 def require_admin(req) -> bool:
-    """
-    Checks x-admin-key header for admin/cron protected endpoints.
-    """
     if not ADMIN_API_KEY:
         return False
     key = (req.headers.get("x-admin-key") or "").strip()
     return key == ADMIN_API_KEY
 
 # ------------------------------------------------------------
+# SMTP / Email helpers
+# ------------------------------------------------------------
+def smtp_ready() -> bool:
+    return all([SMTP_HOST, SMTP_PORT, SMTP_USERNAME, SMTP_PASSWORD, SMTP_FROM_EMAIL])
+
+def send_email(to_email: str, subject: str, html_body: str) -> None:
+    if not smtp_ready():
+        raise RuntimeError("SMTP not configured. Set SMTP_HOST/PORT/USERNAME/PASSWORD/FROM_EMAIL.")
+
+    msg = MIMEMultipart("alternative")
+    msg["From"] = f"{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>"
+    msg["To"] = to_email
+    msg["Subject"] = subject
+    msg.attach(MIMEText(html_body, "html"))
+
+    server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30)
+    try:
+        server.ehlo()
+        server.starttls()
+        server.ehlo()
+        server.login(SMTP_USERNAME, SMTP_PASSWORD)
+        server.sendmail(SMTP_FROM_EMAIL, [to_email], msg.as_string())
+    finally:
+        try:
+            server.quit()
+        except Exception:
+            pass
+
+def format_naira_from_kobo(amount_kobo: int) -> str:
+    try:
+        return f"₦{(int(amount_kobo) / 100):,.2f}"
+    except Exception:
+        return "₦0.00"
+
+def receipt_email_html(
+    wa_phone: str,
+    plan: str,
+    reference: str,
+    amount_kobo: int,
+    status: str,
+    paid_at_iso: Optional[str],
+) -> str:
+    amount = format_naira_from_kobo(amount_kobo)
+    paid_at = paid_at_iso or "N/A"
+    plan_label = (plan or "").capitalize()
+
+    return f"""
+    <div style="font-family: Arial, sans-serif; max-width: 640px; margin: 0 auto; padding: 16px;">
+      <h2 style="margin:0 0 12px 0;">Naija Tax Guide — Payment Receipt</h2>
+      <p style="margin:0 0 12px 0;">Thank you for your subscription.</p>
+
+      <table style="width:100%; border-collapse: collapse; margin-top: 12px;">
+        <tr><td style="padding:10px; border:1px solid #ddd;"><strong>Reference</strong></td>
+            <td style="padding:10px; border:1px solid #ddd;">{reference}</td></tr>
+        <tr><td style="padding:10px; border:1px solid #ddd;"><strong>WhatsApp Number</strong></td>
+            <td style="padding:10px; border:1px solid #ddd;">{wa_phone}</td></tr>
+        <tr><td style="padding:10px; border:1px solid #ddd;"><strong>Plan</strong></td>
+            <td style="padding:10px; border:1px solid #ddd;">{plan_label}</td></tr>
+        <tr><td style="padding:10px; border:1px solid #ddd;"><strong>Amount</strong></td>
+            <td style="padding:10px; border:1px solid #ddd;">{amount}</td></tr>
+        <tr><td style="padding:10px; border:1px solid #ddd;"><strong>Status</strong></td>
+            <td style="padding:10px; border:1px solid #ddd;">{status}</td></tr>
+        <tr><td style="padding:10px; border:1px solid #ddd;"><strong>Paid At</strong></td>
+            <td style="padding:10px; border:1px solid #ddd;">{paid_at}</td></tr>
+      </table>
+
+      <p style="margin-top: 18px;">Need help? Contact us at <strong>{SMTP_FROM_EMAIL}</strong>.</p>
+      <p style="color:#777; font-size: 12px; margin-top: 22px;">
+        Naija Tax Guide • Automated receipt
+      </p>
+    </div>
+    """
+
+def send_payment_receipt_email(
+    to_email: str,
+    wa_phone: str,
+    plan: str,
+    reference: str,
+    amount_kobo: int,
+    status: str,
+    paid_at_iso: Optional[str],
+) -> None:
+    subject = f"Naija Tax Guide Receipt — {reference}"
+    html = receipt_email_html(
+        wa_phone=wa_phone,
+        plan=plan,
+        reference=reference,
+        amount_kobo=amount_kobo,
+        status=status,
+        paid_at_iso=paid_at_iso
+    )
+    send_email(to_email=to_email, subject=subject, html_body=html)
+
+# ------------------------------------------------------------
 # DB helpers
 # ------------------------------------------------------------
 def record_paystack_event(event_id: str, event_type: str, reference: Optional[str], payload: Dict[str, Any]) -> bool:
-    """
-    Returns True if inserted; False if duplicate.
-    Assumes paystack_events.event_id is UNIQUE in Supabase.
-    """
     try:
         sb.table("paystack_events").insert({
             "event_id": event_id,
@@ -171,13 +258,8 @@ def record_paystack_event(event_id: str, event_type: str, reference: Optional[st
         return False
 
 def activate_user_subscription(wa_phone: str, plan: str) -> None:
-    """
-    REQUIRED columns in user_subscriptions:
-      wa_phone (unique), plan, status, expires_at, updated_at
-    """
     plan = (plan or "").lower()
     wa_phone = normalize_wa_phone(wa_phone)
-
     expires_at = iso(now_utc() + timedelta(days=days_for_plan(plan)))
     sb.table("user_subscriptions").upsert({
         "wa_phone": wa_phone,
@@ -187,25 +269,11 @@ def activate_user_subscription(wa_phone: str, plan: str) -> None:
         "updated_at": iso(now_utc())
     }, on_conflict="wa_phone").execute()
 
-def get_subscription(wa_phone: str) -> Optional[Dict[str, Any]]:
-    try:
-        res = sb.table("user_subscriptions").select("*").eq("wa_phone", wa_phone).limit(1).execute()
-        if res.data:
-            return res.data[0]
-    except Exception as e:
-        logging.warning("get_subscription error: %s", str(e))
-    return None
-
 # ------------------------------------------------------------
 # Subscription Expiry Worker (Cron)
 # ------------------------------------------------------------
 def expire_due_subscriptions() -> Dict[str, Any]:
-    """
-    Marks subscriptions as expired if expires_at < now and status is active.
-    Returns summary dict: {checked, expired, errors}
-    """
     summary: Dict[str, Any] = {"checked": 0, "expired": 0, "errors": 0}
-
     try:
         res = (
             sb.table("user_subscriptions")
@@ -256,28 +324,19 @@ def expire_due_subscriptions() -> Dict[str, Any]:
 # ------------------------------------------------------------
 @app.get("/health")
 def health():
-    # Frontend route-check expects fetchable JSON
     return jsonify({"ok": True})
 
-# ---------------------------
-# Cron: Expire subscriptions
-# ---------------------------
 @app.get("/cron/expire_subscriptions")
 def cron_expire_subscriptions():
     if not require_admin(request):
         return jsonify({"ok": False, "error": "unauthorized"}), 401
-
     summary = expire_due_subscriptions()
     return jsonify({"ok": True, "summary": summary}), 200
 
-# ---------------------------
-# Admin: subscriptions
-# ---------------------------
 @app.get("/admin/subscriptions")
 def admin_subscriptions():
     if not require_admin(request):
         return jsonify({"ok": False, "error": "unauthorized"}), 401
-
     res = (
         sb.table("user_subscriptions")
         .select("wa_phone, plan, status, expires_at, updated_at")
@@ -287,39 +346,55 @@ def admin_subscriptions():
     )
     return jsonify(res.data or []), 200
 
-# ---------------------------
-# Admin: payments
-# ---------------------------
 @app.get("/admin/payments")
 def admin_payments():
     if not require_admin(request):
         return jsonify({"ok": False, "error": "unauthorized"}), 401
-
     res = (
         sb.table("payments")
-        .select(
-            "reference, wa_phone, provider, plan, amount_kobo, currency, status, created_at, paid_at"
-        )
+        .select("reference, wa_phone, provider, plan, amount_kobo, currency, status, created_at, paid_at")
         .order("created_at", desc=True)
         .limit(2000)
         .execute()
     )
-
     return jsonify(res.data or []), 200
 
+# ---------------------------
+# Admin: test email
+# ---------------------------
+@app.post("/admin/test_email")
+def admin_test_email():
+    if not require_admin(request):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    data = request.get_json(silent=True) or {}
+    to_email = (data.get("to_email") or "").strip()
+    wa_phone = normalize_wa_phone(str(data.get("wa_phone") or "2340000000000"))
+    plan = (data.get("plan") or "monthly").strip().lower()
+    reference = (data.get("reference") or f"test_{uuid.uuid4().hex[:10]}").strip()
+
+    if not to_email or "@" not in to_email:
+        return jsonify({"ok": False, "error": "to_email is required"}), 400
+
+    try:
+        send_payment_receipt_email(
+            to_email=to_email,
+            wa_phone=wa_phone,
+            plan=plan,
+            reference=reference,
+            amount_kobo=PLAN_PRICES.get(plan, 300000),
+            status="success",
+            paid_at_iso=iso(now_utc())
+        )
+        return jsonify({"ok": True, "message": "Test email sent"}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 # ---------------------------
 # Paystack Initialize
 # ---------------------------
 @app.post("/paystack/initialize")
 def paystack_initialize():
-    """
-    Expects JSON:
-      { "wa_phone": "234xxxxxxxxxx", "email": "user@email.com", "plan": "monthly|quarterly|yearly" }
-
-    Returns:
-      { "status":"ok", "authorization_url":"...", "reference":"..." }
-    """
     if not PAYSTACK_SECRET_KEY:
         return jsonify({"status": "error", "error": "PAYSTACK_SECRET_KEY not set"}), 500
 
@@ -336,8 +411,10 @@ def paystack_initialize():
     amount_kobo = int(PLAN_PRICES[plan])
     reference = f"ntg_{uuid.uuid4().hex}"
 
+    safe_user_email = safe_email(email, wa_phone)
+
     payload = {
-        "email": safe_email(email, wa_phone),
+        "email": safe_user_email,
         "amount": amount_kobo,
         "currency": CURRENCY,
         "reference": reference,
@@ -345,10 +422,10 @@ def paystack_initialize():
             "wa_phone": wa_phone,
             "plan": plan,
             "purpose": "subscription",
+            "email": safe_user_email,  # IMPORTANT: so webhook can fallback to email
         }
     }
 
-    # Optional: Paystack redirect back to your website
     if APP_BASE_URL:
         payload["callback_url"] = f"{APP_BASE_URL}/payment-success?reference={reference}"
 
@@ -372,18 +449,11 @@ def paystack_initialize():
 # ---------------------------
 @app.post("/paystack/verify")
 def paystack_verify():
-    """
-    Expects: { "reference": "..." }
-
-    Returns (frontend expects this shape):
-      { ok: true, paid: true/false, reference, plan?, wa_phone?, message? }
-    """
     if not PAYSTACK_SECRET_KEY:
         return jsonify({"ok": False, "error": "PAYSTACK_SECRET_KEY not set"}), 500
 
     data = request.get_json(silent=True) or {}
     reference = safe_text(data.get("reference"))
-
     if not reference:
         return jsonify({"ok": False, "error": "reference required"}), 400
 
@@ -395,16 +465,39 @@ def paystack_verify():
             return jsonify({"ok": False, "error": "paystack_verify_failed", "detail": resp}), 502
 
         d = resp.get("data", {}) or {}
-        status = (d.get("status") or "").lower()   # "success", "failed", "abandoned"
+        status = (d.get("status") or "").lower()
         paid = status == "success"
 
         metadata = d.get("metadata", {}) or {}
         wa_phone = normalize_wa_phone(str(metadata.get("wa_phone") or ""))
         plan = str(metadata.get("plan") or "").lower()
 
-        # If successful, activate subscription
+        # Try to get customer email from Paystack verify response
+        customer = d.get("customer", {}) or {}
+        customer_email = (customer.get("email") or "").strip()
+        if not customer_email:
+            customer_email = (metadata.get("email") or "").strip()
+
+        amount_kobo = int(d.get("amount") or 0)
+        paid_at_iso = (d.get("paid_at") or "").strip() or (iso(now_utc()) if paid else None)
+
         if paid and wa_phone and plan in PLAN_PRICES:
             activate_user_subscription(wa_phone, plan)
+
+            # Optional: send receipt here as a fallback (webhook is primary)
+            if customer_email and "@" in customer_email and smtp_ready():
+                try:
+                    send_payment_receipt_email(
+                        to_email=customer_email,
+                        wa_phone=wa_phone,
+                        plan=plan,
+                        reference=reference,
+                        amount_kobo=amount_kobo,
+                        status="success",
+                        paid_at_iso=paid_at_iso
+                    )
+                except Exception as e:
+                    logging.warning("Receipt email (verify) failed: %s", str(e))
 
         return jsonify({
             "ok": True,
@@ -441,7 +534,6 @@ def paystack_webhook():
     if not event_id:
         return "Missing event id", 400
 
-    # Idempotency: avoid double-processing
     record_paystack_event(event_id, event_type, reference, payload)
 
     if event_type == "charge.success":
@@ -450,8 +542,31 @@ def paystack_webhook():
         wa_phone = normalize_wa_phone(str(metadata.get("wa_phone") or ""))
         plan = str(metadata.get("plan") or "").lower()
 
+        customer = data.get("customer", {}) or {}
+        customer_email = (customer.get("email") or "").strip()
+        if not customer_email:
+            customer_email = (metadata.get("email") or "").strip()
+
+        amount_kobo = int(data.get("amount") or 0)
+        paid_at_iso = (data.get("paid_at") or "").strip() or iso(now_utc())
+
         if purpose == "subscription" and wa_phone and plan in PLAN_PRICES:
             activate_user_subscription(wa_phone, plan)
+
+            if customer_email and "@" in customer_email and smtp_ready():
+                try:
+                    send_payment_receipt_email(
+                        to_email=customer_email,
+                        wa_phone=wa_phone,
+                        plan=plan,
+                        reference=reference,
+                        amount_kobo=amount_kobo,
+                        status="success",
+                        paid_at_iso=paid_at_iso
+                    )
+                    logging.info("Receipt email sent to %s for %s", customer_email, reference)
+                except Exception as e:
+                    logging.warning("Receipt email (webhook) failed: %s", str(e))
 
     return "OK", 200
 
