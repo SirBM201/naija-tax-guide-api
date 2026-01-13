@@ -1,9 +1,5 @@
 # app.py
 import os
-import logging
-from datetime import datetime, timezone
-from flask import Flask, request, jsonify
-from supabase import create_client
 import re
 import uuid
 import json
@@ -37,6 +33,9 @@ WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
 
 APP_BASE_URL = os.getenv("APP_BASE_URL", "").rstrip("/")
 
+# Admin key for protected admin/cron endpoints
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
+
 # CORS allowed origins: comma-separated
 # Example:
 # ALLOWED_ORIGINS=http://localhost:3000,https://thecre8hub.com,https://www.thecre8hub.com
@@ -54,7 +53,13 @@ CORS(
     resources={r"/*": {"origins": ALLOWED_ORIGINS}},
     supports_credentials=False,
     methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization", "X-Requested-With", "x-paystack-signature"],
+    allow_headers=[
+        "Content-Type",
+        "Authorization",
+        "X-Requested-With",
+        "x-paystack-signature",
+        "x-admin-key",  # IMPORTANT for admin dashboard + cron
+    ],
 )
 
 # Supabase
@@ -130,6 +135,18 @@ def days_for_plan(plan: str) -> int:
     return {"monthly": 30, "quarterly": 90, "yearly": 365}.get(plan, DEFAULT_PLAN_DURATION_DAYS)
 
 # ------------------------------------------------------------
+# Admin Security Helpers
+# ------------------------------------------------------------
+def require_admin(req) -> bool:
+    """
+    Checks x-admin-key header for admin/cron protected endpoints.
+    """
+    if not ADMIN_API_KEY:
+        return False
+    key = (req.headers.get("x-admin-key") or "").strip()
+    return key == ADMIN_API_KEY
+
+# ------------------------------------------------------------
 # DB helpers
 # ------------------------------------------------------------
 def record_paystack_event(event_id: str, event_type: str, reference: Optional[str], payload: Dict[str, Any]) -> bool:
@@ -176,12 +193,114 @@ def get_subscription(wa_phone: str) -> Optional[Dict[str, Any]]:
     return None
 
 # ------------------------------------------------------------
+# Subscription Expiry Worker (Cron)
+# ------------------------------------------------------------
+def expire_due_subscriptions() -> Dict[str, Any]:
+    """
+    Marks subscriptions as expired if expires_at < now and status is active.
+    Returns summary dict: {checked, expired, errors}
+    """
+    summary: Dict[str, Any] = {"checked": 0, "expired": 0, "errors": 0}
+
+    try:
+        res = (
+            sb.table("user_subscriptions")
+            .select("wa_phone, expires_at, status")
+            .eq("status", "active")
+            .limit(5000)
+            .execute()
+        )
+
+        rows = res.data or []
+        summary["checked"] = len(rows)
+
+        to_expire = []
+        for r in rows:
+            exp = r.get("expires_at")
+            if not exp:
+                continue
+            try:
+                exp_dt = datetime.fromisoformat(str(exp).replace("Z", "+00:00"))
+                if exp_dt < now_utc():
+                    to_expire.append(r.get("wa_phone"))
+            except Exception:
+                summary["errors"] += 1
+
+        if not to_expire:
+            return summary
+
+        now_iso = iso(now_utc())
+        BATCH = 200
+        for i in range(0, len(to_expire), BATCH):
+            batch = to_expire[i:i+BATCH]
+            sb.table("user_subscriptions").update({
+                "status": "expired",
+                "updated_at": now_iso
+            }).in_("wa_phone", batch).execute()
+
+        summary["expired"] = len(to_expire)
+        return summary
+
+    except Exception as e:
+        logging.exception("expire_due_subscriptions failed")
+        summary["errors"] += 1
+        summary["error_message"] = str(e)
+        return summary
+
+# ------------------------------------------------------------
 # Routes
 # ------------------------------------------------------------
 @app.get("/health")
 def health():
     # Frontend route-check expects fetchable JSON
     return jsonify({"ok": True})
+
+# ---------------------------
+# Cron: Expire subscriptions
+# ---------------------------
+@app.get("/cron/expire_subscriptions")
+def cron_expire_subscriptions():
+    if not require_admin(request):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    summary = expire_due_subscriptions()
+    return jsonify({"ok": True, "summary": summary}), 200
+
+# ---------------------------
+# Admin: subscriptions
+# ---------------------------
+@app.get("/admin/subscriptions")
+def admin_subscriptions():
+    if not require_admin(request):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    res = (
+        sb.table("user_subscriptions")
+        .select("wa_phone, plan, status, expires_at, updated_at")
+        .order("updated_at", desc=True)
+        .limit(2000)
+        .execute()
+    )
+    return jsonify(res.data or []), 200
+
+# ---------------------------
+# Admin: payments
+# ---------------------------
+@app.get("/admin/payments")
+def admin_payments():
+    if not require_admin(request):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    # Assumes table name "payments"
+    # If your payments table is different, change ONLY this table name + fields.
+    res = (
+        sb.table("payments")
+        .select("reference, wa_phone, amount, status, created_at")
+        .order("created_at", desc=True)
+        .limit(2000)
+        .execute()
+    )
+    return jsonify(res.data or []), 200
 
 # ---------------------------
 # Paystack Initialize
@@ -243,7 +362,7 @@ def paystack_initialize():
         return jsonify({"status": "error", "error": str(e)}), 500
 
 # ---------------------------
-# Paystack Verify (THIS FIXES YOUR FRONTEND)
+# Paystack Verify
 # ---------------------------
 @app.post("/paystack/verify")
 def paystack_verify():
