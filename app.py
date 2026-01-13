@@ -7,7 +7,7 @@ import hmac
 import hashlib
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 import requests
 from flask import Flask, request, jsonify
@@ -18,38 +18,38 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
-
 # ------------------------------------------------------------
 # App + Logging
 # ------------------------------------------------------------
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-
 # ------------------------------------------------------------
 # ENV
 # ------------------------------------------------------------
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
 
-PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY", "")
-WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "")
-WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
-WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
+PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY", "").strip()
 
-APP_BASE_URL = os.getenv("APP_BASE_URL", "").rstrip("/")
+WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "").strip()
+WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "").strip()
+WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "").strip()
+
+APP_BASE_URL = os.getenv("APP_BASE_URL", "").rstrip("/").strip()
 
 # Admin key for protected admin/cron endpoints
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
 
-# SMTP (for email receipts / test)
+# SMTP (for email receipts / test email)
 SMTP_HOST = os.getenv("SMTP_HOST", "").strip()
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER", "").strip()
 SMTP_PASS = os.getenv("SMTP_PASS", "").strip()
-SMTP_FROM = os.getenv("SMTP_FROM", "").strip()  # e.g. info@thecre8hub.com
+SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER).strip()
+SMTP_FROM_NAME = os.getenv("SMTP_FROM_NAME", "Naija Tax Guide").strip()
 
-# CORS allowed origins: comma-separated
+# CORS allowed origins
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
 if not ALLOWED_ORIGINS:
     ALLOWED_ORIGINS = [
@@ -78,7 +78,6 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
     logging.warning("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY missing.")
 sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
-
 # ------------------------------------------------------------
 # Paystack Config
 # ------------------------------------------------------------
@@ -86,7 +85,7 @@ PAYSTACK_INIT_URL = "https://api.paystack.co/transaction/initialize"
 PAYSTACK_VERIFY_URL = "https://api.paystack.co/transaction/verify/"
 CURRENCY = "NGN"
 
-# IMPORTANT: KOBO
+# KOBO
 PLAN_PRICES = {
     "monthly": 300000,    # ₦3,000
     "quarterly": 800000,  # ₦8,000
@@ -94,7 +93,6 @@ PLAN_PRICES = {
 }
 
 DEFAULT_PLAN_DURATION_DAYS = int(os.getenv("DEFAULT_PLAN_DURATION_DAYS", "30"))
-
 
 # ------------------------------------------------------------
 # Helpers
@@ -139,9 +137,8 @@ def safe_email(email: str, wa_phone: str) -> str:
 def days_for_plan(plan: str) -> int:
     return {"monthly": 30, "quarterly": 90, "yearly": 365}.get(plan, DEFAULT_PLAN_DURATION_DAYS)
 
-
 # ------------------------------------------------------------
-# Admin security
+# Admin Security Helpers
 # ------------------------------------------------------------
 def require_admin(req) -> bool:
     if not ADMIN_API_KEY:
@@ -149,64 +146,36 @@ def require_admin(req) -> bool:
     key = (req.headers.get("x-admin-key") or "").strip()
     return key == ADMIN_API_KEY
 
-
 # ------------------------------------------------------------
-# Email
+# Email helper
 # ------------------------------------------------------------
-def smtp_ready() -> Tuple[bool, str]:
-    if not (SMTP_HOST and SMTP_PORT and SMTP_USER and SMTP_PASS and SMTP_FROM):
-        return False, "SMTP env vars missing. Need SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM"
-    return True, "ok"
-
-def send_email(to_email: str, subject: str, html_body: str) -> Tuple[bool, str]:
-    ok, msg = smtp_ready()
-    if not ok:
-        return False, msg
-
-    to_email = (to_email or "").strip()
-    if not to_email or "@" not in to_email:
-        return False, "Invalid to_email"
-
-    m = MIMEMultipart("alternative")
-    m["From"] = SMTP_FROM
-    m["To"] = to_email
-    m["Subject"] = subject
-
-    m.attach(MIMEText(html_body, "html"))
-
-    try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
-            server.ehlo()
-            server.starttls()
-            server.login(SMTP_USER, SMTP_PASS)
-            server.sendmail(SMTP_FROM, [to_email], m.as_string())
-        return True, "sent"
-    except Exception as e:
-        logging.exception("SMTP send failed")
-        return False, str(e)
-
-def receipt_html(app_name: str, wa_phone: str, plan: str, amount_kobo: int, currency: str, reference: str) -> str:
-    amount = f"{amount_kobo/100:,.2f}"
-    return f"""
-    <div style="font-family:Arial,sans-serif;max-width:640px;margin:auto">
-      <h2>{app_name} – Payment Receipt</h2>
-      <p>Thank you. Your subscription payment was successful.</p>
-      <table style="border-collapse:collapse;width:100%">
-        <tr><td style="padding:8px;border:1px solid #ddd"><b>WhatsApp</b></td><td style="padding:8px;border:1px solid #ddd">{wa_phone}</td></tr>
-        <tr><td style="padding:8px;border:1px solid #ddd"><b>Plan</b></td><td style="padding:8px;border:1px solid #ddd">{plan}</td></tr>
-        <tr><td style="padding:8px;border:1px solid #ddd"><b>Amount</b></td><td style="padding:8px;border:1px solid #ddd">{currency} {amount}</td></tr>
-        <tr><td style="padding:8px;border:1px solid #ddd"><b>Reference</b></td><td style="padding:8px;border:1px solid #ddd">{reference}</td></tr>
-        <tr><td style="padding:8px;border:1px solid #ddd"><b>Date</b></td><td style="padding:8px;border:1px solid #ddd">{iso(now_utc())}</td></tr>
-      </table>
-      <p style="margin-top:16px">Support: {SMTP_FROM}</p>
-    </div>
+def send_email(to_email: str, subject: str, html_body: str) -> None:
     """
+    Uses SMTP_* env vars. If not set, raises exception.
+    """
+    if not SMTP_HOST or not SMTP_USER or not SMTP_PASS:
+        raise Exception("SMTP not configured (SMTP_HOST/SMTP_USER/SMTP_PASS missing).")
 
+    msg = MIMEMultipart("alternative")
+    msg["From"] = f"{SMTP_FROM_NAME} <{SMTP_FROM}>"
+    msg["To"] = to_email
+    msg["Subject"] = subject
+
+    msg.attach(MIMEText(html_body, "html"))
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASS)
+        server.sendmail(SMTP_FROM, [to_email], msg.as_string())
 
 # ------------------------------------------------------------
 # DB helpers
 # ------------------------------------------------------------
 def record_paystack_event(event_id: str, event_type: str, reference: Optional[str], payload: Dict[str, Any]) -> bool:
+    """
+    Returns True if inserted; False if duplicate.
+    Requires paystack_events.event_id UNIQUE
+    """
     try:
         sb.table("paystack_events").insert({
             "event_id": event_id,
@@ -222,8 +191,8 @@ def record_paystack_event(event_id: str, event_type: str, reference: Optional[st
 def activate_user_subscription(wa_phone: str, plan: str) -> None:
     plan = (plan or "").lower()
     wa_phone = normalize_wa_phone(wa_phone)
-    expires_at = iso(now_utc() + timedelta(days=days_for_plan(plan)))
 
+    expires_at = iso(now_utc() + timedelta(days=days_for_plan(plan)))
     sb.table("user_subscriptions").upsert({
         "wa_phone": wa_phone,
         "plan": plan,
@@ -232,45 +201,44 @@ def activate_user_subscription(wa_phone: str, plan: str) -> None:
         "updated_at": iso(now_utc())
     }, on_conflict="wa_phone").execute()
 
-def upsert_payment(
+def upsert_payment_row(
     reference: str,
-    wa_phone: str,
-    plan: str,
-    amount_kobo: int,
+    wa_phone: Optional[str],
+    plan: Optional[str],
+    amount_kobo: Optional[int],
     currency: str,
     status: str,
-    paid_at_iso: Optional[str],
-    raw_event: Dict[str, Any],
+    provider: str = "paystack",
+    paid_at: Optional[str] = None,
+    raw_event: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
-    Matches your existing payments columns (from screenshot):
-      reference (text), wa_phone (text), provider (text), plan (text),
-      amount_kobo (int), currency (text), status (text),
-      created_at (timestamptz), paid_at (timestamptz), raw_event (jsonb)
+    Matches your payments table columns seen in Supabase:
+      reference (text / key), wa_phone, provider, plan,
+      amount_kobo, currency, status, created_at, paid_at, raw_event
     """
-    reference = (reference or "").strip()
-    if not reference:
-        return
-
     row = {
         "reference": reference,
-        "wa_phone": normalize_wa_phone(wa_phone),
-        "provider": "paystack",
-        "plan": (plan or "").lower(),
-        "amount_kobo": int(amount_kobo or 0),
-        "currency": (currency or CURRENCY),
-        "status": (status or "").lower(),
-        "created_at": iso(now_utc()),
-        "paid_at": paid_at_iso,
+        "wa_phone": wa_phone,
+        "provider": provider,
+        "plan": plan,
+        "amount_kobo": amount_kobo,
+        "currency": currency,
+        "status": status,
         "raw_event": raw_event or {},
     }
+    if paid_at:
+        row["paid_at"] = paid_at
 
-    # If you want created_at to be the first time only,
-    # keep it as now for simplicity; reference acts as idempotency.
+    # upsert by reference
     sb.table("payments").upsert(row, on_conflict="reference").execute()
 
+# ------------------------------------------------------------
+# Subscription Expiry Worker (Cron)
+# ------------------------------------------------------------
 def expire_due_subscriptions() -> Dict[str, Any]:
     summary: Dict[str, Any] = {"checked": 0, "expired": 0, "errors": 0}
+
     try:
         res = (
             sb.table("user_subscriptions")
@@ -316,7 +284,6 @@ def expire_due_subscriptions() -> Dict[str, Any]:
         summary["error_message"] = str(e)
         return summary
 
-
 # ------------------------------------------------------------
 # Routes
 # ------------------------------------------------------------
@@ -324,10 +291,6 @@ def expire_due_subscriptions() -> Dict[str, Any]:
 def health():
     return jsonify({"ok": True})
 
-
-# ---------------------------
-# Cron: Expire subscriptions
-# ---------------------------
 @app.get("/cron/expire_subscriptions")
 def cron_expire_subscriptions():
     if not require_admin(request):
@@ -335,10 +298,6 @@ def cron_expire_subscriptions():
     summary = expire_due_subscriptions()
     return jsonify({"ok": True, "summary": summary}), 200
 
-
-# ---------------------------
-# Admin: subscriptions
-# ---------------------------
 @app.get("/admin/subscriptions")
 def admin_subscriptions():
     if not require_admin(request):
@@ -353,10 +312,6 @@ def admin_subscriptions():
     )
     return jsonify(res.data or []), 200
 
-
-# ---------------------------
-# Admin: payments
-# ---------------------------
 @app.get("/admin/payments")
 def admin_payments():
     if not require_admin(request):
@@ -371,12 +326,15 @@ def admin_payments():
     )
     return jsonify(res.data or []), 200
 
-
-# ---------------------------
-# Admin: test email (THIS FIXES YOUR 404)
-# ---------------------------
 @app.post("/admin/test_email")
 def admin_test_email():
+    """
+    Postman:
+      POST /admin/test_email
+      Headers: x-admin-key: <ADMIN_API_KEY>
+      JSON body:
+        { "to_email": "...", "wa_phone": "234...", "plan": "monthly" }
+    """
     if not require_admin(request):
         return jsonify({"ok": False, "error": "unauthorized"}), 401
 
@@ -385,13 +343,26 @@ def admin_test_email():
     wa_phone = normalize_wa_phone(safe_text(data.get("wa_phone")))
     plan = safe_text(data.get("plan")).lower() or "monthly"
 
-    amount = int(PLAN_PRICES.get(plan, PLAN_PRICES["monthly"]))
-    subject = f"{os.getenv('APP_NAME', 'Naija Tax Guide')} – Test Receipt"
-    html = receipt_html(os.getenv("APP_NAME", "Naija Tax Guide"), wa_phone or "234xxxxxxxxxx", plan, amount, CURRENCY, f"test_{uuid.uuid4().hex[:10]}")
+    if not to_email or "@" not in to_email:
+        return jsonify({"ok": False, "error": "to_email required"}), 400
 
-    ok, msg = send_email(to_email, subject, html)
-    return jsonify({"ok": ok, "message": msg}), (200 if ok else 500)
+    subject = "Test Email – Naija Tax Guide"
+    html = f"""
+    <div style="font-family:Arial,sans-serif">
+      <h2>Test Email Successful</h2>
+      <p>This confirms SMTP is working.</p>
+      <p><b>WA Phone:</b> {wa_phone or "N/A"}</p>
+      <p><b>Plan:</b> {plan}</p>
+      <p><b>Time (UTC):</b> {iso(now_utc())}</p>
+    </div>
+    """
 
+    try:
+        send_email(to_email, subject, html)
+        return jsonify({"ok": True, "message": "Email sent"}), 200
+    except Exception as e:
+        logging.exception("test_email failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 # ---------------------------
 # Paystack Initialize
@@ -423,12 +394,27 @@ def paystack_initialize():
             "wa_phone": wa_phone,
             "plan": plan,
             "purpose": "subscription",
-            "receipt_email": email or None,
         }
     }
 
     if APP_BASE_URL:
         payload["callback_url"] = f"{APP_BASE_URL}/payment-success?reference={reference}"
+
+    # pre-create payment row as "initialized"
+    try:
+        upsert_payment_row(
+            reference=reference,
+            wa_phone=wa_phone,
+            plan=plan,
+            amount_kobo=amount_kobo,
+            currency=CURRENCY,
+            status="initialized",
+            provider="paystack",
+            paid_at=None,
+            raw_event={"init_payload": payload},
+        )
+    except Exception:
+        logging.exception("Failed to precreate payment row (non-fatal)")
 
     try:
         r = requests.post(PAYSTACK_INIT_URL, headers=paystack_headers(), json=payload, timeout=30)
@@ -436,28 +422,45 @@ def paystack_initialize():
 
         if r.status_code >= 400 or not resp.get("status"):
             logging.error("Paystack init failed: %s %s", r.status_code, resp)
+            # mark as failed
+            try:
+                upsert_payment_row(
+                    reference=reference,
+                    wa_phone=wa_phone,
+                    plan=plan,
+                    amount_kobo=amount_kobo,
+                    currency=CURRENCY,
+                    status="init_failed",
+                    provider="paystack",
+                    raw_event={"init_failed": resp},
+                )
+            except Exception:
+                pass
+
             return jsonify({"status": "error", "error": "paystack_init_failed", "detail": resp}), 502
 
         auth_url = resp["data"]["authorization_url"]
 
-        # Log an initial payment row (pending)
-        upsert_payment(
-            reference=reference,
-            wa_phone=wa_phone,
-            plan=plan,
-            amount_kobo=amount_kobo,
-            currency=CURRENCY,
-            status="pending",
-            paid_at_iso=None,
-            raw_event={"source": "initialize", "payload": payload, "paystack": resp},
-        )
+        # mark as "pending"
+        try:
+            upsert_payment_row(
+                reference=reference,
+                wa_phone=wa_phone,
+                plan=plan,
+                amount_kobo=amount_kobo,
+                currency=CURRENCY,
+                status="pending",
+                provider="paystack",
+                raw_event={"init_response": resp},
+            )
+        except Exception:
+            pass
 
         return jsonify({"status": "ok", "authorization_url": auth_url, "reference": reference}), 200
 
     except Exception as e:
         logging.exception("Initialize exception")
         return jsonify({"status": "error", "error": str(e)}), 500
-
 
 # ---------------------------
 # Paystack Verify
@@ -483,37 +486,36 @@ def paystack_verify():
         status = (d.get("status") or "").lower()
         paid = status == "success"
 
+        amount_kobo = d.get("amount")
+        currency = d.get("currency") or CURRENCY
+
         metadata = d.get("metadata", {}) or {}
         wa_phone = normalize_wa_phone(str(metadata.get("wa_phone") or ""))
         plan = str(metadata.get("plan") or "").lower()
-        amount_kobo = int(d.get("amount") or 0)
-        currency = str(d.get("currency") or CURRENCY)
-        paid_at_val = d.get("paid_at")
-        paid_at_iso = None
-        if paid_at_val:
-            paid_at_iso = str(paid_at_val).replace("Z", "+00:00")
 
-        # Log/update payment
-        upsert_payment(
-            reference=reference,
-            wa_phone=wa_phone,
-            plan=plan,
-            amount_kobo=amount_kobo,
-            currency=currency,
-            status=status,
-            paid_at_iso=paid_at_iso,
-            raw_event={"source": "verify", "paystack": resp},
-        )
+        paid_at = None
+        if paid:
+            paid_at = iso(now_utc())
 
+        # record payment row
+        try:
+            upsert_payment_row(
+                reference=reference,
+                wa_phone=wa_phone or None,
+                plan=plan or None,
+                amount_kobo=int(amount_kobo) if amount_kobo is not None else None,
+                currency=currency,
+                status="success" if paid else status or "not_success",
+                provider="paystack",
+                paid_at=paid_at,
+                raw_event={"verify_response": resp},
+            )
+        except Exception:
+            logging.exception("Failed to upsert payments row (verify)")
+
+        # If successful, activate subscription
         if paid and wa_phone and plan in PLAN_PRICES:
             activate_user_subscription(wa_phone, plan)
-
-            # Optional receipt email
-            receipt_to = (metadata.get("receipt_email") or d.get("customer", {}).get("email") or "").strip()
-            if receipt_to:
-                subject = f"{os.getenv('APP_NAME', 'Naija Tax Guide')} – Receipt ({plan})"
-                html = receipt_html(os.getenv("APP_NAME", "Naija Tax Guide"), wa_phone, plan, amount_kobo, currency, reference)
-                send_email(receipt_to, subject, html)
 
         return jsonify({
             "ok": True,
@@ -529,7 +531,6 @@ def paystack_verify():
         logging.exception("Verify exception")
         return jsonify({"ok": False, "error": str(e)}), 500
 
-
 # ---------------------------
 # Paystack Webhook
 # ---------------------------
@@ -537,7 +538,6 @@ def paystack_verify():
 def paystack_webhook():
     raw_body = request.get_data() or b""
     signature = request.headers.get("x-paystack-signature", "")
-
     if not verify_paystack_signature(raw_body, signature):
         return "Invalid signature", 401
 
@@ -547,44 +547,48 @@ def paystack_webhook():
 
     event_id = str(data.get("id") or data.get("reference") or "")
     reference = str(data.get("reference") or "")
+
     if not event_id:
         return "Missing event id", 400
 
-    # Dedup record (safe even if duplicate)
+    # Idempotency record
     record_paystack_event(event_id, event_type, reference, payload)
 
-    # Update payments table
-    status = str(data.get("status") or "").lower()
-    amount_kobo = int(data.get("amount") or 0)
-    currency = str(data.get("currency") or CURRENCY)
+    status = (data.get("status") or "").lower()
+    amount_kobo = data.get("amount")
+    currency = data.get("currency") or CURRENCY
+
     metadata = data.get("metadata", {}) or {}
     wa_phone = normalize_wa_phone(str(metadata.get("wa_phone") or ""))
     plan = str(metadata.get("plan") or "").lower()
-    paid_at_val = data.get("paid_at")
-    paid_at_iso = None
-    if paid_at_val:
-        paid_at_iso = str(paid_at_val).replace("Z", "+00:00")
+    purpose = str(metadata.get("purpose") or "")
 
-    upsert_payment(
-        reference=reference,
-        wa_phone=wa_phone,
-        plan=plan,
-        amount_kobo=amount_kobo,
-        currency=currency,
-        status=status or event_type,
-        paid_at_iso=paid_at_iso,
-        raw_event={"source": "webhook", "event": event_type, "payload": payload},
-    )
+    # Update payments row on webhook events
+    try:
+        paid_at = iso(now_utc()) if event_type == "charge.success" else None
+        upsert_payment_row(
+            reference=reference or event_id,
+            wa_phone=wa_phone or None,
+            plan=plan or None,
+            amount_kobo=int(amount_kobo) if amount_kobo is not None else None,
+            currency=currency,
+            status="success" if event_type == "charge.success" else (status or event_type),
+            provider="paystack",
+            paid_at=paid_at,
+            raw_event=payload,
+        )
+    except Exception:
+        logging.exception("Failed to upsert payments row (webhook)")
 
     if event_type == "charge.success":
-        purpose = metadata.get("purpose")
         if purpose == "subscription" and wa_phone and plan in PLAN_PRICES:
             activate_user_subscription(wa_phone, plan)
 
-            receipt_to = (metadata.get("receipt_email") or data.get("customer", {}).get("email") or "").strip()
-            if receipt_to:
-                subject = f"{os.getenv('APP_NAME', 'Naija Tax Guide')} – Receipt ({plan})"
-                html = receipt_html(os.getenv("APP_NAME", "Naija Tax Guide"), wa_phone, plan, amount_kobo, currency, reference)
-                send_email(receipt_to, subject, html)
-
     return "OK", 200
+
+# ------------------------------------------------------------
+# Main (local)
+# ------------------------------------------------------------
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port)
