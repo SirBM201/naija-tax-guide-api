@@ -10,6 +10,7 @@ from typing import Any, Dict, Optional
 
 import requests
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 from supabase import create_client
 
 # ------------------------------------------------------------
@@ -17,6 +18,33 @@ from supabase import create_client
 # ------------------------------------------------------------
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+# ------------------------------------------------------------
+# CORS
+# ------------------------------------------------------------
+# IMPORTANT:
+# - Your browser calls from localhost:3000 to koyeb.app will be BLOCKED unless CORS allows it.
+# - This also allows "x-admin-key" header and preflight OPTIONS requests.
+#
+# You can control origins via env var:
+#   CORS_ORIGINS=http://localhost:3000,https://thecre8hub.com,https://www.thecre8hub.com
+#
+cors_origins_env = os.getenv("CORS_ORIGINS", "")
+default_origins = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    # Add your production frontend domain(s) here:
+    "https://thecre8hub.com",
+    "https://www.thecre8hub.com",
+]
+CORS_ORIGINS = [o.strip() for o in cors_origins_env.split(",") if o.strip()] or default_origins
+
+CORS(
+    app,
+    resources={r"/*": {"origins": CORS_ORIGINS}},
+    allow_headers=["Content-Type", "x-admin-key"],
+    methods=["GET", "POST", "OPTIONS"],
+)
 
 # ------------------------------------------------------------
 # ENV
@@ -31,7 +59,7 @@ PAYSTACK_WEBHOOK_SECRET = os.getenv("PAYSTACK_WEBHOOK_SECRET", PAYSTACK_SECRET_K
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
 
 # Optional
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")  # e.g. https://developed-lizabeth-bmsconcept-e65bfd1d.koyeb.app
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")  # e.g. https://...koyeb.app
 PAYSTACK_CALLBACK_URL = os.getenv("PAYSTACK_CALLBACK_URL", "")  # optional redirect URL (can be blank)
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
@@ -43,8 +71,8 @@ supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 # Plans
 # ------------------------------------------------------------
 PLAN_RULES = {
-    "monthly":   {"amount_kobo": 3000 * 100, "days": 30,  "currency": "NGN"},
-    "quarterly": {"amount_kobo": 8000 * 100, "days": 90,  "currency": "NGN"},
+    "monthly":   {"amount_kobo": 3000 * 100,  "days": 30,  "currency": "NGN"},
+    "quarterly": {"amount_kobo": 8000 * 100,  "days": 90,  "currency": "NGN"},
     "yearly":    {"amount_kobo": 30000 * 100, "days": 365, "currency": "NGN"},
 }
 
@@ -123,7 +151,7 @@ def paystack_initialize():
     rule = PLAN_RULES[plan]
     reference = uuid.uuid4().hex[:10]
 
-    # 1) Create/Upsert payment row as pending
+    # 1) Create payment row as pending
     supabase.table("payments").insert({
         "reference": reference,
         "wa_phone": wa_phone,
@@ -137,7 +165,7 @@ def paystack_initialize():
         "email": email,
     }).execute()
 
-    # 2) Create/Upsert subscription as pending (optional but recommended)
+    # 2) Create/Upsert subscription as pending
     upsert_pending_subscription(wa_phone, plan)
 
     # 3) Initialize Paystack transaction
@@ -150,25 +178,28 @@ def paystack_initialize():
         "email": email,
         "amount": rule["amount_kobo"],
         "reference": reference,
-        # metadata helps webhook activation even if you later change schema
         "metadata": {
             "wa_phone": wa_phone,
             "plan": plan
         }
     }
 
-    # Optional callback URL if you want redirect after payment
     if PAYSTACK_CALLBACK_URL:
         payload["callback_url"] = PAYSTACK_CALLBACK_URL
 
-    r = requests.post("https://api.paystack.co/transaction/initialize", headers=headers, json=payload, timeout=25)
+    r = requests.post(
+        "https://api.paystack.co/transaction/initialize",
+        headers=headers,
+        json=payload,
+        timeout=25
+    )
+
     try:
         data = r.json()
     except Exception:
         return jsonify({"ok": False, "error": f"Paystack non-JSON response: {r.text[:200]}"}), 502
 
     if r.status_code >= 300 or not data.get("status"):
-        # mark payment failed
         supabase.table("payments").update({
             "status": "failed",
         }).eq("reference", reference).execute()
@@ -184,7 +215,7 @@ def paystack_initialize():
     })
 
 # ------------------------------------------------------------
-# Paystack: Webhook
+# Paystack: Webhook (Paystack calls server-to-server, CORS not needed here)
 # ------------------------------------------------------------
 @app.post("/paystack/webhook")
 def paystack_webhook():
@@ -207,13 +238,11 @@ def paystack_webhook():
     data = event.get("data") or {}
     reference = data.get("reference") or ""
 
-    # We accept both common success events
     is_success = event_type in ("charge.success", "transaction.success")
 
     if not reference:
         return "ok", 200
 
-    # Load payment row to get wa_phone + plan (source of truth)
     pay_row = supabase.table("payments").select("*").eq("reference", reference).limit(1).execute()
     pay = (pay_row.data or [])
     if not pay:
@@ -224,7 +253,6 @@ def paystack_webhook():
     wa_phone = pay.get("wa_phone")
     plan = pay.get("plan")
 
-    # If webhook includes metadata, it can be used as fallback
     meta = data.get("metadata") or {}
     wa_phone = wa_phone or meta.get("wa_phone")
     plan = plan or meta.get("plan")
@@ -234,7 +262,6 @@ def paystack_webhook():
         return "ok", 200
 
     if is_success:
-        # Mark payment success
         supabase.table("payments").update({
             "status": "success",
             "paid_at": iso(now_utc()),
@@ -242,13 +269,9 @@ def paystack_webhook():
             "currency": data.get("currency") or pay.get("currency") or "NGN",
         }).eq("reference", reference).execute()
 
-        # Activate subscription (ONLY HERE)
         activate_user_subscription(wa_phone, plan)
-
         return "ok", 200
 
-    # Non-success events: keep pending or mark failed depending on event
-    # You can expand this later (e.g., charge.failed)
     return "ok", 200
 
 # ------------------------------------------------------------
@@ -260,7 +283,10 @@ def admin_subscriptions():
     if auth:
         return auth
 
-    res = supabase.table("user_subscriptions").select("wa_phone,plan,status,expires_at,updated_at").order("updated_at", desc=True).execute()
+    res = supabase.table("user_subscriptions") \
+        .select("wa_phone,plan,status,expires_at,updated_at") \
+        .order("updated_at", desc=True) \
+        .execute()
     return jsonify(res.data or [])
 
 @app.get("/admin/payments")
@@ -269,5 +295,8 @@ def admin_payments():
     if auth:
         return auth
 
-    res = supabase.table("payments").select("reference,wa_phone,provider,plan,amount_kobo,currency,status,created_at,paid_at").order("created_at", desc=True).execute()
+    res = supabase.table("payments") \
+        .select("reference,wa_phone,provider,plan,amount_kobo,currency,status,created_at,paid_at") \
+        .order("created_at", desc=True) \
+        .execute()
     return jsonify(res.data or [])
