@@ -1,50 +1,76 @@
-@app.post("/paystack/webhook")
+# ---------------------------
+# Paystack Webhook (UPDATED + IDEMPOTENT)
+# ---------------------------
+@app.post("/webhooks/paystack")
 def paystack_webhook():
-    raw = request.get_data() or b""
-    sig = request.headers.get("x-paystack-signature", "")
+    raw_body = request.get_data() or b""
+    signature = request.headers.get("x-paystack-signature", "")
 
+    # 1) Verify signature
     if not PAYSTACK_SECRET_KEY:
         return "PAYSTACK_SECRET_KEY not set", 500
 
-    expected = hmac.new(PAYSTACK_SECRET_KEY.encode("utf-8"), raw, hashlib.sha512).hexdigest()
-    if not hmac.compare_digest(expected, sig):
-        return "invalid signature", 401
+    if not verify_paystack_signature(raw_body, signature):
+        return "Invalid signature", 401
 
-    event = request.get_json(silent=True) or {}
-    event_type = event.get("event")
+    # 2) Parse payload safely
+    payload = request.get_json(force=True, silent=True) or {}
+    event_type = str(payload.get("event") or "")
+    data = payload.get("data") or {}
 
-    data = event.get("data") or {}
-    reference = data.get("reference")
+    reference = str(data.get("reference") or "").strip()
+    tx_id = data.get("id")  # numeric Paystack transaction id
+
+    # 3) Build a stable event_id for idempotency (Paystack retries webhooks)
+    # Prefer tx_id + event_type, then fallback to reference + event_type, then raw hash
+    if tx_id:
+        event_id = f"{event_type}:{tx_id}"
+    elif reference:
+        event_id = f"{event_type}:{reference}"
+    else:
+        event_id = hashlib.sha256(raw_body).hexdigest()
+
+    # 4) Idempotency gate: if this event was already recorded, stop immediately
+    inserted = record_paystack_event(event_id, event_type, reference or None, payload)
+    if not inserted:
+        return "OK", 200
+
+    # 5) Extract useful fields
     status = (data.get("status") or "").lower()
+    amount_kobo = data.get("amount")
+    currency = data.get("currency") or CURRENCY
 
-    # We only activate on charge.success
-    if event_type == "charge.success" and reference:
-        pay = supabase.table("payments").select("*").eq("reference", reference).limit(1).execute().data
-        if pay:
-            pay = pay[0]
-            wa_phone = pay.get("wa_phone")
-            plan = (pay.get("plan") or "").lower()
+    metadata = data.get("metadata") or {}
+    wa_phone = normalize_wa_phone(str(metadata.get("wa_phone") or ""))
+    plan = str(metadata.get("plan") or "").lower()
+    purpose = str(metadata.get("purpose") or "")
 
-            # update payment
-            supabase.table("payments").update({
-                "status": "success",
-                "paid_at": iso(now_utc()),
-                "raw_event": {"source": "webhook", "paystack_event": event}
-            }).eq("reference", reference).execute()
+    # 6) Update payments table ONLY if reference exists
+    # (Paystack normally includes reference; if it doesn't, don't corrupt payments.reference)
+    if reference:
+        try:
+            paid_at = iso(now_utc()) if event_type == "charge.success" else None
 
-            # activate subscription
-            if wa_phone and plan:
+            upsert_payment_row(
+                reference=reference,
+                wa_phone=wa_phone or None,
+                plan=plan or None,
+                amount_kobo=int(amount_kobo) if amount_kobo is not None else None,
+                currency=currency,
+                status="success" if event_type == "charge.success" else (status or event_type),
+                provider="paystack",
+                paid_at=paid_at,
+                raw_event=payload,
+            )
+        except Exception:
+            logging.exception("Failed to upsert payments row (webhook)")
+
+    # 7) Activate subscription ONLY on successful charge + correct metadata
+    if event_type == "charge.success":
+        if purpose == "subscription" and wa_phone and plan in PLAN_PRICES:
+            try:
                 activate_user_subscription(wa_phone, plan)
+            except Exception:
+                logging.exception("activate_user_subscription failed (webhook)")
 
-                # optional WhatsApp confirmation
-                try:
-                    send_reply(
-                        wa_phone,
-                        "✅ Payment received!\n\n"
-                        f"Your plan is now ACTIVE: *{plan.upper()}*.\n"
-                        "Type *menu* to continue."
-                    )
-                except Exception:
-                    pass
-
-    return "ok", 200
+    return "OK", 200
