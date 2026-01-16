@@ -14,10 +14,6 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from supabase import create_client
 
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-
 # ------------------------------------------------------------
 # App + Logging
 # ------------------------------------------------------------
@@ -32,26 +28,10 @@ SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
 
 PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY", "").strip()
 
-WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "").strip()
-WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "").strip()
-WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "").strip()
-
 APP_BASE_URL = os.getenv("APP_BASE_URL", "").rstrip("/").strip()
 
 # Admin key for protected admin/cron endpoints
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
-
-# SMTP (optional)
-SMTP_HOST = os.getenv("SMTP_HOST", "").strip()
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER = os.getenv("SMTP_USER", "").strip()
-SMTP_PASS = os.getenv("SMTP_PASS", "").strip()
-SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER).strip()
-SMTP_FROM_NAME = os.getenv("SMTP_FROM_NAME", "Naija Tax Guide").strip()
-
-# Optional: allow manual webhook test without paystack signature
-# Set this in Koyeb if you want.
-WEBHOOK_TEST_SECRET = os.getenv("WEBHOOK_TEST_SECRET", "").strip()
 
 # CORS allowed origins
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
@@ -74,7 +54,6 @@ CORS(
         "X-Requested-With",
         "x-paystack-signature",
         "x-admin-key",
-        "x-webhook-test",  # for manual testing
     ],
 )
 
@@ -122,7 +101,8 @@ def paystack_headers() -> Dict[str, str]:
 
 def verify_paystack_signature(raw_body: bytes, signature: str) -> bool:
     """
-    Paystack webhook signature is HMAC SHA512 using YOUR SECRET KEY.
+    Paystack: HMAC-SHA512 of raw request body using PAYSTACK_SECRET_KEY.
+    Header: x-paystack-signature
     """
     if not signature or not PAYSTACK_SECRET_KEY:
         return False
@@ -145,9 +125,6 @@ def safe_email(email: str, wa_phone: str) -> str:
 def days_for_plan(plan: str) -> int:
     return {"monthly": 30, "quarterly": 90, "yearly": 365}.get(plan, DEFAULT_PLAN_DURATION_DAYS)
 
-# ------------------------------------------------------------
-# Admin Security Helpers
-# ------------------------------------------------------------
 def require_admin(req) -> bool:
     if not ADMIN_API_KEY:
         return False
@@ -155,31 +132,12 @@ def require_admin(req) -> bool:
     return key == ADMIN_API_KEY
 
 # ------------------------------------------------------------
-# Email helper
-# ------------------------------------------------------------
-def send_email(to_email: str, subject: str, html_body: str) -> None:
-    if not SMTP_HOST or not SMTP_USER or not SMTP_PASS:
-        raise Exception("SMTP not configured (SMTP_HOST/SMTP_USER/SMTP_PASS missing).")
-
-    msg = MIMEMultipart("alternative")
-    msg["From"] = f"{SMTP_FROM_NAME} <{SMTP_FROM}>"
-    msg["To"] = to_email
-    msg["Subject"] = subject
-
-    msg.attach(MIMEText(html_body, "html"))
-
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
-        server.starttls()
-        server.login(SMTP_USER, SMTP_PASS)
-        server.sendmail(SMTP_FROM, [to_email], msg.as_string())
-
-# ------------------------------------------------------------
 # DB helpers
 # ------------------------------------------------------------
 def record_paystack_event(event_id: str, event_type: str, reference: Optional[str], payload: Dict[str, Any]) -> bool:
     """
     Returns True if inserted; False if duplicate.
-    Requires paystack_events.event_id UNIQUE (you already created it).
+    Requires public.paystack_events.event_id UNIQUE (you already created it).
     """
     try:
         sb.table("paystack_events").insert({
@@ -193,18 +151,26 @@ def record_paystack_event(event_id: str, event_type: str, reference: Optional[st
         logging.warning("paystack_events insert failed/duplicate: %s", str(e))
         return False
 
-def activate_user_subscription(wa_phone: str, plan: str) -> None:
+def activate_user_subscription(wa_phone: str, plan: str, reference: Optional[str] = None, last_event: Optional[str] = None) -> None:
     plan = (plan or "").lower()
     wa_phone = normalize_wa_phone(wa_phone)
 
     expires_at = iso(now_utc() + timedelta(days=days_for_plan(plan)))
-    sb.table("user_subscriptions").upsert({
+
+    # Keep this aligned with your table columns (you showed paystack_reference and last_event exist)
+    payload = {
         "wa_phone": wa_phone,
         "plan": plan,
         "status": "active",
         "expires_at": expires_at,
-        "updated_at": iso(now_utc())
-    }, on_conflict="wa_phone").execute()
+        "updated_at": iso(now_utc()),
+    }
+    if reference:
+        payload["paystack_reference"] = reference
+    if last_event:
+        payload["last_event"] = last_event
+
+    sb.table("user_subscriptions").upsert(payload, on_conflict="wa_phone").execute()
 
 def upsert_payment_row(
     reference: str,
@@ -218,7 +184,11 @@ def upsert_payment_row(
     raw_event: Optional[Dict[str, Any]] = None,
     email: Optional[str] = None,
 ) -> None:
-    row = {
+    """
+    Matches your payments columns shown: reference, wa_phone, provider, plan,
+    amount_kobo, currency, status, created_at, paid_at, raw_event, email
+    """
+    row: Dict[str, Any] = {
         "reference": reference,
         "wa_phone": wa_phone,
         "provider": provider,
@@ -243,62 +213,212 @@ def health():
     return jsonify({"ok": True})
 
 # ---------------------------
-# Paystack Webhook
+# Paystack Initialize
+# ---------------------------
+@app.post("/paystack/initialize")
+def paystack_initialize():
+    if not PAYSTACK_SECRET_KEY:
+        return jsonify({"status": "error", "error": "PAYSTACK_SECRET_KEY not set"}), 500
+
+    data = request.get_json(silent=True) or {}
+    wa_phone = normalize_wa_phone(safe_text(data.get("wa_phone")))
+    email = safe_text(data.get("email"))
+    plan = safe_text(data.get("plan")).lower()
+
+    if not wa_phone:
+        return jsonify({"status": "error", "error": "wa_phone required"}), 400
+    if plan not in PLAN_PRICES:
+        return jsonify({"status": "error", "error": f"invalid plan. allowed={list(PLAN_PRICES.keys())}"}), 400
+
+    amount_kobo = int(PLAN_PRICES[plan])
+    reference = f"ntg_{uuid.uuid4().hex}"
+
+    payload = {
+        "email": safe_email(email, wa_phone),
+        "amount": amount_kobo,
+        "currency": CURRENCY,
+        "reference": reference,
+        "metadata": {
+            "wa_phone": wa_phone,
+            "plan": plan,
+            "purpose": "subscription",
+        }
+    }
+
+    if APP_BASE_URL:
+        payload["callback_url"] = f"{APP_BASE_URL}/payment-success?reference={reference}"
+
+    # pre-create payment row as "initialized"
+    try:
+        upsert_payment_row(
+            reference=reference,
+            wa_phone=wa_phone,
+            plan=plan,
+            amount_kobo=amount_kobo,
+            currency=CURRENCY,
+            status="initialized",
+            provider="paystack",
+            paid_at=None,
+            raw_event={"init_payload": payload},
+            email=payload["email"],
+        )
+    except Exception:
+        logging.exception("Failed to precreate payment row (non-fatal)")
+
+    try:
+        r = requests.post(PAYSTACK_INIT_URL, headers=paystack_headers(), json=payload, timeout=30)
+        resp = r.json() if r.content else {}
+
+        if r.status_code >= 400 or not resp.get("status"):
+            logging.error("Paystack init failed: %s %s", r.status_code, resp)
+            try:
+                upsert_payment_row(
+                    reference=reference,
+                    wa_phone=wa_phone,
+                    plan=plan,
+                    amount_kobo=amount_kobo,
+                    currency=CURRENCY,
+                    status="init_failed",
+                    provider="paystack",
+                    raw_event={"init_failed": resp},
+                    email=payload["email"],
+                )
+            except Exception:
+                pass
+            return jsonify({"status": "error", "error": "paystack_init_failed", "detail": resp}), 502
+
+        auth_url = resp["data"]["authorization_url"]
+
+        try:
+            upsert_payment_row(
+                reference=reference,
+                wa_phone=wa_phone,
+                plan=plan,
+                amount_kobo=amount_kobo,
+                currency=CURRENCY,
+                status="pending",
+                provider="paystack",
+                raw_event={"init_response": resp},
+                email=payload["email"],
+            )
+        except Exception:
+            pass
+
+        return jsonify({"status": "ok", "authorization_url": auth_url, "reference": reference}), 200
+
+    except Exception as e:
+        logging.exception("Initialize exception")
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+# ---------------------------
+# Paystack Verify (called by frontend payment-success page)
+# ---------------------------
+@app.post("/paystack/verify")
+def paystack_verify():
+    if not PAYSTACK_SECRET_KEY:
+        return jsonify({"ok": False, "error": "PAYSTACK_SECRET_KEY not set"}), 500
+
+    data = request.get_json(silent=True) or {}
+    reference = safe_text(data.get("reference"))
+    if not reference:
+        return jsonify({"ok": False, "error": "reference required"}), 400
+
+    try:
+        r = requests.get(f"{PAYSTACK_VERIFY_URL}{reference}", headers=paystack_headers(), timeout=30)
+        resp = r.json() if r.content else {}
+
+        if r.status_code >= 400 or not resp.get("status"):
+            return jsonify({"ok": False, "error": "paystack_verify_failed", "detail": resp}), 502
+
+        d = resp.get("data", {}) or {}
+        status = (d.get("status") or "").lower()
+        paid = status == "success"
+
+        amount_kobo = d.get("amount")
+        currency = d.get("currency") or CURRENCY
+
+        metadata = d.get("metadata", {}) or {}
+        wa_phone = normalize_wa_phone(str(metadata.get("wa_phone") or ""))
+        plan = str(metadata.get("plan") or "").lower()
+
+        paid_at = iso(now_utc()) if paid else None
+
+        # record payment row
+        try:
+            upsert_payment_row(
+                reference=reference,
+                wa_phone=wa_phone or None,
+                plan=plan or None,
+                amount_kobo=int(amount_kobo) if amount_kobo is not None else None,
+                currency=currency,
+                status="success" if paid else status or "not_success",
+                provider="paystack",
+                paid_at=paid_at,
+                raw_event={"verify_response": resp},
+                email=str(d.get("customer", {}).get("email") or "") or None,
+            )
+        except Exception:
+            logging.exception("Failed to upsert payments row (verify)")
+
+        # If successful, activate subscription
+        if paid and wa_phone and plan in PLAN_PRICES:
+            activate_user_subscription(wa_phone, plan, reference=reference, last_event="verify.success")
+
+        return jsonify({
+            "ok": True,
+            "paid": bool(paid),
+            "reference": reference,
+            "status": status,
+            "wa_phone": wa_phone or None,
+            "plan": plan or None,
+            "message": "Payment verified and subscription activated." if paid else "Payment not successful yet."
+        }), 200
+
+    except Exception as e:
+        logging.exception("Verify exception")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+# ---------------------------
+# Paystack Webhook (Paystack calls THIS)
 # ---------------------------
 @app.post("/webhooks/paystack")
 def paystack_webhook():
-    """
-    Paystack hits this endpoint with:
-      - POST JSON body
-      - header: x-paystack-signature
-
-    We also allow a manual test mode:
-      - If WEBHOOK_TEST_SECRET is set, you can send:
-          header x-webhook-test: <WEBHOOK_TEST_SECRET>
-        and we'll accept without signature.
-    """
     raw_body = request.get_data() or b""
     signature = request.headers.get("x-paystack-signature", "")
 
-    # Manual test mode (optional)
-    test_header = (request.headers.get("x-webhook-test") or "").strip()
-    if WEBHOOK_TEST_SECRET and test_header == WEBHOOK_TEST_SECRET:
-        logging.info("Webhook accepted via x-webhook-test header (manual test).")
-    else:
-        if not verify_paystack_signature(raw_body, signature):
-            logging.warning("Invalid Paystack signature.")
-            return "Invalid signature", 401
+    # IMPORTANT: Always log webhook hits (even if invalid) to see traffic in Koyeb logs.
+    logging.info("Paystack webhook HIT: len=%s signature_present=%s", len(raw_body), bool(signature))
 
-    payload = request.get_json(force=True, silent=True) or {}
-    event_type = str(payload.get("event") or "")
-    data = payload.get("data", {}) or {}
+    if not PAYSTACK_SECRET_KEY:
+        logging.error("PAYSTACK_SECRET_KEY not set")
+        return "PAYSTACK_SECRET_KEY not set", 500
 
-    # Paystack commonly provides:
-    #   data.id (numeric), data.reference (string)
+    if not verify_paystack_signature(raw_body, signature):
+        logging.warning("Paystack webhook invalid signature")
+        return "invalid signature", 401
+
+    event = request.get_json(silent=True) or {}
+    event_type = str(event.get("event") or "")
+    data = event.get("data", {}) or {}
+
     reference = str(data.get("reference") or "")
-    event_id = str(data.get("id") or reference or "")
-
-    if not event_id:
-        return "Missing event id", 400
-
-    # Idempotency: stop if we've seen this event_id already
-    inserted = record_paystack_event(event_id, event_type, reference, payload)
-    if not inserted:
-        return "OK", 200
-
-    status = (data.get("status") or "").lower()
+    status = str(data.get("status") or "").lower()
     amount_kobo = data.get("amount")
-    currency = data.get("currency") or CURRENCY
-
-    customer = data.get("customer", {}) or {}
-    email = (customer.get("email") or "").strip()
+    currency = str(data.get("currency") or CURRENCY)
 
     metadata = data.get("metadata", {}) or {}
     wa_phone = normalize_wa_phone(str(metadata.get("wa_phone") or ""))
     plan = str(metadata.get("plan") or "").lower()
     purpose = str(metadata.get("purpose") or "")
 
-    # Always upsert into payments
+    # idempotency key: Paystack data.id is best
+    event_id = str(data.get("id") or reference or uuid.uuid4().hex)
+
+    inserted = record_paystack_event(event_id, event_type, reference or None, event)
+    logging.info("Paystack event received: type=%s ref=%s inserted=%s status=%s wa=%s plan=%s",
+                 event_type, reference, inserted, status, wa_phone, plan)
+
+    # Update payments row for every event (so you always see what happened)
     try:
         paid_at = iso(now_utc()) if event_type == "charge.success" else None
         upsert_payment_row(
@@ -310,21 +430,21 @@ def paystack_webhook():
             status="success" if event_type == "charge.success" else (status or event_type),
             provider="paystack",
             paid_at=paid_at,
-            raw_event=payload,
-            email=email or None,
+            raw_event=event,
+            email=str(data.get("customer", {}).get("email") or "") or None,
         )
     except Exception:
         logging.exception("Failed to upsert payments row (webhook)")
 
-    # Activate only on success
+    # Activate subscription only when successful charge
     if event_type == "charge.success":
         if purpose == "subscription" and wa_phone and plan in PLAN_PRICES:
             try:
-                activate_user_subscription(wa_phone, plan)
+                activate_user_subscription(wa_phone, plan, reference=reference, last_event="charge.success")
             except Exception:
                 logging.exception("activate_user_subscription failed")
 
-    return "OK", 200
+    return "ok", 200
 
 # ------------------------------------------------------------
 # Main (local)
