@@ -510,49 +510,64 @@ def paystack_verify():
 # ---------------------------
 # Paystack Webhook
 # ---------------------------
+# ---------------------------
+# Paystack Webhook (FULL UPDATED + IDEMPOTENT)
+# ---------------------------
 @app.post("/webhooks/paystack")
 def paystack_webhook():
     raw_body = request.get_data() or b""
-    signature = request.headers.get("x-paystack-signature", "")
+    signature = request.headers.get("x-paystack-signature", "").strip()
+
+    # 1) Signature check
+    if not PAYSTACK_SECRET_KEY:
+        return "PAYSTACK_SECRET_KEY not set", 500
 
     if not verify_paystack_signature(raw_body, signature):
         return "Invalid signature", 401
 
+    # 2) Parse event
     payload = request.get_json(force=True, silent=True) or {}
-    event_type = str(payload.get("event") or "")
-    data = payload.get("data", {}) or {}
+    event_type = str(payload.get("event") or "").strip()
+    data = payload.get("data") or {}
 
-    # Use Paystack transaction id for idempotency if present
-    tx_id = data.get("id")
-    reference = str(data.get("reference") or "")
+    # Paystack usually provides these
+    reference = str(data.get("reference") or "").strip()
+    tx_id = data.get("id")  # numeric Paystack tx id (best for idempotency)
 
-    # event_id must be stable/unique across retries
+    # 3) Create a stable event_id for idempotency
+    # Paystack retries events; we must not process duplicates.
     if tx_id:
         event_id = f"{event_type}:{tx_id}"
     elif reference:
         event_id = f"{event_type}:{reference}"
     else:
-        # last resort: hash of the raw body
+        # last resort (rare)
         event_id = hashlib.sha256(raw_body).hexdigest()
 
-    # Idempotency: if duplicate, stop here (do NOT reactivate)
+    # 4) Idempotency gate
     inserted = record_paystack_event(event_id, event_type, reference or None, payload)
     if not inserted:
+        # already processed
         return "OK", 200
 
-    status = (data.get("status") or "").lower()
+    # 5) Extract fields
+    status = str(data.get("status") or "").lower()
     amount_kobo = data.get("amount")
-    currency = data.get("currency") or CURRENCY
+    currency = str(data.get("currency") or CURRENCY)
 
-    metadata = data.get("metadata", {}) or {}
+    metadata = data.get("metadata") or {}
     wa_phone = normalize_wa_phone(str(metadata.get("wa_phone") or ""))
     plan = str(metadata.get("plan") or "").lower()
     purpose = str(metadata.get("purpose") or "")
 
-    # Only update payments when we have a reference
+    customer = data.get("customer") or {}
+    customer_email = str(customer.get("email") or "").strip() or None
+
+    # 6) Update payments (only if we have a reference)
     if reference:
         try:
             paid_at = iso(now_utc()) if event_type == "charge.success" else None
+
             upsert_payment_row(
                 reference=reference,
                 wa_phone=wa_phone or None,
@@ -564,13 +579,41 @@ def paystack_webhook():
                 paid_at=paid_at,
                 raw_event=payload,
             )
+
+            # If your payments table has email column, store it (non-fatal if not)
+            if customer_email:
+                try:
+                    sb.table("payments").update({"email": customer_email}).eq("reference", reference).execute()
+                except Exception:
+                    pass
+
         except Exception:
             logging.exception("Failed to upsert payments row (webhook)")
 
-    # Activate only on successful charge
+    # 7) Activate subscription ONLY on success + correct metadata
     if event_type == "charge.success":
         if purpose == "subscription" and wa_phone and plan in PLAN_PRICES:
-            activate_user_subscription(wa_phone, plan)
+            try:
+                # Activate main subscription record
+                activate_user_subscription(wa_phone, plan)
+
+                # Optional: enrich user_subscriptions with extra columns seen in your screenshots
+                try:
+                    sb.table("user_subscriptions").update({
+                        "paystack_reference": reference or None,
+                        "last_event": event_type,
+                        "duration_days": days_for_plan(plan),
+                        "amount_kobo": int(amount_kobo) if amount_kobo is not None else None,
+                        "currency": currency,
+                        "email": customer_email,
+                        "updated_at": iso(now_utc()),
+                    }).eq("wa_phone", normalize_wa_phone(wa_phone)).execute()
+                except Exception:
+                    # if any column doesn't exist, ignore (safe)
+                    pass
+
+            except Exception:
+                logging.exception("activate_user_subscription failed (webhook)")
 
     return "OK", 200
 
