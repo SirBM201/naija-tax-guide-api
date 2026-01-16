@@ -1,4 +1,12 @@
-# main.py
+# app.py (TOP OF FILE — FIRST LINES)
+
+import sys
+import os
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+
 import os
 import logging
 from flask import Flask, jsonify
