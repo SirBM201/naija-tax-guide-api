@@ -2,7 +2,6 @@
 import os
 import re
 import uuid
-import json
 import hmac
 import hashlib
 import logging
@@ -107,6 +106,7 @@ def safe_text(v: Any) -> str:
     return (v or "").strip()
 
 def normalize_wa_phone(wa_phone: str) -> str:
+    # digits only (consistent with your DB usage)
     return re.sub(r"\D", "", (wa_phone or "").strip())
 
 def paystack_headers() -> Dict[str, str]:
@@ -132,6 +132,7 @@ def safe_email(email: str, wa_phone: str) -> str:
     digits = re.sub(r"\D", "", wa_phone or "")
     if not digits:
         digits = uuid.uuid4().hex[:10]
+    # Paystack requires email; use a safe placeholder domain
     return f"user_{digits}@thecre8hub.local"
 
 def days_for_plan(plan: str) -> int:
@@ -150,9 +151,6 @@ def require_admin(req) -> bool:
 # Email helper
 # ------------------------------------------------------------
 def send_email(to_email: str, subject: str, html_body: str) -> None:
-    """
-    Uses SMTP_* env vars. If not set, raises exception.
-    """
     if not SMTP_HOST or not SMTP_USER or not SMTP_PASS:
         raise Exception("SMTP not configured (SMTP_HOST/SMTP_USER/SMTP_PASS missing).")
 
@@ -160,7 +158,6 @@ def send_email(to_email: str, subject: str, html_body: str) -> None:
     msg["From"] = f"{SMTP_FROM_NAME} <{SMTP_FROM}>"
     msg["To"] = to_email
     msg["Subject"] = subject
-
     msg.attach(MIMEText(html_body, "html"))
 
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
@@ -212,11 +209,6 @@ def upsert_payment_row(
     paid_at: Optional[str] = None,
     raw_event: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """
-    Matches your payments table columns seen in Supabase:
-      reference (text / key), wa_phone, provider, plan,
-      amount_kobo, currency, status, created_at, paid_at, raw_event
-    """
     row = {
         "reference": reference,
         "wa_phone": wa_phone,
@@ -229,8 +221,6 @@ def upsert_payment_row(
     }
     if paid_at:
         row["paid_at"] = paid_at
-
-    # upsert by reference
     sb.table("payments").upsert(row, on_conflict="reference").execute()
 
 # ------------------------------------------------------------
@@ -328,13 +318,6 @@ def admin_payments():
 
 @app.post("/admin/test_email")
 def admin_test_email():
-    """
-    Postman:
-      POST /admin/test_email
-      Headers: x-admin-key: <ADMIN_API_KEY>
-      JSON body:
-        { "to_email": "...", "wa_phone": "234...", "plan": "monthly" }
-    """
     if not require_admin(request):
         return jsonify({"ok": False, "error": "unauthorized"}), 401
 
@@ -410,7 +393,6 @@ def paystack_initialize():
             currency=CURRENCY,
             status="initialized",
             provider="paystack",
-            paid_at=None,
             raw_event={"init_payload": payload},
         )
     except Exception:
@@ -422,7 +404,6 @@ def paystack_initialize():
 
         if r.status_code >= 400 or not resp.get("status"):
             logging.error("Paystack init failed: %s %s", r.status_code, resp)
-            # mark as failed
             try:
                 upsert_payment_row(
                     reference=reference,
@@ -432,7 +413,7 @@ def paystack_initialize():
                     currency=CURRENCY,
                     status="init_failed",
                     provider="paystack",
-                    raw_event={"init_failed": resp},
+                    raw_event={"init_failed": resp, "http_status": r.status_code},
                 )
             except Exception:
                 pass
@@ -441,7 +422,6 @@ def paystack_initialize():
 
         auth_url = resp["data"]["authorization_url"]
 
-        # mark as "pending"
         try:
             upsert_payment_row(
                 reference=reference,
@@ -493,11 +473,8 @@ def paystack_verify():
         wa_phone = normalize_wa_phone(str(metadata.get("wa_phone") or ""))
         plan = str(metadata.get("plan") or "").lower()
 
-        paid_at = None
-        if paid:
-            paid_at = iso(now_utc())
+        paid_at = iso(now_utc()) if paid else None
 
-        # record payment row
         try:
             upsert_payment_row(
                 reference=reference,
@@ -505,7 +482,7 @@ def paystack_verify():
                 plan=plan or None,
                 amount_kobo=int(amount_kobo) if amount_kobo is not None else None,
                 currency=currency,
-                status="success" if paid else status or "not_success",
+                status="success" if paid else (status or "not_success"),
                 provider="paystack",
                 paid_at=paid_at,
                 raw_event={"verify_response": resp},
@@ -513,7 +490,6 @@ def paystack_verify():
         except Exception:
             logging.exception("Failed to upsert payments row (verify)")
 
-        # If successful, activate subscription
         if paid and wa_phone and plan in PLAN_PRICES:
             activate_user_subscription(wa_phone, plan)
 
@@ -538,21 +514,31 @@ def paystack_verify():
 def paystack_webhook():
     raw_body = request.get_data() or b""
     signature = request.headers.get("x-paystack-signature", "")
+
     if not verify_paystack_signature(raw_body, signature):
         return "Invalid signature", 401
 
     payload = request.get_json(force=True, silent=True) or {}
-    event_type = payload.get("event", "")
+    event_type = str(payload.get("event") or "")
     data = payload.get("data", {}) or {}
 
-    event_id = str(data.get("id") or data.get("reference") or "")
+    # Use Paystack transaction id for idempotency if present
+    tx_id = data.get("id")
     reference = str(data.get("reference") or "")
 
-    if not event_id:
-        return "Missing event id", 400
+    # event_id must be stable/unique across retries
+    if tx_id:
+        event_id = f"{event_type}:{tx_id}"
+    elif reference:
+        event_id = f"{event_type}:{reference}"
+    else:
+        # last resort: hash of the raw body
+        event_id = hashlib.sha256(raw_body).hexdigest()
 
-    # Idempotency record
-    record_paystack_event(event_id, event_type, reference, payload)
+    # Idempotency: if duplicate, stop here (do NOT reactivate)
+    inserted = record_paystack_event(event_id, event_type, reference or None, payload)
+    if not inserted:
+        return "OK", 200
 
     status = (data.get("status") or "").lower()
     amount_kobo = data.get("amount")
@@ -563,23 +549,25 @@ def paystack_webhook():
     plan = str(metadata.get("plan") or "").lower()
     purpose = str(metadata.get("purpose") or "")
 
-    # Update payments row on webhook events
-    try:
-        paid_at = iso(now_utc()) if event_type == "charge.success" else None
-        upsert_payment_row(
-            reference=reference or event_id,
-            wa_phone=wa_phone or None,
-            plan=plan or None,
-            amount_kobo=int(amount_kobo) if amount_kobo is not None else None,
-            currency=currency,
-            status="success" if event_type == "charge.success" else (status or event_type),
-            provider="paystack",
-            paid_at=paid_at,
-            raw_event=payload,
-        )
-    except Exception:
-        logging.exception("Failed to upsert payments row (webhook)")
+    # Only update payments when we have a reference
+    if reference:
+        try:
+            paid_at = iso(now_utc()) if event_type == "charge.success" else None
+            upsert_payment_row(
+                reference=reference,
+                wa_phone=wa_phone or None,
+                plan=plan or None,
+                amount_kobo=int(amount_kobo) if amount_kobo is not None else None,
+                currency=currency,
+                status="success" if event_type == "charge.success" else (status or event_type),
+                provider="paystack",
+                paid_at=paid_at,
+                raw_event=payload,
+            )
+        except Exception:
+            logging.exception("Failed to upsert payments row (webhook)")
 
+    # Activate only on successful charge
     if event_type == "charge.success":
         if purpose == "subscription" and wa_phone and plan in PLAN_PRICES:
             activate_user_subscription(wa_phone, plan)
