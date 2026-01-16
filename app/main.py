@@ -1,19 +1,18 @@
 # app/main.py
 import os
+import re
 import json
 import hmac
+import uuid
 import hashlib
 import logging
-import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Any, Optional, Dict
 
 import requests
 from flask import Flask, request, jsonify
-from supabase import create_client
-
-# Optional but strongly recommended for CORS stability
 from flask_cors import CORS
+from supabase import create_client
 
 # ------------------------------------------------------------
 # App
@@ -24,19 +23,17 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 # ------------------------------------------------------------
 # ENV
 # ------------------------------------------------------------
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
 
-PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY", "")
-PAYSTACK_WEBHOOK_SECRET = os.getenv("PAYSTACK_WEBHOOK_SECRET", PAYSTACK_SECRET_KEY)
+PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY", "").strip()
+PAYSTACK_WEBHOOK_SECRET = os.getenv("PAYSTACK_WEBHOOK_SECRET", PAYSTACK_SECRET_KEY).strip()
 
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
 
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")  # e.g. https://xxxx.koyeb.app
-PAYSTACK_CALLBACK_URL = os.getenv("PAYSTACK_CALLBACK_URL", "")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip()  # optional
+PAYSTACK_CALLBACK_URL = os.getenv("PAYSTACK_CALLBACK_URL", "").strip()
 
-# Comma-separated origins. Example:
-# CORS_ALLOW_ORIGINS=http://localhost:3000,https://thecre8hub.com
 CORS_ALLOW_ORIGINS = os.getenv("CORS_ALLOW_ORIGINS", "http://localhost:3000").strip()
 allowed_origins = [o.strip() for o in CORS_ALLOW_ORIGINS.split(",") if o.strip()]
 
@@ -50,17 +47,17 @@ CORS(
 )
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-    logging.warning("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY missing. Admin/Paystack will fail.")
+    logging.warning("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY missing. DB features will fail.")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 # ------------------------------------------------------------
 # Plans
 # ------------------------------------------------------------
-PLAN_RULES = {
-    "monthly":   {"amount_kobo": 3000 * 100, "days": 30,  "currency": "NGN"},
-    "quarterly": {"amount_kobo": 8000 * 100, "days": 90,  "currency": "NGN"},
-    "yearly":    {"amount_kobo": 30000 * 100, "days": 365, "currency": "NGN"},
+PLAN_RULES: Dict[str, Dict[str, Any]] = {
+    "monthly": {"amount_kobo": 3000 * 100, "days": 30, "currency": "NGN"},
+    "quarterly": {"amount_kobo": 8000 * 100, "days": 90, "currency": "NGN"},
+    "yearly": {"amount_kobo": 30000 * 100, "days": 365, "currency": "NGN"},
 }
 
 # ------------------------------------------------------------
@@ -80,30 +77,134 @@ def require_admin(req) -> Optional[Any]:
 
 def activate_user_subscription(wa_phone: str, plan: str) -> None:
     days = PLAN_RULES.get(plan, {}).get("days", 30)
-    expires_at = iso(now_utc() + timedelta(days=days))
-    supabase.table("user_subscriptions").upsert({
-        "wa_phone": wa_phone,
-        "plan": plan,
-        "status": "active",
-        "expires_at": expires_at,
-        "updated_at": iso(now_utc())
-    }, on_conflict="wa_phone").execute()
+    expires_at = iso(now_utc() + timedelta(days=int(days)))
+    supabase.table("user_subscriptions").upsert(
+        {
+            "wa_phone": wa_phone,
+            "plan": plan,
+            "status": "active",
+            "expires_at": expires_at,
+            "updated_at": iso(now_utc()),
+        },
+        on_conflict="wa_phone",
+    ).execute()
 
 def upsert_pending_subscription(wa_phone: str, plan: str) -> None:
-    supabase.table("user_subscriptions").upsert({
-        "wa_phone": wa_phone,
-        "plan": plan,
-        "status": "pending",
-        "expires_at": None,
-        "updated_at": iso(now_utc())
-    }, on_conflict="wa_phone").execute()
+    supabase.table("user_subscriptions").upsert(
+        {
+            "wa_phone": wa_phone,
+            "plan": plan,
+            "status": "pending",
+            "expires_at": None,
+            "updated_at": iso(now_utc()),
+        },
+        on_conflict="wa_phone",
+    ).execute()
 
 # ------------------------------------------------------------
-# Health
+# Cache helpers (ai_cache + usage_logs)
+# ------------------------------------------------------------
+def normalize_question(q: str) -> str:
+    q = (q or "").strip().lower()
+    q = re.sub(r"\s+", " ", q)
+    return q
+
+def make_cache_key(q: str) -> str:
+    norm = normalize_question(q)
+    return hashlib.sha256(norm.encode("utf-8")).hexdigest()
+
+def cache_get(question: str) -> Optional[dict]:
+    key = make_cache_key(question)
+    res = (
+        supabase.table("ai_cache")
+        .select("cache_key,answer,hits")
+        .eq("cache_key", key)
+        .limit(1)
+        .execute()
+    )
+    rows = res.data or []
+    if not rows:
+        return None
+
+    row = rows[0]
+    try:
+        supabase.table("ai_cache").update(
+            {"hits": int(row.get("hits") or 0) + 1, "updated_at": iso(now_utc())}
+        ).eq("cache_key", key).execute()
+    except Exception:
+        pass
+
+    return row.get("answer")
+
+def cache_set(question: str, answer: dict) -> None:
+    key = make_cache_key(question)
+    supabase.table("ai_cache").upsert(
+        {
+            "cache_key": key,
+            "question": normalize_question(question),
+            "answer": answer,
+            "updated_at": iso(now_utc()),
+        },
+        on_conflict="cache_key",
+    ).execute()
+
+def log_usage(wa_phone: str, route: str, is_cache_hit: bool) -> None:
+    try:
+        supabase.table("usage_logs").insert(
+            {
+                "wa_phone": wa_phone,
+                "route": route,
+                "is_cache_hit": bool(is_cache_hit),
+                "created_at": iso(now_utc()),
+            }
+        ).execute()
+    except Exception:
+        pass
+
+# ------------------------------------------------------------
+# Health + route introspection
 # ------------------------------------------------------------
 @app.get("/health")
 def health():
     return jsonify({"ok": True})
+
+@app.get("/routes")
+def routes():
+    out = []
+    for r in app.url_map.iter_rules():
+        methods = sorted([m for m in r.methods if m not in ("HEAD", "OPTIONS")])
+        out.append({"rule": str(r), "endpoint": r.endpoint, "methods": methods})
+    out.sort(key=lambda x: x["rule"])
+    return jsonify(out)
+
+# ------------------------------------------------------------
+# Ask endpoint (cache-first)
+# ------------------------------------------------------------
+@app.post("/ask")
+def ask():
+    body = request.get_json(silent=True) or {}
+    wa_phone = (body.get("wa_phone") or "").strip()
+    question = (body.get("question") or "").strip()
+
+    if not wa_phone:
+        return jsonify({"ok": False, "error": "wa_phone is required"}), 400
+    if not question:
+        return jsonify({"ok": False, "error": "question is required"}), 400
+
+    cached = cache_get(question)
+    if cached is not None:
+        log_usage(wa_phone, "/ask", True)
+        return jsonify({"ok": True, "cached": True, "answer": cached})
+
+    # Placeholder answer for now (we connect AI next)
+    answer = {
+        "text": "Cache miss. AI call will be connected here next.",
+        "meta": {"source": "placeholder"},
+    }
+
+    cache_set(question, answer)
+    log_usage(wa_phone, "/ask", False)
+    return jsonify({"ok": True, "cached": False, "answer": answer})
 
 # ------------------------------------------------------------
 # Paystack: Initialize
@@ -128,25 +229,26 @@ def paystack_initialize():
     rule = PLAN_RULES[plan]
     reference = uuid.uuid4().hex[:12]
 
-    # IMPORTANT: write BOTH amount_kobo and amount (numeric) to prevent schema mismatch forever
     amount_kobo = int(rule["amount_kobo"])
     amount = amount_kobo / 100.0
 
-    # 1) Create/Upsert payment row as pending
+    # 1) Create payment row
     try:
-        supabase.table("payments").insert({
-            "reference": reference,
-            "wa_phone": wa_phone,
-            "provider": "paystack",
-            "plan": plan,
-            "amount_kobo": amount_kobo,
-            "amount": amount,
-            "currency": rule["currency"],
-            "status": "pending",
-            "created_at": iso(now_utc()),
-            "paid_at": None,
-            "email": email,
-        }).execute()
+        supabase.table("payments").insert(
+            {
+                "reference": reference,
+                "wa_phone": wa_phone,
+                "provider": "paystack",
+                "plan": plan,
+                "amount_kobo": amount_kobo,
+                "amount": amount,
+                "currency": rule["currency"],
+                "status": "pending",
+                "created_at": iso(now_utc()),
+                "paid_at": None,
+                "email": email,
+            }
+        ).execute()
     except Exception as e:
         logging.exception("Failed inserting payment row")
         return jsonify({"ok": False, "error": f"db_insert_failed: {str(e)[:300]}"}), 500
@@ -160,12 +262,17 @@ def paystack_initialize():
         "email": email,
         "amount": amount_kobo,
         "reference": reference,
-        "metadata": {"wa_phone": wa_phone, "plan": plan}
+        "metadata": {"wa_phone": wa_phone, "plan": plan},
     }
     if PAYSTACK_CALLBACK_URL:
         payload["callback_url"] = PAYSTACK_CALLBACK_URL
 
-    r = requests.post("https://api.paystack.co/transaction/initialize", headers=headers, json=payload, timeout=25)
+    r = requests.post(
+        "https://api.paystack.co/transaction/initialize",
+        headers=headers,
+        json=payload,
+        timeout=25,
+    )
 
     try:
         data = r.json()
@@ -231,13 +338,15 @@ def paystack_webhook():
         amount_kobo = int(data.get("amount") or pay.get("amount_kobo") or 0)
         amount = amount_kobo / 100.0
 
-        supabase.table("payments").update({
-            "status": "success",
-            "paid_at": iso(now_utc()),
-            "amount_kobo": amount_kobo,
-            "amount": amount,
-            "currency": data.get("currency") or pay.get("currency") or "NGN",
-        }).eq("reference", reference).execute()
+        supabase.table("payments").update(
+            {
+                "status": "success",
+                "paid_at": iso(now_utc()),
+                "amount_kobo": amount_kobo,
+                "amount": amount,
+                "currency": data.get("currency") or pay.get("currency") or "NGN",
+            }
+        ).eq("reference", reference).execute()
 
         activate_user_subscription(wa_phone, plan)
 
@@ -252,9 +361,12 @@ def admin_subscriptions():
     if auth:
         return auth
 
-    res = supabase.table("user_subscriptions") \
-        .select("wa_phone,plan,status,expires_at,updated_at") \
-        .order("updated_at", desc=True).execute()
+    res = (
+        supabase.table("user_subscriptions")
+        .select("wa_phone,plan,status,expires_at,updated_at")
+        .order("updated_at", desc=True)
+        .execute()
+    )
     return jsonify(res.data or [])
 
 @app.get("/admin/payments")
@@ -263,7 +375,38 @@ def admin_payments():
     if auth:
         return auth
 
-    res = supabase.table("payments") \
-        .select("reference,wa_phone,provider,plan,amount,amount_kobo,currency,status,created_at,paid_at") \
-        .order("created_at", desc=True).execute()
+    res = (
+        supabase.table("payments")
+        .select("reference,wa_phone,provider,plan,amount,amount_kobo,currency,status,created_at,paid_at,email")
+        .order("created_at", desc=True)
+        .execute()
+    )
+    return jsonify(res.data or [])
+
+@app.get("/admin/cache")
+def admin_cache():
+    auth = require_admin(request)
+    if auth:
+        return auth
+
+    res = (
+        supabase.table("ai_cache")
+        .select("cache_key,question,hits,created_at,updated_at")
+        .order("updated_at", desc=True)
+        .limit(200)
+        .execute()
+    )
+    return jsonify(res.data or [])
+
+@app.get("/admin/usage")
+def admin_usage():
+    auth = require_admin(request)
+    if auth:
+        return auth
+
+    wa_phone = (request.args.get("wa_phone") or "").strip()
+    q = supabase.table("usage_logs").select("wa_phone,route,is_cache_hit,created_at").order("created_at", desc=True).limit(300)
+    if wa_phone:
+        q = q.eq("wa_phone", wa_phone)
+    res = q.execute()
     return jsonify(res.data or [])
