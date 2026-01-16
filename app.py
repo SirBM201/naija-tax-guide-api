@@ -26,6 +26,16 @@ def now_utc_iso() -> str:
 def create_app() -> Flask:
     app = Flask(__name__)
     CORS(app)
+from flask import jsonify
+
+@app.get("/routes")
+@app.get("/_routes")
+def list_routes():
+    out = []
+    for r in app.url_map.iter_rules():
+        methods = sorted([m for m in r.methods if m not in ("HEAD", "OPTIONS")])
+        out.append({"rule": str(r), "methods": methods, "endpoint": r.endpoint})
+    return jsonify({"count": len(out), "routes": sorted(out, key=lambda x: x["rule"])})
 
     # -----------------------------
     # ENV
