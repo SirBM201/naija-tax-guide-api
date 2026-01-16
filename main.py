@@ -20,6 +20,11 @@ from supabase import create_client
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
+@app.get("/__routes")
+def __routes():
+    rules = sorted([f"{r.rule} -> {','.join(sorted(list(r.methods)))}" for r in app.url_map.iter_rules()])
+    return jsonify({"count": len(rules), "routes": rules})
+
 # ------------------------------------------------------------
 # ENV
 # ------------------------------------------------------------
