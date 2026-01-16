@@ -32,11 +32,15 @@ ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip()  # e.g. https://xxxx.koyeb.app
 PAYSTACK_CALLBACK_URL = os.getenv("PAYSTACK_CALLBACK_URL", "").strip()
 
-# Comma-separated origins. Example:
-# CORS_ALLOW_ORIGINS=http://localhost:3000,https://thecre8hub.com
+# WhatsApp Cloud API
+WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "").strip()
+WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "").strip()
+WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "").strip()
+WHATSAPP_API_VERSION = os.getenv("WHATSAPP_API_VERSION", "v20.0").strip()
+
+# CORS
 CORS_ALLOW_ORIGINS = os.getenv("CORS_ALLOW_ORIGINS", "http://localhost:3000").strip()
 allowed_origins = [o.strip() for o in CORS_ALLOW_ORIGINS.split(",") if o.strip()]
-
 CORS(
     app,
     resources={r"/*": {"origins": allowed_origins}},
@@ -46,7 +50,7 @@ CORS(
 )
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-    logging.warning("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY missing. Admin/Paystack will fail.")
+    logging.warning("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY missing. DB features will fail.")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
@@ -94,6 +98,58 @@ def upsert_pending_subscription(wa_phone: str, plan: str) -> None:
         "updated_at": iso(now_utc())
     }, on_conflict="wa_phone").execute()
 
+def is_subscription_active(wa_phone: str) -> bool:
+    """Basic check: active + not expired (if expires_at exists)."""
+    try:
+        res = supabase.table("user_subscriptions") \
+            .select("status,expires_at") \
+            .eq("wa_phone", wa_phone).limit(1).execute()
+        rows = res.data or []
+        if not rows:
+            return False
+        row = rows[0]
+        if (row.get("status") or "").lower() != "active":
+            return False
+        expires_at = row.get("expires_at")
+        if not expires_at:
+            return True
+        try:
+            # ISO string -> datetime
+            exp = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+            return exp > now_utc()
+        except Exception:
+            return True
+    except Exception:
+        logging.exception("Subscription check failed")
+        return False
+
+# ------------------------------------------------------------
+# WhatsApp send
+# ------------------------------------------------------------
+def wa_send_text(to_phone: str, text: str) -> None:
+    if not WHATSAPP_TOKEN or not WHATSAPP_PHONE_NUMBER_ID:
+        logging.warning("WHATSAPP_TOKEN or WHATSAPP_PHONE_NUMBER_ID missing; cannot send WhatsApp reply.")
+        return
+
+    url = f"https://graph.facebook.com/{WHATSAPP_API_VERSION}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
+    headers = {
+        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to_phone,
+        "type": "text",
+        "text": {"body": text},
+    }
+
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=20)
+        if r.status_code >= 300:
+            logging.error(f"WhatsApp send failed: {r.status_code} {r.text[:300]}")
+    except Exception:
+        logging.exception("WhatsApp send exception")
+
 # ------------------------------------------------------------
 # Health
 # ------------------------------------------------------------
@@ -114,6 +170,100 @@ def routes():
             "rule": str(r),
         })
     return jsonify(sorted(out, key=lambda x: x["rule"]))
+
+# ------------------------------------------------------------
+# ASK (API used by web + WhatsApp handler)
+# ------------------------------------------------------------
+@app.post("/ask")
+def ask():
+    body = request.get_json(silent=True) or {}
+    wa_phone = (body.get("wa_phone") or "").strip()
+    question = (body.get("question") or "").strip()
+
+    if not wa_phone:
+        return jsonify({"ok": False, "error": "wa_phone is required"}), 400
+    if not question:
+        return jsonify({"ok": False, "error": "question is required"}), 400
+
+    # You can enforce subscription here if desired:
+    # if not is_subscription_active(wa_phone):
+    #     return jsonify({"ok": False, "error": "subscription_required"}), 402
+
+    # Placeholder (same behavior you saw in PowerShell)
+    return jsonify({
+        "ok": True,
+        "cached": False,
+        "answer": {"meta": {}, "text": "Cache miss. AI call will be connected here next."}
+    })
+
+# ------------------------------------------------------------
+# WhatsApp Webhook (Meta calls this)
+# Callback URL should be:
+#   https://YOUR-KOYEB-URL/whatsapp/webhook
+# ------------------------------------------------------------
+@app.get("/whatsapp/webhook")
+def whatsapp_verify():
+    mode = request.args.get("hub.mode", "")
+    token = request.args.get("hub.verify_token", "")
+    challenge = request.args.get("hub.challenge", "")
+
+    if mode == "subscribe" and token and token == WHATSAPP_VERIFY_TOKEN:
+        return challenge, 200
+    return "forbidden", 403
+
+@app.post("/whatsapp/webhook")
+def whatsapp_incoming():
+    payload = request.get_json(silent=True) or {}
+    # Always return 200 quickly (Meta expects fast ack)
+    try:
+        entry = (payload.get("entry") or [])
+        if not entry:
+            return "ok", 200
+
+        changes = (entry[0].get("changes") or [])
+        if not changes:
+            return "ok", 200
+
+        value = changes[0].get("value") or {}
+        messages = value.get("messages") or []
+        if not messages:
+            return "ok", 200
+
+        msg = messages[0]
+        from_phone = (msg.get("from") or "").strip()
+        msg_type = (msg.get("type") or "").strip()
+
+        # Only handle text for now
+        if msg_type != "text":
+            if from_phone:
+                wa_send_text(from_phone, "Message type received. Please send a text question for now.")
+            return "ok", 200
+
+        text_body = ((msg.get("text") or {}).get("body") or "").strip()
+        if not from_phone or not text_body:
+            return "ok", 200
+
+        # Optional: enforce subscription
+        # if not is_subscription_active(from_phone):
+        #     wa_send_text(from_phone, "Subscription required. Please subscribe on thecre8hub.com to continue.")
+        #     return "ok", 200
+
+        # Reuse your /ask logic internally (no HTTP call)
+        # We call the same logic used by web clients.
+        answer = "Cache miss. AI call will be connected here next."
+        try:
+            # mimic ask() response structure
+            answer = "Cache miss. AI call will be connected here next."
+        except Exception:
+            logging.exception("Ask handler failed")
+            answer = "An internal error occurred. Please try again."
+
+        wa_send_text(from_phone, answer)
+        return "ok", 200
+
+    except Exception:
+        logging.exception("WhatsApp webhook handler error")
+        return "ok", 200
 
 # ------------------------------------------------------------
 # Paystack: Initialize
@@ -137,7 +287,6 @@ def paystack_initialize():
 
     rule = PLAN_RULES[plan]
     reference = uuid.uuid4().hex[:12]
-
     amount_kobo = int(rule["amount_kobo"])
     amount = amount_kobo / 100.0
 
@@ -215,7 +364,6 @@ def paystack_webhook():
     reference = data.get("reference") or ""
 
     is_success = event_type in ("charge.success", "transaction.success")
-
     if not reference:
         return "ok", 200
 
