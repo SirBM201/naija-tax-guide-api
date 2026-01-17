@@ -6,7 +6,7 @@ import hashlib
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional, Dict, Tuple
+from typing import Any, Optional, Dict, Tuple, List
 
 import requests
 from flask import Flask, request, jsonify
@@ -37,6 +37,17 @@ WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "").strip()
 WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "").strip()
 WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "").strip()
 WHATSAPP_BUSINESS_ACCOUNT_ID = os.getenv("WHATSAPP_BUSINESS_ACCOUNT_ID", "").strip()  # optional
+
+# AI / OpenAI
+AI_ENABLED = os.getenv("AI_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()  # safe default if you use OpenAI
+# If you want to allow AI replies even for non-subscribers (NOT recommended for cost):
+AI_ALLOW_FREE_USERS = os.getenv("AI_ALLOW_FREE_USERS", "false").strip().lower() in ("1", "true", "yes", "on")
+
+# Public site base URL (optional but recommended)
+APP_BASE_URL = os.getenv("APP_BASE_URL", "").strip()  # e.g. https://your-koyeb-service.koyeb.app
+FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "").strip()  # e.g. https://thecre8hub.com
 
 # CORS
 CORS_ALLOW_ORIGINS = os.getenv("CORS_ALLOW_ORIGINS", "http://localhost:3000").strip()
@@ -88,11 +99,17 @@ def normalize_phone(raw: str) -> str:
     return s
 
 def normalize_question(q: str) -> str:
-    # matches your qa_cache schema: normalized_question (text)
     s = (q or "").strip().lower()
     s = " ".join(s.split())
     return s
 
+def safe_trunc(s: str, n: int = 250) -> str:
+    s = (s or "")
+    return s[:n]
+
+# ------------------------------------------------------------
+# Subscription
+# ------------------------------------------------------------
 def get_subscription_status(wa_phone: str) -> Dict[str, Any]:
     wa_phone = normalize_phone(wa_phone)
     try:
@@ -118,37 +135,49 @@ def get_subscription_status(wa_phone: str) -> Dict[str, Any]:
                 exp = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
                 active = exp > now_utc()
             except Exception:
+                # If parsing fails, treat as active to avoid blocking paid users
                 active = True
+
         return {"exists": True, "active": active, "plan": plan, "status": status, "expires_at": expires_at}
     except Exception as e:
         logging.exception("get_subscription_status failed")
-        return {"exists": False, "active": False, "plan": None, "status": "error", "expires_at": None, "error": str(e)[:200]}
+        return {
+            "exists": False,
+            "active": False,
+            "plan": None,
+            "status": "error",
+            "expires_at": None,
+            "error": str(e)[:200],
+        }
 
 def activate_user_subscription(wa_phone: str, plan: str) -> None:
     days = PLAN_RULES.get(plan, {}).get("days", 30)
     expires_at = iso(now_utc() + timedelta(days=days))
-    supabase.table("user_subscriptions").upsert({
-        "wa_phone": normalize_phone(wa_phone),
-        "plan": plan,
-        "status": "active",
-        "expires_at": expires_at,
-        "updated_at": iso(now_utc())
-    }, on_conflict="wa_phone").execute()
+    supabase.table("user_subscriptions").upsert(
+        {
+            "wa_phone": normalize_phone(wa_phone),
+            "plan": plan,
+            "status": "active",
+            "expires_at": expires_at,
+            "updated_at": iso(now_utc()),
+        },
+        on_conflict="wa_phone",
+    ).execute()
 
 def upsert_pending_subscription(wa_phone: str, plan: str) -> None:
-    supabase.table("user_subscriptions").upsert({
-        "wa_phone": normalize_phone(wa_phone),
-        "plan": plan,
-        "status": "pending",
-        "expires_at": None,
-        "updated_at": iso(now_utc())
-    }, on_conflict="wa_phone").execute()
+    supabase.table("user_subscriptions").upsert(
+        {
+            "wa_phone": normalize_phone(wa_phone),
+            "plan": plan,
+            "status": "pending",
+            "expires_at": None,
+            "updated_at": iso(now_utc()),
+        },
+        on_conflict="wa_phone",
+    ).execute()
 
 # ------------------------------------------------------------
-# QA Cache (UPDATED to match your Supabase columns)
-# Table columns you showed:
-# id uuid, normalized_question text, answer text, tags array, use_count int,
-# last_used_at timestamptz, created_at timestamptz
+# QA Cache
 # ------------------------------------------------------------
 def cache_get(question: str) -> Optional[str]:
     nq = normalize_question(question)
@@ -169,15 +198,15 @@ def cache_get(question: str) -> Optional[str]:
 
         row = rows[0]
         ans = row.get("answer")
-        # increment use_count + update last_used_at (best effort)
+
+        # best-effort update
         try:
             cid = row.get("id")
             use_count = int(row.get("use_count") or 0) + 1
             if cid:
-                supabase.table("qa_cache").update({
-                    "use_count": use_count,
-                    "last_used_at": now_utc().isoformat()
-                }).eq("id", cid).execute()
+                supabase.table("qa_cache").update(
+                    {"use_count": use_count, "last_used_at": now_utc().isoformat()}
+                ).eq("id", cid).execute()
         except Exception:
             pass
 
@@ -191,26 +220,290 @@ def cache_set(question: str, answer: str) -> None:
     if not nq or not (answer or "").strip():
         return
     try:
-        supabase.table("qa_cache").insert({
-            "normalized_question": nq,
-            "answer": (answer or "").strip(),
-            "tags": [],
-            "use_count": 0,
-            "last_used_at": now_utc().isoformat(),
-            "created_at": now_utc().isoformat(),
-        }).execute()
+        supabase.table("qa_cache").insert(
+            {
+                "normalized_question": nq,
+                "answer": (answer or "").strip(),
+                "tags": [],
+                "use_count": 0,
+                "last_used_at": now_utc().isoformat(),
+                "created_at": now_utc().isoformat(),
+            }
+        ).execute()
     except Exception:
-        # If you later add a UNIQUE constraint on normalized_question, switch this to upsert.
+        # If you later enforce unique normalized_question, switch to upsert
         return
 
-# -----------------------------
-# AI stub (replace later)
-# -----------------------------
-def ai_answer(question: str) -> str:
+# ------------------------------------------------------------
+# WhatsApp send (ROBUST)
+# ------------------------------------------------------------
+def wa_api_url(path: str) -> str:
+    # Keep version consistent with your current setup
+    return f"https://graph.facebook.com/v24.0{path}"
+
+def chunk_text(text: str, max_len: int = 1400) -> List[str]:
+    """
+    WhatsApp rejects very long messages. We'll split into safe chunks.
+    """
+    text = (text or "").strip()
+    if not text:
+        return [""]
+
+    chunks: List[str] = []
+    i = 0
+    while i < len(text):
+        part = text[i:i + max_len]
+        cut = max(part.rfind("\n"), part.rfind(" "))
+        if cut > 200:
+            part = part[:cut].rstrip()
+            i += cut
+        else:
+            i += max_len
+        part = part.strip()
+        if part:
+            chunks.append(part)
+    return chunks if chunks else [""]
+
+def send_whatsapp_text_one(to_wa_phone: str, text: str) -> Tuple[bool, str]:
+    if not WHATSAPP_TOKEN or not WHATSAPP_PHONE_NUMBER_ID:
+        msg = "WHATSAPP_TOKEN or WHATSAPP_PHONE_NUMBER_ID missing"
+        logging.error(f"WA_SEND_FAIL {msg}")
+        return False, msg
+
+    to_wa_phone = normalize_phone(to_wa_phone)
+    url = wa_api_url(f"/{WHATSAPP_PHONE_NUMBER_ID}/messages")
+    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to_wa_phone,
+        "type": "text",
+        "text": {"preview_url": False, "body": (text or "").strip()},
+    }
+
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=25)
+        if r.status_code >= 300:
+            # THIS is what you need to see when “no reply” happens
+            logging.error(f"WA_SEND_HTTP_ERROR status={r.status_code} body={safe_trunc(r.text, 800)}")
+            return False, f"WhatsApp send failed: {r.status_code} {safe_trunc(r.text, 250)}"
+        return True, "ok"
+    except Exception as e:
+        logging.exception("WA_SEND_EXCEPTION")
+        return False, f"WhatsApp send exception: {str(e)[:200]}"
+
+def wa_reply(to_wa_phone: str, text: str) -> Tuple[bool, str]:
+    """
+    Sends in chunks so long AI replies never fail silently.
+    """
+    parts = chunk_text(text, max_len=1400)
+    for idx, part in enumerate(parts):
+        ok, info = send_whatsapp_text_one(to_wa_phone, part)
+        logging.info(f"WA_SEND_CHUNK idx={idx+1}/{len(parts)} ok={ok} info={info}")
+        if not ok:
+            return False, info
+    return True, "ok"
+
+# ------------------------------------------------------------
+# Pricing / Help
+# ------------------------------------------------------------
+def format_plans_text() -> str:
+    site = FRONTEND_BASE_URL or APP_BASE_URL or ""
+    link_line = f"\n\nSubscribe here: {site}" if site else ""
     return (
-        "I received your question.\n\n"
-        f"Question: {question}\n\n"
-        "AI replies will be enabled next (OpenAI connection)."
+        "Naija Tax Guide Plans:\n"
+        "1) MONTHLY - ₦3,000\n"
+        "2) QUARTERLY - ₦8,000\n"
+        "3) YEARLY - ₦30,000\n\n"
+        "Reply:\n"
+        "SUBSCRIBE monthly\n"
+        "SUBSCRIBE quarterly\n"
+        "SUBSCRIBE yearly\n"
+        f"{link_line}\n\n"
+        "Or reply HELP to see commands."
+    )
+
+def format_help_text() -> str:
+    return (
+        "Commands you can send:\n"
+        "HELP - show this menu\n"
+        "PLANS - see subscription plans\n"
+        "SUBSCRIBE monthly|quarterly|yearly - start a plan\n"
+        "STATUS - check your subscription\n\n"
+        "Or send any tax question directly."
+    )
+
+def handle_inbound_command(from_phone: str, text: str) -> Optional[str]:
+    t = (text or "").strip()
+    if not t:
+        return None
+
+    upper = t.upper()
+
+    if upper == "HELP":
+        return format_help_text()
+
+    if upper == "PLANS":
+        return format_plans_text()
+
+    if upper == "STATUS":
+        sub = get_subscription_status(from_phone)
+        if sub.get("status") == "error":
+            return "STATUS: Unable to read subscription right now. Please try again."
+        if not sub.get("exists"):
+            return "STATUS: No subscription found yet. Reply PLANS to see options."
+        plan = (sub.get("plan") or "unknown").upper()
+        status = (sub.get("status") or "unknown").upper()
+        expires_at = sub.get("expires_at") or "-"
+        active = "YES" if sub.get("active") else "NO"
+        return f"STATUS:\nPlan: {plan}\nState: {status}\nActive: {active}\nExpires: {expires_at}"
+
+    if upper.startswith("SUBSCRIBE"):
+        parts = t.split()
+        if len(parts) < 2:
+            return "Usage: SUBSCRIBE monthly|quarterly|yearly\nReply PLANS to see pricing."
+        plan = parts[1].strip().lower()
+        if plan not in PLAN_RULES:
+            return "Invalid plan. Use: monthly, quarterly, yearly."
+
+        try:
+            upsert_pending_subscription(from_phone, plan)
+        except Exception:
+            pass
+
+        site = FRONTEND_BASE_URL or APP_BASE_URL or ""
+        link_line = f"\n\nPay here: {site}" if site else ""
+        return (
+            f"SUBSCRIBE: {plan.upper()} selected.\n"
+            "Next step: complete payment on the website."
+            f"{link_line}\n\n"
+            "If you already paid, reply STATUS in 1–2 minutes."
+        )
+
+    return None
+
+# ------------------------------------------------------------
+# AI (REAL) - Low cost / safe, with hard fallbacks
+# ------------------------------------------------------------
+def ai_answer(question: str) -> str:
+    """
+    Uses OpenAI if enabled. If it fails, returns a helpful fallback text.
+    IMPORTANT: We keep the output concise to reduce WhatsApp length + cost.
+    """
+    q = (question or "").strip()
+    if not q:
+        return "Please send your tax question in one sentence."
+
+    if not AI_ENABLED:
+        return (
+            "AI is currently disabled.\n\n"
+            "Reply PLANS to subscribe, or ask again later."
+        )
+
+    if not OPENAI_API_KEY:
+        logging.error("AI_ENABLED is true but OPENAI_API_KEY is missing")
+        return (
+            "AI is enabled but not configured correctly (missing API key).\n"
+            "Please try again later."
+        )
+
+    # System prompt: short answers, practical, Nigeria context
+    system = (
+        "You are Naija Tax Guide. Answer Nigerian tax questions clearly and briefly. "
+        "Use simple language, bullet points where helpful, and keep answers under ~1200 characters. "
+        "If the question is unclear, ask 1 clarifying question."
+    )
+
+    # Try Responses API first (newer), fall back to Chat Completions if needed
+    try:
+        # 1) Responses API
+        resp = requests.post(
+            "https://api.openai.com/v1/responses",
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": OPENAI_MODEL,
+                "input": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": q},
+                ],
+                "max_output_tokens": 250,
+            },
+            timeout=35,
+        )
+
+        if resp.status_code < 300:
+            data = resp.json()
+            # Most common extraction
+            text_out = ""
+            try:
+                # response.output_text exists in many responses
+                text_out = (data.get("output_text") or "").strip()
+            except Exception:
+                text_out = ""
+
+            if not text_out:
+                # fallback extraction
+                try:
+                    out = data.get("output") or []
+                    # Walk through possible content blocks
+                    for item in out:
+                        content = item.get("content") or []
+                        for block in content:
+                            if block.get("type") in ("output_text", "text"):
+                                text_out += (block.get("text") or "")
+                    text_out = (text_out or "").strip()
+                except Exception:
+                    text_out = ""
+
+            if text_out:
+                return text_out
+
+            logging.error(f"OpenAI Responses API returned no text. body={safe_trunc(resp.text, 800)}")
+        else:
+            logging.error(f"OpenAI Responses API error status={resp.status_code} body={safe_trunc(resp.text, 800)}")
+
+    except Exception:
+        logging.exception("OpenAI Responses API exception")
+
+    # 2) Chat Completions fallback
+    try:
+        resp = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": OPENAI_MODEL,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": q},
+                ],
+                "max_tokens": 250,
+                "temperature": 0.3,
+            },
+            timeout=35,
+        )
+
+        if resp.status_code < 300:
+            data = resp.json()
+            text_out = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
+            if text_out:
+                return text_out
+
+            logging.error(f"Chat Completions returned no text. body={safe_trunc(resp.text, 800)}")
+        else:
+            logging.error(f"Chat Completions error status={resp.status_code} body={safe_trunc(resp.text, 800)}")
+
+    except Exception:
+        logging.exception("OpenAI Chat Completions exception")
+
+    return (
+        "Sorry — I couldn’t generate an answer right now.\n"
+        "Please try again in 1 minute, or reply PLANS / STATUS."
     )
 
 # ------------------------------------------------------------
@@ -222,6 +515,8 @@ def health():
         "ok": True,
         "service": "naija-tax-guide",
         "time_utc": now_utc().isoformat(),
+        "ai_enabled": AI_ENABLED,
+        "openai_model": OPENAI_MODEL,
     })
 
 @app.get("/routes")
@@ -236,7 +531,7 @@ def routes():
     return jsonify(sorted(out, key=lambda x: x["rule"]))
 
 # ------------------------------------------------------------
-# ASK (used by website AND WhatsApp inbound)
+# ASK (website + programmatic)
 # ------------------------------------------------------------
 @app.post("/ask")
 def ask():
@@ -253,9 +548,15 @@ def ask():
     if cached_answer:
         return jsonify({"ok": True, "cached": True, "answer": cached_answer, "meta": {"source": "cache"}})
 
+    # For /ask, we do not enforce subscription strictly (depends on your business rules).
+    # If you want strict gating, uncomment below:
+    # sub = get_subscription_status(wa_phone)
+    # if not sub.get("active"):
+    #     return jsonify({"ok": True, "cached": False, "answer": format_plans_text(), "meta": {"source": "subscribe_gate"}})
+
     answer = ai_answer(question)
     cache_set(question, answer)
-    return jsonify({"ok": True, "cached": False, "answer": answer, "meta": {"source": "ai_stub"}})
+    return jsonify({"ok": True, "cached": False, "answer": answer, "meta": {"source": "ai"}})
 
 # ------------------------------------------------------------
 # Paystack: Initialize
@@ -398,104 +699,6 @@ def paystack_webhook():
     return "ok", 200
 
 # ------------------------------------------------------------
-# WhatsApp Cloud API helpers
-# ------------------------------------------------------------
-def wa_api_url(path: str) -> str:
-    return f"https://graph.facebook.com/v24.0{path}"
-
-def send_whatsapp_text(to_wa_phone: str, text: str) -> Tuple[bool, str]:
-    if not WHATSAPP_TOKEN or not WHATSAPP_PHONE_NUMBER_ID:
-        return False, "WHATSAPP_TOKEN or WHATSAPP_PHONE_NUMBER_ID missing"
-
-    to_wa_phone = normalize_phone(to_wa_phone)
-    url = wa_api_url(f"/{WHATSAPP_PHONE_NUMBER_ID}/messages")
-    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
-
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to_wa_phone,
-        "type": "text",
-        "text": {"body": (text or "")[:3800]},
-    }
-
-    try:
-        r = requests.post(url, headers=headers, json=payload, timeout=25)
-        if r.status_code >= 300:
-            return False, f"WhatsApp send failed: {r.status_code} {r.text[:250]}"
-        return True, "ok"
-    except Exception as e:
-        return False, f"WhatsApp send exception: {str(e)[:200]}"
-
-def format_plans_text() -> str:
-    return (
-        "Naija Tax Guide Plans:\n"
-        "1) MONTHLY - ₦3,000\n"
-        "2) QUARTERLY - ₦8,000\n"
-        "3) YEARLY - ₦30,000\n\n"
-        "Reply:\n"
-        "SUBSCRIBE monthly\n"
-        "SUBSCRIBE quarterly\n"
-        "SUBSCRIBE yearly\n\n"
-        "Or reply HELP to see commands."
-    )
-
-def format_help_text() -> str:
-    return (
-        "Commands you can send:\n"
-        "HELP - show this menu\n"
-        "PLANS - see subscription plans\n"
-        "SUBSCRIBE monthly|quarterly|yearly - start a plan\n"
-        "STATUS - check your subscription\n\n"
-        "Or send any tax question directly."
-    )
-
-def handle_inbound_command(from_phone: str, text: str) -> Optional[str]:
-    t = (text or "").strip()
-    if not t:
-        return None
-
-    upper = t.upper()
-
-    if upper == "HELP":
-        return format_help_text()
-
-    if upper == "PLANS":
-        return format_plans_text()
-
-    if upper == "STATUS":
-        sub = get_subscription_status(from_phone)
-        if sub.get("status") == "error":
-            return "STATUS: Unable to read subscription right now. Please try again."
-        if not sub.get("exists"):
-            return "STATUS: No subscription found yet. Reply PLANS to see options."
-        plan = (sub.get("plan") or "unknown").upper()
-        status = (sub.get("status") or "unknown").upper()
-        expires_at = sub.get("expires_at") or "-"
-        active = "YES" if sub.get("active") else "NO"
-        return f"STATUS:\nPlan: {plan}\nState: {status}\nActive: {active}\nExpires: {expires_at}"
-
-    if upper.startswith("SUBSCRIBE"):
-        parts = t.split()
-        if len(parts) < 2:
-            return "Usage: SUBSCRIBE monthly|quarterly|yearly\nReply PLANS to see pricing."
-        plan = parts[1].strip().lower()
-        if plan not in PLAN_RULES:
-            return "Invalid plan. Use: monthly, quarterly, yearly."
-
-        try:
-            upsert_pending_subscription(from_phone, plan)
-        except Exception:
-            pass
-
-        return (
-            f"SUBSCRIBE: {plan.upper()} selected.\n"
-            "Next step: complete payment on the website.\n"
-            "If you already paid, reply STATUS in 1–2 minutes."
-        )
-
-    return None
-
-# ------------------------------------------------------------
 # WhatsApp Webhook (Meta verification + inbound messages)
 # ------------------------------------------------------------
 @app.get("/whatsapp/webhook")
@@ -515,7 +718,7 @@ def whatsapp_webhook_verify():
 def whatsapp_webhook_inbound():
     payload = request.get_json(silent=True) or {}
 
-    # IMPORTANT: log every inbound webhook hit (so you SEE it in Koyeb logs)
+    # log webhook hit
     try:
         field = (((payload.get("entry") or [])[0].get("changes") or [])[0]).get("field")
     except Exception:
@@ -540,33 +743,59 @@ def whatsapp_webhook_inbound():
         if msg_type == "text":
             text_body = ((msg.get("text") or {}).get("body") or "").strip()
 
-        logging.info(f"WA_MESSAGE from={from_phone} type={msg_type} body={text_body[:120]}")
+        logging.info(f"WA_MESSAGE from={from_phone} type={msg_type} body={safe_trunc(text_body, 160)}")
 
         if from_phone and text_body:
             # 1) Commands
             cmd_response = handle_inbound_command(from_phone, text_body)
             if cmd_response:
-                ok, info = send_whatsapp_text(from_phone, cmd_response)
+                ok, info = wa_reply(from_phone, cmd_response)
                 logging.info(f"WA_REPLY_CMD ok={ok} info={info}")
                 return "ok", 200
 
-            # 2) Normal question
+            # 2) Always try cache first (free)
+            cached = None
             try:
                 cached = cache_get(text_body)
-                if cached:
-                    ok, info = send_whatsapp_text(from_phone, cached)
-                    logging.info(f"WA_REPLY_CACHE ok={ok} info={info}")
-                    return "ok", 200
-
-                answer = ai_answer(text_body)
-                cache_set(text_body, answer)
-                ok, info = send_whatsapp_text(from_phone, answer)
-                logging.info(f"WA_REPLY_AI_STUB ok={ok} info={info}")
             except Exception:
-                logging.exception("Inbound message handling failed")
-                send_whatsapp_text(from_phone, "Sorry — system error. Please try again.")
+                cached = None
 
-            return "ok", 200
+            if cached:
+                ok, info = wa_reply(from_phone, cached)
+                logging.info(f"WA_REPLY_CACHE ok={ok} info={info}")
+                return "ok", 200
+
+            # 3) Enforce subscription for AI (cost control)
+            sub = get_subscription_status(from_phone)
+            is_active = bool(sub.get("active"))
+
+            if not is_active and not AI_ALLOW_FREE_USERS:
+                msg_txt = (
+                    "You are not subscribed yet.\n\n"
+                    "Reply PLANS to see pricing and subscribe.\n"
+                    "After payment, reply STATUS.\n\n"
+                    "Tip: You can still use HELP / PLANS / STATUS anytime."
+                )
+                ok, info = wa_reply(from_phone, msg_txt)
+                logging.info(f"WA_REPLY_SUB_GATE ok={ok} info={info}")
+                return "ok", 200
+
+            # 4) AI answer (paid users, or free allowed by env)
+            try:
+                answer = ai_answer(text_body)
+                # cache it (even for paid users) to reduce future cost
+                cache_set(text_body, answer)
+
+                ok, info = wa_reply(from_phone, answer)
+                logging.info(f"WA_REPLY_AI ok={ok} info={info}")
+
+                # If WhatsApp send fails, we still return 200 so Meta doesn't retry forever
+                return "ok", 200
+
+            except Exception:
+                logging.exception("Inbound AI handling failed")
+                wa_reply(from_phone, "Sorry — system error. Please try again.")
+                return "ok", 200
 
     # Status updates (delivered/read/etc.)
     statuses = value.get("statuses") or []
