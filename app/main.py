@@ -10,8 +10,8 @@ from typing import Any, Optional, Dict, Tuple
 
 import requests
 from flask import Flask, request, jsonify
-from supabase import create_client
 from flask_cors import CORS
+from supabase import create_client
 
 # ------------------------------------------------------------
 # App
@@ -22,21 +22,23 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 # ------------------------------------------------------------
 # ENV
 # ------------------------------------------------------------
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
 
-PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY", "")
-PAYSTACK_WEBHOOK_SECRET = os.getenv("PAYSTACK_WEBHOOK_SECRET", PAYSTACK_SECRET_KEY)
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
 
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
-
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")  # e.g. https://xxxx.koyeb.app
-PAYSTACK_CALLBACK_URL = os.getenv("PAYSTACK_CALLBACK_URL", "")
+# Paystack
+PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY", "").strip()
+PAYSTACK_WEBHOOK_SECRET = os.getenv("PAYSTACK_WEBHOOK_SECRET", PAYSTACK_SECRET_KEY).strip()
+PAYSTACK_CALLBACK_URL = os.getenv("PAYSTACK_CALLBACK_URL", "").strip()
 
 # WhatsApp Cloud API
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "").strip()
 WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "").strip()
 WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "").strip()
+
+# Optional: if you want to store/verify business account id too
+WHATSAPP_BUSINESS_ACCOUNT_ID = os.getenv("WHATSAPP_BUSINESS_ACCOUNT_ID", "").strip()
 
 # CORS
 CORS_ALLOW_ORIGINS = os.getenv("CORS_ALLOW_ORIGINS", "http://localhost:3000").strip()
@@ -50,8 +52,11 @@ CORS(
     methods=["GET", "POST", "OPTIONS"],
 )
 
+# ------------------------------------------------------------
+# Supabase client
+# ------------------------------------------------------------
 if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-    logging.warning("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY missing. Admin/Paystack/WhatsApp logic may fail.")
+    logging.warning("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY missing. DB calls will fail.")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
@@ -79,11 +84,51 @@ def require_admin(req) -> Optional[Any]:
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     return None
 
+def normalize_phone(raw: str) -> str:
+    s = (raw or "").strip()
+    s = s.replace(" ", "").replace("+", "")
+    return s
+
+def get_subscription_status(wa_phone: str) -> Dict[str, Any]:
+    """
+    Reads user_subscriptions and returns a normalized status dict.
+    Expected columns: wa_phone, plan, status, expires_at
+    """
+    wa_phone = normalize_phone(wa_phone)
+    try:
+        res = (
+            supabase.table("user_subscriptions")
+            .select("wa_phone,plan,status,expires_at,updated_at")
+            .eq("wa_phone", wa_phone)
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        if not rows:
+            return {"exists": False, "active": False, "plan": None, "status": "none", "expires_at": None}
+
+        row = rows[0]
+        expires_at = row.get("expires_at")
+        status = (row.get("status") or "none").lower()
+        plan = (row.get("plan") or None)
+
+        active = False
+        if status == "active" and expires_at:
+            try:
+                exp = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+                active = exp > now_utc()
+            except Exception:
+                active = True  # fallback: if date parsing fails, treat "active" as active
+        return {"exists": True, "active": active, "plan": plan, "status": status, "expires_at": expires_at}
+    except Exception as e:
+        logging.exception("get_subscription_status failed")
+        return {"exists": False, "active": False, "plan": None, "status": "error", "expires_at": None, "error": str(e)[:200]}
+
 def activate_user_subscription(wa_phone: str, plan: str) -> None:
     days = PLAN_RULES.get(plan, {}).get("days", 30)
     expires_at = iso(now_utc() + timedelta(days=days))
     supabase.table("user_subscriptions").upsert({
-        "wa_phone": wa_phone,
+        "wa_phone": normalize_phone(wa_phone),
         "plan": plan,
         "status": "active",
         "expires_at": expires_at,
@@ -92,103 +137,56 @@ def activate_user_subscription(wa_phone: str, plan: str) -> None:
 
 def upsert_pending_subscription(wa_phone: str, plan: str) -> None:
     supabase.table("user_subscriptions").upsert({
-        "wa_phone": wa_phone,
+        "wa_phone": normalize_phone(wa_phone),
         "plan": plan,
         "status": "pending",
         "expires_at": None,
         "updated_at": iso(now_utc())
     }, on_conflict="wa_phone").execute()
 
-def get_subscription_status(wa_phone: str) -> Dict[str, Any]:
-    res = supabase.table("user_subscriptions").select("*").eq("wa_phone", wa_phone).limit(1).execute()
-    rows = res.data or []
-    return rows[0] if rows else {}
+# -----------------------------
+# Simple cache (optional)
+# -----------------------------
+def cache_key(question: str) -> str:
+    q = (question or "").strip().lower()
+    return hashlib.sha256(q.encode("utf-8")).hexdigest()
 
-def normalize_text(s: str) -> str:
-    return (s or "").strip()
-
-# ---------------------------
-# WhatsApp send message
-# ---------------------------
-def wa_send_text(to_phone: str, text: str) -> Tuple[bool, str]:
+def cache_get(question: str) -> Optional[str]:
     """
-    Sends a WhatsApp text message to a user via Cloud API.
-    to_phone should be in international format without '+' ideally (Meta accepts both in many cases).
+    Requires a table like: qa_cache(question_hash text pk, question text, answer text, updated_at text)
+    If you don't have it yet, this will just safely return None.
     """
-    if not WHATSAPP_TOKEN or not WHATSAPP_PHONE_NUMBER_ID:
-        return False, "WHATSAPP_TOKEN or WHATSAPP_PHONE_NUMBER_ID not set"
-
-    url = f"https://graph.facebook.com/v19.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
-    headers = {
-        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to_phone,
-        "type": "text",
-        "text": {"body": text},
-    }
-
     try:
-        r = requests.post(url, headers=headers, json=payload, timeout=25)
-        if r.status_code >= 300:
-            return False, f"HTTP {r.status_code}: {r.text[:300]}"
-        return True, "sent"
-    except Exception as e:
-        return False, str(e)[:300]
+        qh = cache_key(question)
+        res = supabase.table("qa_cache").select("answer").eq("question_hash", qh).limit(1).execute()
+        rows = res.data or []
+        if rows:
+            return rows[0].get("answer")
+        return None
+    except Exception:
+        return None
 
-# ---------------------------
-# Build replies for commands
-# ---------------------------
-def reply_help() -> str:
-    return (
-        "Naija Tax Guide Commands:\n"
-        "1) HELP - show commands\n"
-        "2) PLANS - view subscription plans\n"
-        "3) SUBSCRIBE - how to subscribe\n"
-        "4) STATUS - check your subscription status\n\n"
-        "Or just ask your tax question directly."
-    )
+def cache_set(question: str, answer: str) -> None:
+    try:
+        qh = cache_key(question)
+        supabase.table("qa_cache").upsert({
+            "question_hash": qh,
+            "question": (question or "").strip(),
+            "answer": (answer or "").strip(),
+            "updated_at": iso(now_utc())
+        }, on_conflict="question_hash").execute()
+    except Exception:
+        return
 
-def reply_plans() -> str:
-    return (
-        "Subscription Plans:\n"
-        "- MONTHLY: ₦3,000\n"
-        "- QUARTERLY: ₦8,000\n"
-        "- YEARLY: ₦30,000\n\n"
-        "Send SUBSCRIBE to get the payment link instructions."
-    )
-
-def reply_subscribe() -> str:
-    base = (PUBLIC_BASE_URL or "").rstrip("/")
-    if base:
-        return (
-            "To subscribe:\n"
-            "1) Go to the website and choose a plan.\n"
-            f"2) Website: {base}\n"
-            "3) After payment, your WhatsApp access activates automatically.\n\n"
-            "You can also reply with: MONTHLY, QUARTERLY, or YEARLY."
-        )
-    return (
-        "To subscribe:\n"
-        "1) Choose a plan: MONTHLY / QUARTERLY / YEARLY\n"
-        "2) You will receive payment instructions.\n"
-        "3) After payment, your WhatsApp access activates automatically."
-    )
-
-def reply_status(wa_phone: str) -> str:
-    sub = get_subscription_status(wa_phone)
-    if not sub:
-        return "No subscription record found for your number yet. Send PLANS or SUBSCRIBE to get started."
-
-    status = sub.get("status") or "unknown"
-    plan = sub.get("plan") or "-"
-    expires_at = sub.get("expires_at") or "-"
-    return f"Your subscription:\n- Plan: {plan}\n- Status: {status}\n- Expires: {expires_at}"
+# -----------------------------
+# AI stub (replace later)
+# -----------------------------
+def ai_answer(question: str) -> str:
+    # Replace with OpenAI call later. For now, keep it stable.
+    return f"Cache miss. AI call will be connected here next.\n\nYour question was: {question}"
 
 # ------------------------------------------------------------
-# Health + Routes
+# Health / Debug
 # ------------------------------------------------------------
 @app.get("/health")
 def health():
@@ -196,39 +194,46 @@ def health():
 
 @app.get("/routes")
 def routes():
-    output = []
-    for r in app.url_map.iter_rules():
-        output.append({
-            "endpoint": r.endpoint,
-            "methods": sorted([m for m in r.methods if m not in ("HEAD", "OPTIONS")]),
-            "rule": str(r)
+    out = []
+    for rule in app.url_map.iter_rules():
+        out.append({
+            "endpoint": rule.endpoint,
+            "methods": sorted([m for m in rule.methods if m in ("GET", "POST", "OPTIONS")]),
+            "rule": str(rule),
         })
-    return jsonify(sorted(output, key=lambda x: x["rule"]))
+    return jsonify(sorted(out, key=lambda x: x["rule"]))
 
 # ------------------------------------------------------------
-# Core Ask (placeholder today, AI later)
+# ASK (used by website AND WhatsApp inbound)
 # ------------------------------------------------------------
 @app.post("/ask")
 def ask():
-    """
-    Current behavior: cache/DB lookup then AI (later).
-    For now, returns a placeholder that shows cache miss.
-    """
     body = request.get_json(silent=True) or {}
-    wa_phone = normalize_text(body.get("wa_phone"))
-    question = normalize_text(body.get("question"))
+    wa_phone = normalize_phone(body.get("wa_phone") or "")
+    question = (body.get("question") or "").strip()
 
     if not wa_phone:
         return jsonify({"ok": False, "error": "wa_phone is required"}), 400
     if not question:
         return jsonify({"ok": False, "error": "question is required"}), 400
 
-    # TODO: implement cache lookup + AI call
-    return jsonify({
-        "ok": True,
-        "cached": False,
-        "answer": {"meta": "", "text": "Cache miss. AI call will be connected here next."}
-    })
+    # OPTIONAL: if you want to enforce subscription before answering, uncomment below
+    # sub = get_subscription_status(wa_phone)
+    # if not sub.get("active"):
+    #     return jsonify({
+    #         "ok": True,
+    #         "cached": False,
+    #         "answer": "You are not on an active plan. Reply PLANS to see options, or SUBSCRIBE monthly/quarterly/yearly.",
+    #         "meta": {"subscription": sub}
+    #     })
+
+    cached_answer = cache_get(question)
+    if cached_answer:
+        return jsonify({"ok": True, "cached": True, "answer": cached_answer, "meta": {"source": "cache"}})
+
+    answer = ai_answer(question)
+    cache_set(question, answer)
+    return jsonify({"ok": True, "cached": False, "answer": answer, "meta": {"source": "ai_stub"}})
 
 # ------------------------------------------------------------
 # Paystack: Initialize
@@ -240,7 +245,7 @@ def paystack_initialize():
 
     body = request.get_json(silent=True) or {}
     email = (body.get("email") or "").strip().lower()
-    wa_phone = (body.get("wa_phone") or "").strip()
+    wa_phone = normalize_phone(body.get("wa_phone") or "")
     plan = (body.get("plan") or "").strip().lower()
 
     if not email or "@" not in email:
@@ -252,9 +257,11 @@ def paystack_initialize():
 
     rule = PLAN_RULES[plan]
     reference = uuid.uuid4().hex[:12]
+
     amount_kobo = int(rule["amount_kobo"])
     amount = amount_kobo / 100.0
 
+    # 1) Payment row
     try:
         supabase.table("payments").insert({
             "reference": reference,
@@ -273,8 +280,13 @@ def paystack_initialize():
         logging.exception("Failed inserting payment row")
         return jsonify({"ok": False, "error": f"db_insert_failed: {str(e)[:300]}"}), 500
 
-    upsert_pending_subscription(wa_phone, plan)
+    # 2) Subscription pending
+    try:
+        upsert_pending_subscription(wa_phone, plan)
+    except Exception:
+        pass
 
+    # 3) Paystack init
     headers = {"Authorization": f"Bearer {PAYSTACK_SECRET_KEY}", "Content-Type": "application/json"}
     payload = {
         "email": email,
@@ -364,13 +376,121 @@ def paystack_webhook():
     return "ok", 200
 
 # ------------------------------------------------------------
+# WhatsApp Cloud API helpers
+# ------------------------------------------------------------
+def wa_api_url(path: str) -> str:
+    # Use a stable Graph API version
+    return f"https://graph.facebook.com/v20.0{path}"
+
+def send_whatsapp_text(to_wa_phone: str, text: str) -> Tuple[bool, str]:
+    """
+    Sends a WhatsApp message via Cloud API.
+    Requires WHATSAPP_TOKEN and WHATSAPP_PHONE_NUMBER_ID.
+    """
+    if not WHATSAPP_TOKEN or not WHATSAPP_PHONE_NUMBER_ID:
+        return False, "WHATSAPP_TOKEN or WHATSAPP_PHONE_NUMBER_ID missing"
+
+    to_wa_phone = normalize_phone(to_wa_phone)
+    url = wa_api_url(f"/{WHATSAPP_PHONE_NUMBER_ID}/messages")
+    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to_wa_phone,
+        "type": "text",
+        "text": {"body": text[:3800]},  # safe limit
+    }
+
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=25)
+        if r.status_code >= 300:
+            return False, f"WhatsApp send failed: {r.status_code} {r.text[:250]}"
+        return True, "ok"
+    except Exception as e:
+        return False, f"WhatsApp send exception: {str(e)[:200]}"
+
+def format_plans_text() -> str:
+    return (
+        "Naija Tax Guide Plans:\n"
+        "1) MONTHLY - ₦3,000\n"
+        "2) QUARTERLY - ₦8,000\n"
+        "3) YEARLY - ₦30,000\n\n"
+        "Reply:\n"
+        "SUBSCRIBE monthly\n"
+        "SUBSCRIBE quarterly\n"
+        "SUBSCRIBE yearly\n\n"
+        "Or reply HELP to see commands."
+    )
+
+def format_help_text() -> str:
+    return (
+        "Commands you can send:\n"
+        "HELP - show this menu\n"
+        "PLANS - see subscription plans\n"
+        "SUBSCRIBE monthly|quarterly|yearly - start a plan\n"
+        "STATUS - check your subscription\n\n"
+        "Or send any tax question directly."
+    )
+
+def handle_inbound_command(from_phone: str, text: str) -> Optional[str]:
+    """
+    Returns a response string if it's a recognized command; otherwise None.
+    """
+    t = (text or "").strip()
+    if not t:
+        return None
+
+    upper = t.strip().upper()
+
+    if upper == "HELP":
+        return format_help_text()
+
+    if upper == "PLANS":
+        return format_plans_text()
+
+    if upper == "STATUS":
+        sub = get_subscription_status(from_phone)
+        if sub.get("status") == "error":
+            return "STATUS: Unable to read subscription right now. Please try again."
+        if not sub.get("exists"):
+            return "STATUS: No subscription found yet. Reply PLANS to see options."
+        plan = (sub.get("plan") or "unknown").upper()
+        status = (sub.get("status") or "unknown").upper()
+        expires_at = sub.get("expires_at") or "-"
+        active = "YES" if sub.get("active") else "NO"
+        return f"STATUS:\nPlan: {plan}\nState: {status}\nActive: {active}\nExpires: {expires_at}"
+
+    if upper.startswith("SUBSCRIBE"):
+        parts = t.split()
+        if len(parts) < 2:
+            return "Usage: SUBSCRIBE monthly|quarterly|yearly\nReply PLANS to see pricing."
+        plan = parts[1].strip().lower()
+        if plan not in PLAN_RULES:
+            return "Invalid plan. Use: monthly, quarterly, yearly."
+
+        # We mark as pending here. Payment can be triggered on website or later flow.
+        # If you want WhatsApp to send a payment link later, we can add it.
+        try:
+            upsert_pending_subscription(from_phone, plan)
+        except Exception:
+            pass
+        return (
+            f"SUBSCRIBE: {plan.upper()} selected.\n"
+            "Next step: complete payment on the website.\n"
+            "If you already paid, reply STATUS in 1–2 minutes."
+        )
+
+    return None
+
+# ------------------------------------------------------------
 # WhatsApp Webhook (Meta verification + inbound messages)
 # ------------------------------------------------------------
 @app.get("/whatsapp/webhook")
 def whatsapp_webhook_verify():
     """
-    Meta verification request includes:
-    hub.mode, hub.verify_token, hub.challenge
+    Meta will call:
+    /whatsapp/webhook?hub.mode=subscribe&hub.verify_token=...&hub.challenge=...
+    You must return hub.challenge (plain text) when verify_token matches.
     """
     mode = request.args.get("hub.mode", "")
     token = request.args.get("hub.verify_token", "")
@@ -379,91 +499,62 @@ def whatsapp_webhook_verify():
     if mode == "subscribe" and token and WHATSAPP_VERIFY_TOKEN and token == WHATSAPP_VERIFY_TOKEN:
         return challenge, 200
 
-    # This is why you see "forbidden" in browser — it’s normal without the correct args/token.
+    # If you open this URL in browser without params, you may see 403 — that's normal.
     return "forbidden", 403
 
 @app.post("/whatsapp/webhook")
 def whatsapp_webhook_inbound():
     """
-    Receives inbound WhatsApp events. We:
-    - extract text messages
-    - handle commands
-    - otherwise pass into /ask
-    - reply via Cloud API
+    Receives messages + statuses from WhatsApp Cloud API.
+    We parse inbound text and respond.
     """
     payload = request.get_json(silent=True) or {}
+
     try:
-        entries = payload.get("entry") or []
-        for entry in entries:
-            changes = entry.get("changes") or []
-            for change in changes:
-                value = change.get("value") or {}
-                messages = value.get("messages") or []
-                for msg in messages:
-                    from_phone = str(msg.get("from") or "").strip()
-                    msg_type = msg.get("type")
-
-                    if not from_phone:
-                        continue
-
-                    text = ""
-                    if msg_type == "text":
-                        text = ((msg.get("text") or {}).get("body") or "").strip()
-
-                    if not text:
-                        # ignore non-text for now
-                        continue
-
-                    upper = text.strip().upper()
-
-                    # Commands
-                    if upper in ("HELP", "MENU"):
-                        wa_send_text(from_phone, reply_help())
-                        continue
-
-                    if upper in ("PLANS", "PLAN"):
-                        wa_send_text(from_phone, reply_plans())
-                        continue
-
-                    if upper in ("SUBSCRIBE", "BUY"):
-                        wa_send_text(from_phone, reply_subscribe())
-                        continue
-
-                    if upper in ("STATUS", "CHECK"):
-                        wa_send_text(from_phone, reply_status(from_phone))
-                        continue
-
-                    # Quick plan keywords
-                    if upper in ("MONTHLY", "QUARTERLY", "YEARLY"):
-                        wa_send_text(from_phone, f"You selected {upper}. Please subscribe via the website or request a payment link from the web flow.\n\nSend SUBSCRIBE for instructions.")
-                        continue
-
-                    # Default: route into /ask logic (internal call)
-                    with app.test_request_context(
-                        "/ask",
-                        method="POST",
-                        json={"wa_phone": from_phone, "question": text},
-                    ):
-                        resp = ask()
-                        # resp is Flask response; convert to dict
-                        if isinstance(resp, tuple):
-                            resp_obj, status = resp
-                            data = resp_obj.get_json(silent=True) or {}
-                        else:
-                            data = resp.get_json(silent=True) or {}
-
-                    answer = data.get("answer") or {}
-                    reply_text = answer.get("text") or "OK"
-
-                    wa_send_text(from_phone, reply_text)
-
-        return "ok", 200
+        entry = (payload.get("entry") or [])[0]
+        change = (entry.get("changes") or [])[0]
+        value = change.get("value") or {}
     except Exception:
-        logging.exception("WhatsApp webhook processing failed")
         return "ok", 200
+
+    # Inbound user messages
+    messages = value.get("messages") or []
+    if messages:
+        msg = messages[0]
+        from_phone = normalize_phone(msg.get("from") or "")
+        msg_type = msg.get("type") or ""
+
+        text_body = ""
+        if msg_type == "text":
+            text_body = ((msg.get("text") or {}).get("body") or "").strip()
+
+        if from_phone and text_body:
+            # 1) Commands
+            cmd_response = handle_inbound_command(from_phone, text_body)
+            if cmd_response:
+                send_whatsapp_text(from_phone, cmd_response)
+                return "ok", 200
+
+            # 2) Normal questions -> your /ask logic (same behavior)
+            try:
+                cached_answer = cache_get(text_body)
+                if cached_answer:
+                    send_whatsapp_text(from_phone, cached_answer)
+                    return "ok", 200
+
+                answer = ai_answer(text_body)
+                cache_set(text_body, answer)
+                send_whatsapp_text(from_phone, answer)
+            except Exception as e:
+                logging.exception("Inbound message handling failed")
+                send_whatsapp_text(from_phone, "Sorry — system error. Please try again.")
+            return "ok", 200
+
+    # Status updates (delivery/read) - optional to store later
+    return "ok", 200
 
 # ------------------------------------------------------------
-# Admin
+# Admin endpoints
 # ------------------------------------------------------------
 @app.get("/admin/subscriptions")
 def admin_subscriptions():
@@ -471,9 +562,12 @@ def admin_subscriptions():
     if auth:
         return auth
 
-    res = supabase.table("user_subscriptions") \
-        .select("wa_phone,plan,status,expires_at,updated_at") \
-        .order("updated_at", desc=True).execute()
+    res = (
+        supabase.table("user_subscriptions")
+        .select("wa_phone,plan,status,expires_at,updated_at")
+        .order("updated_at", desc=True)
+        .execute()
+    )
     return jsonify(res.data or [])
 
 @app.get("/admin/payments")
@@ -482,7 +576,10 @@ def admin_payments():
     if auth:
         return auth
 
-    res = supabase.table("payments") \
-        .select("reference,wa_phone,provider,plan,amount,amount_kobo,currency,status,created_at,paid_at") \
-        .order("created_at", desc=True).execute()
+    res = (
+        supabase.table("payments")
+        .select("reference,wa_phone,provider,plan,amount,amount_kobo,currency,status,created_at,paid_at")
+        .order("created_at", desc=True)
+        .execute()
+    )
     return jsonify(res.data or [])
