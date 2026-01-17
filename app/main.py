@@ -36,14 +36,18 @@ PAYSTACK_CALLBACK_URL = os.getenv("PAYSTACK_CALLBACK_URL", "").strip()
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "").strip()
 WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "").strip()
 WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "").strip()
+WHATSAPP_BUSINESS_ACCOUNT_ID = os.getenv("WHATSAPP_BUSINESS_ACCOUNT_ID", "").strip()  # optional
 
-# Optional: if you want to store/verify business account id too
-WHATSAPP_BUSINESS_ACCOUNT_ID = os.getenv("WHATSAPP_BUSINESS_ACCOUNT_ID", "").strip()
+# OpenAI (optional for real AI replies)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+ENABLE_AI_REPLIES = os.getenv("ENABLE_AI_REPLIES", "false").strip().lower() in ("1", "true", "yes")
+
+# Graph API version
+GRAPH_VERSION = os.getenv("GRAPH_VERSION", "v20.0").strip()
 
 # CORS
 CORS_ALLOW_ORIGINS = os.getenv("CORS_ALLOW_ORIGINS", "http://localhost:3000").strip()
 allowed_origins = [o.strip() for o in CORS_ALLOW_ORIGINS.split(",") if o.strip()]
-
 CORS(
     app,
     resources={r"/*": {"origins": allowed_origins}},
@@ -57,7 +61,6 @@ CORS(
 # ------------------------------------------------------------
 if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
     logging.warning("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY missing. DB calls will fail.")
-
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 # ------------------------------------------------------------
@@ -78,7 +81,7 @@ def now_utc() -> datetime:
 def iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat()
 
-def require_admin(req) -> Optional[Any]:
+def require_admin(req):
     key = req.headers.get("x-admin-key", "")
     if not ADMIN_API_KEY or key != ADMIN_API_KEY:
         return jsonify({"ok": False, "error": "unauthorized"}), 401
@@ -89,11 +92,10 @@ def normalize_phone(raw: str) -> str:
     s = s.replace(" ", "").replace("+", "")
     return s
 
+# ------------------------------------------------------------
+# Subscription helpers
+# ------------------------------------------------------------
 def get_subscription_status(wa_phone: str) -> Dict[str, Any]:
-    """
-    Reads user_subscriptions and returns a normalized status dict.
-    Expected columns: wa_phone, plan, status, expires_at
-    """
     wa_phone = normalize_phone(wa_phone)
     try:
         res = (
@@ -118,7 +120,7 @@ def get_subscription_status(wa_phone: str) -> Dict[str, Any]:
                 exp = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
                 active = exp > now_utc()
             except Exception:
-                active = True  # fallback: if date parsing fails, treat "active" as active
+                active = True
         return {"exists": True, "active": active, "plan": plan, "status": status, "expires_at": expires_at}
     except Exception as e:
         logging.exception("get_subscription_status failed")
@@ -144,18 +146,14 @@ def upsert_pending_subscription(wa_phone: str, plan: str) -> None:
         "updated_at": iso(now_utc())
     }, on_conflict="wa_phone").execute()
 
-# -----------------------------
-# Simple cache (optional)
-# -----------------------------
+# ------------------------------------------------------------
+# Cache helpers (safe: never crash webhook if schema is wrong)
+# ------------------------------------------------------------
 def cache_key(question: str) -> str:
     q = (question or "").strip().lower()
     return hashlib.sha256(q.encode("utf-8")).hexdigest()
 
 def cache_get(question: str) -> Optional[str]:
-    """
-    Requires a table like: qa_cache(question_hash text pk, question text, answer text, updated_at text)
-    If you don't have it yet, this will just safely return None.
-    """
     try:
         qh = cache_key(question)
         res = supabase.table("qa_cache").select("answer").eq("question_hash", qh).limit(1).execute()
@@ -163,7 +161,10 @@ def cache_get(question: str) -> Optional[str]:
         if rows:
             return rows[0].get("answer")
         return None
-    except Exception:
+    except Exception as e:
+        # IMPORTANT: your logs show HTTP 400 on qa_cache calls.
+        # This keeps your app alive while you fix the qa_cache schema.
+        logging.warning(f"cache_get skipped (qa_cache issue): {str(e)[:180]}")
         return None
 
 def cache_set(question: str, answer: str) -> None:
@@ -175,22 +176,71 @@ def cache_set(question: str, answer: str) -> None:
             "answer": (answer or "").strip(),
             "updated_at": iso(now_utc())
         }, on_conflict="question_hash").execute()
-    except Exception:
+    except Exception as e:
+        logging.warning(f"cache_set skipped (qa_cache issue): {str(e)[:180]}")
         return
 
-# -----------------------------
-# AI stub (replace later)
-# -----------------------------
+# ------------------------------------------------------------
+# AI (real or fallback)
+# ------------------------------------------------------------
+def openai_answer(question: str) -> str:
+    """
+    Optional real AI replies using OpenAI Responses API.
+    Enable by setting:
+      ENABLE_AI_REPLIES=true
+      OPENAI_API_KEY=...
+    """
+    if not (ENABLE_AI_REPLIES and OPENAI_API_KEY):
+        return ""
+
+    try:
+        url = "https://api.openai.com/v1/responses"
+        headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+        payload = {
+            "model": "gpt-4.1-mini",
+            "input": f"You are Naija Tax Guide. Answer clearly and briefly.\n\nUser: {question}"
+        }
+        r = requests.post(url, headers=headers, json=payload, timeout=35)
+        if r.status_code >= 300:
+            logging.warning(f"OpenAI error: {r.status_code} {r.text[:180]}")
+            return ""
+        data = r.json()
+        # Extract text safely
+        out_text = ""
+        for item in (data.get("output") or []):
+            for c in (item.get("content") or []):
+                if c.get("type") == "output_text":
+                    out_text += c.get("text", "")
+        return (out_text or "").strip()
+    except Exception as e:
+        logging.warning(f"OpenAI exception: {str(e)[:180]}")
+        return ""
+
 def ai_answer(question: str) -> str:
-    # Replace with OpenAI call later. For now, keep it stable.
-    return f"Cache miss. AI call will be connected here next.\n\nYour question was: {question}"
+    # 1) Try real AI if enabled
+    real = openai_answer(question)
+    if real:
+        return real
+
+    # 2) Fallback (so your system always responds)
+    return (
+        "Thanks. AI replies are not fully enabled yet.\n\n"
+        f"Your question was:\n{question}\n\n"
+        "Reply HELP to see menu, or PLANS to subscribe."
+    )
 
 # ------------------------------------------------------------
 # Health / Debug
 # ------------------------------------------------------------
 @app.get("/health")
 def health():
-    return jsonify({"ok": True})
+    return jsonify({
+        "ok": True,
+        "whatsapp_phone_number_id_set": bool(WHATSAPP_PHONE_NUMBER_ID),
+        "whatsapp_token_set": bool(WHATSAPP_TOKEN),
+        "ai_enabled": ENABLE_AI_REPLIES and bool(OPENAI_API_KEY),
+        "graph_version": GRAPH_VERSION
+    })
 
 @app.get("/routes")
 def routes():
@@ -217,23 +267,13 @@ def ask():
     if not question:
         return jsonify({"ok": False, "error": "question is required"}), 400
 
-    # OPTIONAL: if you want to enforce subscription before answering, uncomment below
-    # sub = get_subscription_status(wa_phone)
-    # if not sub.get("active"):
-    #     return jsonify({
-    #         "ok": True,
-    #         "cached": False,
-    #         "answer": "You are not on an active plan. Reply PLANS to see options, or SUBSCRIBE monthly/quarterly/yearly.",
-    #         "meta": {"subscription": sub}
-    #     })
-
     cached_answer = cache_get(question)
     if cached_answer:
         return jsonify({"ok": True, "cached": True, "answer": cached_answer, "meta": {"source": "cache"}})
 
     answer = ai_answer(question)
     cache_set(question, answer)
-    return jsonify({"ok": True, "cached": False, "answer": answer, "meta": {"source": "ai_stub"}})
+    return jsonify({"ok": True, "cached": False, "answer": answer, "meta": {"source": "ai"}})
 
 # ------------------------------------------------------------
 # Paystack: Initialize
@@ -261,7 +301,6 @@ def paystack_initialize():
     amount_kobo = int(rule["amount_kobo"])
     amount = amount_kobo / 100.0
 
-    # 1) Payment row
     try:
         supabase.table("payments").insert({
             "reference": reference,
@@ -280,13 +319,11 @@ def paystack_initialize():
         logging.exception("Failed inserting payment row")
         return jsonify({"ok": False, "error": f"db_insert_failed: {str(e)[:300]}"}), 500
 
-    # 2) Subscription pending
     try:
         upsert_pending_subscription(wa_phone, plan)
     except Exception:
         pass
 
-    # 3) Paystack init
     headers = {"Authorization": f"Bearer {PAYSTACK_SECRET_KEY}", "Content-Type": "application/json"}
     payload = {
         "email": email,
@@ -379,14 +416,9 @@ def paystack_webhook():
 # WhatsApp Cloud API helpers
 # ------------------------------------------------------------
 def wa_api_url(path: str) -> str:
-    # Use a stable Graph API version
-    return f"https://graph.facebook.com/v20.0{path}"
+    return f"https://graph.facebook.com/{GRAPH_VERSION}{path}"
 
 def send_whatsapp_text(to_wa_phone: str, text: str) -> Tuple[bool, str]:
-    """
-    Sends a WhatsApp message via Cloud API.
-    Requires WHATSAPP_TOKEN and WHATSAPP_PHONE_NUMBER_ID.
-    """
     if not WHATSAPP_TOKEN or not WHATSAPP_PHONE_NUMBER_ID:
         return False, "WHATSAPP_TOKEN or WHATSAPP_PHONE_NUMBER_ID missing"
 
@@ -398,7 +430,7 @@ def send_whatsapp_text(to_wa_phone: str, text: str) -> Tuple[bool, str]:
         "messaging_product": "whatsapp",
         "to": to_wa_phone,
         "type": "text",
-        "text": {"body": text[:3800]},  # safe limit
+        "text": {"body": text[:3800]},
     }
 
     try:
@@ -424,23 +456,19 @@ def format_plans_text() -> str:
 
 def format_help_text() -> str:
     return (
-        "Commands you can send:\n"
+        "Commands:\n"
         "HELP - show this menu\n"
         "PLANS - see subscription plans\n"
-        "SUBSCRIBE monthly|quarterly|yearly - start a plan\n"
+        "SUBSCRIBE monthly|quarterly|yearly - choose a plan\n"
         "STATUS - check your subscription\n\n"
         "Or send any tax question directly."
     )
 
 def handle_inbound_command(from_phone: str, text: str) -> Optional[str]:
-    """
-    Returns a response string if it's a recognized command; otherwise None.
-    """
     t = (text or "").strip()
     if not t:
         return None
-
-    upper = t.strip().upper()
+    upper = t.upper()
 
     if upper == "HELP":
         return format_help_text()
@@ -468,12 +496,11 @@ def handle_inbound_command(from_phone: str, text: str) -> Optional[str]:
         if plan not in PLAN_RULES:
             return "Invalid plan. Use: monthly, quarterly, yearly."
 
-        # We mark as pending here. Payment can be triggered on website or later flow.
-        # If you want WhatsApp to send a payment link later, we can add it.
         try:
             upsert_pending_subscription(from_phone, plan)
         except Exception:
             pass
+
         return (
             f"SUBSCRIBE: {plan.upper()} selected.\n"
             "Next step: complete payment on the website.\n"
@@ -487,28 +514,28 @@ def handle_inbound_command(from_phone: str, text: str) -> Optional[str]:
 # ------------------------------------------------------------
 @app.get("/whatsapp/webhook")
 def whatsapp_webhook_verify():
-    """
-    Meta will call:
-    /whatsapp/webhook?hub.mode=subscribe&hub.verify_token=...&hub.challenge=...
-    You must return hub.challenge (plain text) when verify_token matches.
-    """
     mode = request.args.get("hub.mode", "")
     token = request.args.get("hub.verify_token", "")
     challenge = request.args.get("hub.challenge", "")
 
+    # IMPORTANT: When you open this URL in your browser directly,
+    # it should return "forbidden". Only Meta sends the hub.* params.
     if mode == "subscribe" and token and WHATSAPP_VERIFY_TOKEN and token == WHATSAPP_VERIFY_TOKEN:
+        logging.info("WhatsApp webhook verified successfully (challenge returned).")
         return challenge, 200
 
-    # If you open this URL in browser without params, you may see 403 — that's normal.
     return "forbidden", 403
 
 @app.post("/whatsapp/webhook")
 def whatsapp_webhook_inbound():
-    """
-    Receives messages + statuses from WhatsApp Cloud API.
-    We parse inbound text and respond.
-    """
     payload = request.get_json(silent=True) or {}
+
+    # LOGGING: This is what you need to confirm Meta is delivering "messages"
+    try:
+        entry_count = len(payload.get("entry") or [])
+        logging.info(f"WA webhook POST received. entry_count={entry_count}")
+    except Exception:
+        logging.info("WA webhook POST received.")
 
     try:
         entry = (payload.get("entry") or [])[0]
@@ -517,8 +544,11 @@ def whatsapp_webhook_inbound():
     except Exception:
         return "ok", 200
 
-    # Inbound user messages
     messages = value.get("messages") or []
+    statuses = value.get("statuses") or []
+    logging.info(f"WA payload: messages={len(messages)} statuses={len(statuses)}")
+
+    # 1) Inbound user messages
     if messages:
         msg = messages[0]
         from_phone = normalize_phone(msg.get("from") or "")
@@ -528,29 +558,34 @@ def whatsapp_webhook_inbound():
         if msg_type == "text":
             text_body = ((msg.get("text") or {}).get("body") or "").strip()
 
+        logging.info(f"WA inbound message: from={from_phone} type={msg_type} text={text_body[:120]!r}")
+
         if from_phone and text_body:
-            # 1) Commands
+            # Commands first
             cmd_response = handle_inbound_command(from_phone, text_body)
             if cmd_response:
-                send_whatsapp_text(from_phone, cmd_response)
+                ok, info = send_whatsapp_text(from_phone, cmd_response)
+                logging.info(f"WA reply (command) sent ok={ok} info={info}")
                 return "ok", 200
 
-            # 2) Normal questions -> your /ask logic (same behavior)
-            try:
-                cached_answer = cache_get(text_body)
-                if cached_answer:
-                    send_whatsapp_text(from_phone, cached_answer)
-                    return "ok", 200
+            # Normal questions -> cache -> AI -> reply
+            cached_answer = cache_get(text_body)
+            if cached_answer:
+                ok, info = send_whatsapp_text(from_phone, cached_answer)
+                logging.info(f"WA reply (cache) sent ok={ok} info={info}")
+                return "ok", 200
 
-                answer = ai_answer(text_body)
-                cache_set(text_body, answer)
-                send_whatsapp_text(from_phone, answer)
-            except Exception as e:
-                logging.exception("Inbound message handling failed")
-                send_whatsapp_text(from_phone, "Sorry — system error. Please try again.")
+            answer = ai_answer(text_body)
+            cache_set(text_body, answer)
+            ok, info = send_whatsapp_text(from_phone, answer)
+            logging.info(f"WA reply (ai) sent ok={ok} info={info}")
             return "ok", 200
 
-    # Status updates (delivery/read) - optional to store later
+    # 2) Status updates (optional)
+    if statuses:
+        st = statuses[0]
+        logging.info(f"WA status update: {json.dumps(st)[:260]}")
+
     return "ok", 200
 
 # ------------------------------------------------------------
@@ -561,7 +596,6 @@ def admin_subscriptions():
     auth = require_admin(request)
     if auth:
         return auth
-
     res = (
         supabase.table("user_subscriptions")
         .select("wa_phone,plan,status,expires_at,updated_at")
@@ -575,7 +609,6 @@ def admin_payments():
     auth = require_admin(request)
     if auth:
         return auth
-
     res = (
         supabase.table("payments")
         .select("reference,wa_phone,provider,plan,amount,amount_kobo,currency,status,created_at,paid_at")
