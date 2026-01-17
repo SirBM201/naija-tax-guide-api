@@ -38,9 +38,6 @@ WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "").strip()
 WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "").strip()
 WHATSAPP_BUSINESS_ACCOUNT_ID = os.getenv("WHATSAPP_BUSINESS_ACCOUNT_ID", "").strip()  # optional
 
-# Feature flags
-ENABLE_AI_REPLIES = os.getenv("ENABLE_AI_REPLIES", "true").strip().lower() in ("1", "true", "yes", "on")
-
 # CORS
 CORS_ALLOW_ORIGINS = os.getenv("CORS_ALLOW_ORIGINS", "http://localhost:3000").strip()
 allowed_origins = [o.strip() for o in CORS_ALLOW_ORIGINS.split(",") if o.strip()]
@@ -91,11 +88,10 @@ def normalize_phone(raw: str) -> str:
     return s
 
 def normalize_question(q: str) -> str:
-    """
-    Matches your Supabase qa_cache schema: normalized_question text
-    Keep simple and stable.
-    """
-    return " ".join((q or "").strip().lower().split())
+    # matches your qa_cache schema: normalized_question (text)
+    s = (q or "").strip().lower()
+    s = " ".join(s.split())
+    return s
 
 def get_subscription_status(wa_phone: str) -> Dict[str, Any]:
     wa_phone = normalize_phone(wa_phone)
@@ -114,12 +110,12 @@ def get_subscription_status(wa_phone: str) -> Dict[str, Any]:
         row = rows[0]
         expires_at = row.get("expires_at")
         status = (row.get("status") or "none").lower()
-        plan = (row.get("plan") or None)
+        plan = row.get("plan") or None
 
         active = False
         if status == "active" and expires_at:
             try:
-                exp = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+                exp = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
                 active = exp > now_utc()
             except Exception:
                 active = True
@@ -149,21 +145,21 @@ def upsert_pending_subscription(wa_phone: str, plan: str) -> None:
     }, on_conflict="wa_phone").execute()
 
 # ------------------------------------------------------------
-# QA Cache (matches your actual table schema)
-# Columns:
-# id uuid, normalized_question text, answer text, tags array,
-# use_count integer, last_used_at timestamptz, created_at timestamptz
+# QA Cache (UPDATED to match your Supabase columns)
+# Table columns you showed:
+# id uuid, normalized_question text, answer text, tags array, use_count int,
+# last_used_at timestamptz, created_at timestamptz
 # ------------------------------------------------------------
 def cache_get(question: str) -> Optional[str]:
     nq = normalize_question(question)
     if not nq:
         return None
-
     try:
         res = (
             supabase.table("qa_cache")
             .select("id,answer,use_count")
             .eq("normalized_question", nq)
+            .order("last_used_at", desc=True)
             .limit(1)
             .execute()
         )
@@ -172,19 +168,20 @@ def cache_get(question: str) -> Optional[str]:
             return None
 
         row = rows[0]
-        ans = row.get("answer") or ""
-
-        # update usage stats (best effort)
+        ans = row.get("answer")
+        # increment use_count + update last_used_at (best effort)
         try:
+            cid = row.get("id")
             use_count = int(row.get("use_count") or 0) + 1
-            supabase.table("qa_cache").update({
-                "use_count": use_count,
-                "last_used_at": iso(now_utc()),
-            }).eq("id", row["id"]).execute()
+            if cid:
+                supabase.table("qa_cache").update({
+                    "use_count": use_count,
+                    "last_used_at": now_utc().isoformat()
+                }).eq("id", cid).execute()
         except Exception:
             pass
 
-        return ans.strip() if ans else None
+        return ans
     except Exception:
         logging.exception("cache_get failed")
         return None
@@ -193,47 +190,27 @@ def cache_set(question: str, answer: str) -> None:
     nq = normalize_question(question)
     if not nq or not (answer or "").strip():
         return
-
-    # We do insert-or-update without relying on ON CONFLICT,
-    # because you may not have a unique constraint on normalized_question.
     try:
-        existing = (
-            supabase.table("qa_cache")
-            .select("id,use_count")
-            .eq("normalized_question", nq)
-            .limit(1)
-            .execute()
-        )
-        rows = existing.data or []
-        if rows:
-            row = rows[0]
-            use_count = int(row.get("use_count") or 0)
-            supabase.table("qa_cache").update({
-                "answer": answer.strip(),
-                "use_count": use_count,
-                "last_used_at": iso(now_utc()),
-            }).eq("id", row["id"]).execute()
-            return
-
         supabase.table("qa_cache").insert({
             "normalized_question": nq,
-            "answer": answer.strip(),
+            "answer": (answer or "").strip(),
             "tags": [],
             "use_count": 0,
-            "last_used_at": None,
-            "created_at": iso(now_utc()),
+            "last_used_at": now_utc().isoformat(),
+            "created_at": now_utc().isoformat(),
         }).execute()
     except Exception:
-        logging.exception("cache_set failed")
+        # If you later add a UNIQUE constraint on normalized_question, switch this to upsert.
         return
 
-# ------------------------------------------------------------
+# -----------------------------
 # AI stub (replace later)
-# ------------------------------------------------------------
+# -----------------------------
 def ai_answer(question: str) -> str:
     return (
-        "AI replies are enabled, but OpenAI is not connected yet.\n\n"
-        f"Your question was:\n{question}"
+        "I received your question.\n\n"
+        f"Question: {question}\n\n"
+        "AI replies will be enabled next (OpenAI connection)."
     )
 
 # ------------------------------------------------------------
@@ -241,7 +218,11 @@ def ai_answer(question: str) -> str:
 # ------------------------------------------------------------
 @app.get("/health")
 def health():
-    return jsonify({"ok": True})
+    return jsonify({
+        "ok": True,
+        "service": "naija-tax-guide",
+        "time_utc": now_utc().isoformat(),
+    })
 
 @app.get("/routes")
 def routes():
@@ -268,12 +249,9 @@ def ask():
     if not question:
         return jsonify({"ok": False, "error": "question is required"}), 400
 
-    cached = cache_get(question)
-    if cached:
-        return jsonify({"ok": True, "cached": True, "answer": cached, "meta": {"source": "cache"}})
-
-    if not ENABLE_AI_REPLIES:
-        return jsonify({"ok": True, "cached": False, "answer": "AI replies are currently disabled.", "meta": {"source": "disabled"}})
+    cached_answer = cache_get(question)
+    if cached_answer:
+        return jsonify({"ok": True, "cached": True, "answer": cached_answer, "meta": {"source": "cache"}})
 
     answer = ai_answer(question)
     cache_set(question, answer)
@@ -305,6 +283,7 @@ def paystack_initialize():
     amount_kobo = int(rule["amount_kobo"])
     amount = amount_kobo / 100.0
 
+    # 1) Payment row
     try:
         supabase.table("payments").insert({
             "reference": reference,
@@ -323,11 +302,13 @@ def paystack_initialize():
         logging.exception("Failed inserting payment row")
         return jsonify({"ok": False, "error": f"db_insert_failed: {str(e)[:300]}"}), 500
 
+    # 2) Subscription pending
     try:
         upsert_pending_subscription(wa_phone, plan)
     except Exception:
         pass
 
+    # 3) Paystack init
     headers = {"Authorization": f"Bearer {PAYSTACK_SECRET_KEY}", "Content-Type": "application/json"}
     payload = {
         "email": email,
@@ -429,6 +410,7 @@ def send_whatsapp_text(to_wa_phone: str, text: str) -> Tuple[bool, str]:
     to_wa_phone = normalize_phone(to_wa_phone)
     url = wa_api_url(f"/{WHATSAPP_PHONE_NUMBER_ID}/messages")
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
+
     payload = {
         "messaging_product": "whatsapp",
         "to": to_wa_phone,
@@ -522,70 +504,75 @@ def whatsapp_webhook_verify():
     token = request.args.get("hub.verify_token", "")
     challenge = request.args.get("hub.challenge", "")
 
+    logging.info(f"WA_VERIFY_HIT mode={mode} token_len={len(token)} has_challenge={bool(challenge)}")
+
     if mode == "subscribe" and token and WHATSAPP_VERIFY_TOKEN and token == WHATSAPP_VERIFY_TOKEN:
-        logging.info("WH_VERIFY: success")
         return challenge, 200
 
-    logging.warning(f"WH_VERIFY: forbidden mode={mode} token_match={token == WHATSAPP_VERIFY_TOKEN}")
     return "forbidden", 403
 
 @app.post("/whatsapp/webhook")
 def whatsapp_webhook_inbound():
-    # This log line is the key: if Meta hits you, you WILL see it in Koyeb logs.
-    logging.info("WH_INBOUND: received POST /whatsapp/webhook")
-
     payload = request.get_json(silent=True) or {}
+
+    # IMPORTANT: log every inbound webhook hit (so you SEE it in Koyeb logs)
+    try:
+        field = (((payload.get("entry") or [])[0].get("changes") or [])[0]).get("field")
+    except Exception:
+        field = None
+    logging.info(f"WA_WEBHOOK_HIT field={field} keys={list(payload.keys())}")
+
     try:
         entry = (payload.get("entry") or [])[0]
         change = (entry.get("changes") or [])[0]
         value = change.get("value") or {}
     except Exception:
-        logging.warning("WH_INBOUND: payload shape unexpected (no entry/changes/value)")
         return "ok", 200
 
+    # Inbound messages
     messages = value.get("messages") or []
-    if not messages:
-        # statuses, etc.
-        logging.info("WH_INBOUND: no messages in payload (likely status event)")
-        return "ok", 200
-
-    # process ALL messages
-    for msg in messages:
+    if messages:
+        msg = messages[0]
         from_phone = normalize_phone(msg.get("from") or "")
         msg_type = msg.get("type") or ""
-        text_body = ""
 
+        text_body = ""
         if msg_type == "text":
             text_body = ((msg.get("text") or {}).get("body") or "").strip()
 
-        logging.info(f"WH_INBOUND: from={from_phone} type={msg_type} text_len={len(text_body)}")
+        logging.info(f"WA_MESSAGE from={from_phone} type={msg_type} body={text_body[:120]}")
 
-        if not from_phone or not text_body:
-            continue
+        if from_phone and text_body:
+            # 1) Commands
+            cmd_response = handle_inbound_command(from_phone, text_body)
+            if cmd_response:
+                ok, info = send_whatsapp_text(from_phone, cmd_response)
+                logging.info(f"WA_REPLY_CMD ok={ok} info={info}")
+                return "ok", 200
 
-        # 1) Commands
-        cmd = handle_inbound_command(from_phone, text_body)
-        if cmd:
-            ok, detail = send_whatsapp_text(from_phone, cmd)
-            logging.info(f"WH_REPLY: command ok={ok} detail={detail}")
-            continue
+            # 2) Normal question
+            try:
+                cached = cache_get(text_body)
+                if cached:
+                    ok, info = send_whatsapp_text(from_phone, cached)
+                    logging.info(f"WA_REPLY_CACHE ok={ok} info={info}")
+                    return "ok", 200
 
-        # 2) Normal question
-        cached = cache_get(text_body)
-        if cached:
-            ok, detail = send_whatsapp_text(from_phone, cached)
-            logging.info(f"WH_REPLY: cache ok={ok} detail={detail}")
-            continue
+                answer = ai_answer(text_body)
+                cache_set(text_body, answer)
+                ok, info = send_whatsapp_text(from_phone, answer)
+                logging.info(f"WA_REPLY_AI_STUB ok={ok} info={info}")
+            except Exception:
+                logging.exception("Inbound message handling failed")
+                send_whatsapp_text(from_phone, "Sorry — system error. Please try again.")
 
-        if not ENABLE_AI_REPLIES:
-            ok, detail = send_whatsapp_text(from_phone, "AI replies are currently disabled.")
-            logging.info(f"WH_REPLY: disabled ok={ok} detail={detail}")
-            continue
+            return "ok", 200
 
-        answer = ai_answer(text_body)
-        cache_set(text_body, answer)
-        ok, detail = send_whatsapp_text(from_phone, answer)
-        logging.info(f"WH_REPLY: ai_stub ok={ok} detail={detail}")
+    # Status updates (delivered/read/etc.)
+    statuses = value.get("statuses") or []
+    if statuses:
+        st = statuses[0]
+        logging.info(f"WA_STATUS id={st.get('id')} status={st.get('status')} to={st.get('recipient_id')}")
 
     return "ok", 200
 
