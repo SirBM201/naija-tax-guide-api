@@ -38,15 +38,19 @@ WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "").strip()
 WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "").strip()
 WHATSAPP_BUSINESS_ACCOUNT_ID = os.getenv("WHATSAPP_BUSINESS_ACCOUNT_ID", "").strip()  # optional
 
-# AI / OpenAI
+# AI / OpenAI (real AI)
 AI_ENABLED = os.getenv("AI_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()  # safe default if you use OpenAI
-# If you want to allow AI replies even for non-subscribers (NOT recommended for cost):
-AI_ALLOW_FREE_USERS = os.getenv("AI_ALLOW_FREE_USERS", "false").strip().lower() in ("1", "true", "yes", "on")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 
-# Public site base URL (optional but recommended)
-APP_BASE_URL = os.getenv("APP_BASE_URL", "").strip()  # e.g. https://your-koyeb-service.koyeb.app
+# Marketing: allow 1 free AI answer/day for non-subscribers (default 1)
+FREE_AI_DAILY_QUOTA = int((os.getenv("FREE_AI_DAILY_QUOTA", "1").strip() or "1"))
+# If you ever want to completely disable free AI, set FREE_AI_DAILY_QUOTA=0
+# This flag is kept for clarity; quota controls are the real gate.
+AI_ALLOW_FREE_USERS = os.getenv("AI_ALLOW_FREE_USERS", "true").strip().lower() in ("1", "true", "yes", "on")
+
+# URLs (optional but recommended)
+APP_BASE_URL = os.getenv("APP_BASE_URL", "").strip()          # e.g. https://xxxxx.koyeb.app
 FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "").strip()  # e.g. https://thecre8hub.com
 
 # CORS
@@ -87,6 +91,13 @@ def now_utc() -> datetime:
 def iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat()
 
+def today_utc_date() -> str:
+    return now_utc().date().isoformat()
+
+def safe_trunc(s: str, n: int = 250) -> str:
+    s = (s or "")
+    return s[:n]
+
 def require_admin(req) -> Optional[Any]:
     key = req.headers.get("x-admin-key", "")
     if not ADMIN_API_KEY or key != ADMIN_API_KEY:
@@ -102,10 +113,6 @@ def normalize_question(q: str) -> str:
     s = (q or "").strip().lower()
     s = " ".join(s.split())
     return s
-
-def safe_trunc(s: str, n: int = 250) -> str:
-    s = (s or "")
-    return s[:n]
 
 # ------------------------------------------------------------
 # Subscription
@@ -135,49 +142,90 @@ def get_subscription_status(wa_phone: str) -> Dict[str, Any]:
                 exp = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
                 active = exp > now_utc()
             except Exception:
-                # If parsing fails, treat as active to avoid blocking paid users
                 active = True
 
         return {"exists": True, "active": active, "plan": plan, "status": status, "expires_at": expires_at}
     except Exception as e:
         logging.exception("get_subscription_status failed")
-        return {
-            "exists": False,
-            "active": False,
-            "plan": None,
-            "status": "error",
-            "expires_at": None,
-            "error": str(e)[:200],
-        }
+        return {"exists": False, "active": False, "plan": None, "status": "error", "expires_at": None, "error": str(e)[:200]}
 
 def activate_user_subscription(wa_phone: str, plan: str) -> None:
     days = PLAN_RULES.get(plan, {}).get("days", 30)
     expires_at = iso(now_utc() + timedelta(days=days))
-    supabase.table("user_subscriptions").upsert(
-        {
-            "wa_phone": normalize_phone(wa_phone),
-            "plan": plan,
-            "status": "active",
-            "expires_at": expires_at,
-            "updated_at": iso(now_utc()),
-        },
-        on_conflict="wa_phone",
-    ).execute()
+    supabase.table("user_subscriptions").upsert({
+        "wa_phone": normalize_phone(wa_phone),
+        "plan": plan,
+        "status": "active",
+        "expires_at": expires_at,
+        "updated_at": iso(now_utc())
+    }, on_conflict="wa_phone").execute()
 
 def upsert_pending_subscription(wa_phone: str, plan: str) -> None:
-    supabase.table("user_subscriptions").upsert(
-        {
-            "wa_phone": normalize_phone(wa_phone),
-            "plan": plan,
-            "status": "pending",
-            "expires_at": None,
-            "updated_at": iso(now_utc()),
-        },
-        on_conflict="wa_phone",
-    ).execute()
+    supabase.table("user_subscriptions").upsert({
+        "wa_phone": normalize_phone(wa_phone),
+        "plan": plan,
+        "status": "pending",
+        "expires_at": None,
+        "updated_at": iso(now_utc())
+    }, on_conflict="wa_phone").execute()
+
+# ------------------------------------------------------------
+# Daily AI quota for non-subscribers
+# Requires Supabase table:
+# public.ai_daily_usage(wa_phone text, day date, count int, last_used_at timestamptz, primary key (wa_phone, day))
+# ------------------------------------------------------------
+def get_daily_ai_count(wa_phone: str) -> int:
+    wa_phone = normalize_phone(wa_phone)
+    d = today_utc_date()
+    try:
+        res = (
+            supabase.table("ai_daily_usage")
+            .select("count")
+            .eq("wa_phone", wa_phone)
+            .eq("day", d)
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        return int((rows[0].get("count") if rows else 0) or 0)
+    except Exception:
+        logging.exception("get_daily_ai_count failed")
+        return 0
+
+def bump_daily_ai_count(wa_phone: str) -> None:
+    wa_phone = normalize_phone(wa_phone)
+    d = today_utc_date()
+    try:
+        supabase.table("ai_daily_usage").upsert({
+            "wa_phone": wa_phone,
+            "day": d,
+            "count": 0,
+            "last_used_at": now_utc().isoformat()
+        }, on_conflict="wa_phone,day").execute()
+
+        current = get_daily_ai_count(wa_phone)
+        supabase.table("ai_daily_usage").update({
+            "count": current + 1,
+            "last_used_at": now_utc().isoformat()
+        }).eq("wa_phone", wa_phone).eq("day", d).execute()
+    except Exception:
+        logging.exception("bump_daily_ai_count failed")
+        return
+
+def free_ai_allowed(wa_phone: str) -> bool:
+    if not AI_ALLOW_FREE_USERS:
+        return False
+    if FREE_AI_DAILY_QUOTA <= 0:
+        return False
+    used = get_daily_ai_count(wa_phone)
+    return used < FREE_AI_DAILY_QUOTA
 
 # ------------------------------------------------------------
 # QA Cache
+# Expected columns (recommended):
+# id uuid, normalized_question text UNIQUE, answer text, tags text[], use_count int,
+# last_used_at timestamptz, created_at timestamptz,
+# source text default 'ai', enabled boolean default true, priority int default 0
 # ------------------------------------------------------------
 def cache_get(question: str) -> Optional[str]:
     nq = normalize_question(question)
@@ -186,8 +234,10 @@ def cache_get(question: str) -> Optional[str]:
     try:
         res = (
             supabase.table("qa_cache")
-            .select("id,answer,use_count")
+            .select("id,answer,use_count,priority")
             .eq("normalized_question", nq)
+            .eq("enabled", True)
+            .order("priority", desc=True)        # seed Q&A priority beats AI
             .order("last_used_at", desc=True)
             .limit(1)
             .execute()
@@ -199,14 +249,14 @@ def cache_get(question: str) -> Optional[str]:
         row = rows[0]
         ans = row.get("answer")
 
-        # best-effort update
         try:
             cid = row.get("id")
             use_count = int(row.get("use_count") or 0) + 1
             if cid:
-                supabase.table("qa_cache").update(
-                    {"use_count": use_count, "last_used_at": now_utc().isoformat()}
-                ).eq("id", cid).execute()
+                supabase.table("qa_cache").update({
+                    "use_count": use_count,
+                    "last_used_at": now_utc().isoformat()
+                }).eq("id", cid).execute()
         except Exception:
             pass
 
@@ -215,36 +265,33 @@ def cache_get(question: str) -> Optional[str]:
         logging.exception("cache_get failed")
         return None
 
-def cache_set(question: str, answer: str) -> None:
+def cache_set(question: str, answer: str, source: str = "ai", priority: int = 10) -> None:
     nq = normalize_question(question)
     if not nq or not (answer or "").strip():
         return
     try:
-        supabase.table("qa_cache").insert(
-            {
-                "normalized_question": nq,
-                "answer": (answer or "").strip(),
-                "tags": [],
-                "use_count": 0,
-                "last_used_at": now_utc().isoformat(),
-                "created_at": now_utc().isoformat(),
-            }
-        ).execute()
+        supabase.table("qa_cache").upsert({
+            "normalized_question": nq,
+            "answer": (answer or "").strip(),
+            "tags": [],
+            "use_count": 0,
+            "last_used_at": now_utc().isoformat(),
+            "created_at": now_utc().isoformat(),
+            "source": source,
+            "enabled": True,
+            "priority": priority,
+        }, on_conflict="normalized_question").execute()
     except Exception:
-        # If you later enforce unique normalized_question, switch to upsert
+        logging.exception("cache_set failed")
         return
 
 # ------------------------------------------------------------
-# WhatsApp send (ROBUST)
+# WhatsApp send (robust, chunked, logs real errors)
 # ------------------------------------------------------------
 def wa_api_url(path: str) -> str:
-    # Keep version consistent with your current setup
     return f"https://graph.facebook.com/v24.0{path}"
 
 def chunk_text(text: str, max_len: int = 1400) -> List[str]:
-    """
-    WhatsApp rejects very long messages. We'll split into safe chunks.
-    """
     text = (text or "").strip()
     if not text:
         return [""]
@@ -284,8 +331,7 @@ def send_whatsapp_text_one(to_wa_phone: str, text: str) -> Tuple[bool, str]:
     try:
         r = requests.post(url, headers=headers, json=payload, timeout=25)
         if r.status_code >= 300:
-            # THIS is what you need to see when “no reply” happens
-            logging.error(f"WA_SEND_HTTP_ERROR status={r.status_code} body={safe_trunc(r.text, 800)}")
+            logging.error(f"WA_SEND_HTTP_ERROR status={r.status_code} body={safe_trunc(r.text, 1200)}")
             return False, f"WhatsApp send failed: {r.status_code} {safe_trunc(r.text, 250)}"
         return True, "ok"
     except Exception as e:
@@ -293,9 +339,6 @@ def send_whatsapp_text_one(to_wa_phone: str, text: str) -> Tuple[bool, str]:
         return False, f"WhatsApp send exception: {str(e)[:200]}"
 
 def wa_reply(to_wa_phone: str, text: str) -> Tuple[bool, str]:
-    """
-    Sends in chunks so long AI replies never fail silently.
-    """
     parts = chunk_text(text, max_len=1400)
     for idx, part in enumerate(parts):
         ok, info = send_whatsapp_text_one(to_wa_phone, part)
@@ -383,46 +426,31 @@ def handle_inbound_command(from_phone: str, text: str) -> Optional[str]:
     return None
 
 # ------------------------------------------------------------
-# AI (REAL) - Low cost / safe, with hard fallbacks
+# AI (REAL): OpenAI Responses API + fallback
 # ------------------------------------------------------------
 def ai_answer(question: str) -> str:
-    """
-    Uses OpenAI if enabled. If it fails, returns a helpful fallback text.
-    IMPORTANT: We keep the output concise to reduce WhatsApp length + cost.
-    """
     q = (question or "").strip()
     if not q:
         return "Please send your tax question in one sentence."
 
     if not AI_ENABLED:
-        return (
-            "AI is currently disabled.\n\n"
-            "Reply PLANS to subscribe, or ask again later."
-        )
+        return "AI is currently disabled. Reply PLANS to subscribe, or try again later."
 
     if not OPENAI_API_KEY:
         logging.error("AI_ENABLED is true but OPENAI_API_KEY is missing")
-        return (
-            "AI is enabled but not configured correctly (missing API key).\n"
-            "Please try again later."
-        )
+        return "AI is enabled but not configured correctly (missing API key). Please try again later."
 
-    # System prompt: short answers, practical, Nigeria context
     system = (
         "You are Naija Tax Guide. Answer Nigerian tax questions clearly and briefly. "
         "Use simple language, bullet points where helpful, and keep answers under ~1200 characters. "
         "If the question is unclear, ask 1 clarifying question."
     )
 
-    # Try Responses API first (newer), fall back to Chat Completions if needed
+    # Try Responses API
     try:
-        # 1) Responses API
         resp = requests.post(
             "https://api.openai.com/v1/responses",
-            headers={
-                "Authorization": f"Bearer {OPENAI_API_KEY}",
-                "Content-Type": "application/json",
-            },
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
             json={
                 "model": OPENAI_MODEL,
                 "input": [
@@ -436,46 +464,37 @@ def ai_answer(question: str) -> str:
 
         if resp.status_code < 300:
             data = resp.json()
-            # Most common extraction
-            text_out = ""
-            try:
-                # response.output_text exists in many responses
-                text_out = (data.get("output_text") or "").strip()
-            except Exception:
-                text_out = ""
-
-            if not text_out:
-                # fallback extraction
-                try:
-                    out = data.get("output") or []
-                    # Walk through possible content blocks
-                    for item in out:
-                        content = item.get("content") or []
-                        for block in content:
-                            if block.get("type") in ("output_text", "text"):
-                                text_out += (block.get("text") or "")
-                    text_out = (text_out or "").strip()
-                except Exception:
-                    text_out = ""
-
+            text_out = (data.get("output_text") or "").strip()
             if text_out:
                 return text_out
 
-            logging.error(f"OpenAI Responses API returned no text. body={safe_trunc(resp.text, 800)}")
+            # fallback extraction
+            try:
+                out = data.get("output") or []
+                buf = ""
+                for item in out:
+                    content = item.get("content") or []
+                    for block in content:
+                        if block.get("type") in ("output_text", "text"):
+                            buf += (block.get("text") or "")
+                buf = (buf or "").strip()
+                if buf:
+                    return buf
+            except Exception:
+                pass
+
+            logging.error(f"OpenAI Responses API returned no text. body={safe_trunc(resp.text, 1000)}")
         else:
-            logging.error(f"OpenAI Responses API error status={resp.status_code} body={safe_trunc(resp.text, 800)}")
+            logging.error(f"OpenAI Responses API error status={resp.status_code} body={safe_trunc(resp.text, 1000)}")
 
     except Exception:
         logging.exception("OpenAI Responses API exception")
 
-    # 2) Chat Completions fallback
+    # Chat Completions fallback
     try:
         resp = requests.post(
             "https://api.openai.com/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {OPENAI_API_KEY}",
-                "Content-Type": "application/json",
-            },
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
             json={
                 "model": OPENAI_MODEL,
                 "messages": [
@@ -487,24 +506,19 @@ def ai_answer(question: str) -> str:
             },
             timeout=35,
         )
-
         if resp.status_code < 300:
             data = resp.json()
             text_out = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
             if text_out:
                 return text_out
 
-            logging.error(f"Chat Completions returned no text. body={safe_trunc(resp.text, 800)}")
+            logging.error(f"Chat Completions returned no text. body={safe_trunc(resp.text, 1000)}")
         else:
-            logging.error(f"Chat Completions error status={resp.status_code} body={safe_trunc(resp.text, 800)}")
-
+            logging.error(f"Chat Completions error status={resp.status_code} body={safe_trunc(resp.text, 1000)}")
     except Exception:
         logging.exception("OpenAI Chat Completions exception")
 
-    return (
-        "Sorry — I couldn’t generate an answer right now.\n"
-        "Please try again in 1 minute, or reply PLANS / STATUS."
-    )
+    return "Sorry — I couldn’t generate an answer right now. Please try again in 1 minute."
 
 # ------------------------------------------------------------
 # Health / Debug
@@ -517,6 +531,8 @@ def health():
         "time_utc": now_utc().isoformat(),
         "ai_enabled": AI_ENABLED,
         "openai_model": OPENAI_MODEL,
+        "free_ai_daily_quota": FREE_AI_DAILY_QUOTA,
+        "ai_allow_free_users": AI_ALLOW_FREE_USERS,
     })
 
 @app.get("/routes")
@@ -531,7 +547,7 @@ def routes():
     return jsonify(sorted(out, key=lambda x: x["rule"]))
 
 # ------------------------------------------------------------
-# ASK (website + programmatic)
+# ASK (website AND WhatsApp inbound)
 # ------------------------------------------------------------
 @app.post("/ask")
 def ask():
@@ -548,14 +564,26 @@ def ask():
     if cached_answer:
         return jsonify({"ok": True, "cached": True, "answer": cached_answer, "meta": {"source": "cache"}})
 
-    # For /ask, we do not enforce subscription strictly (depends on your business rules).
-    # If you want strict gating, uncomment below:
-    # sub = get_subscription_status(wa_phone)
-    # if not sub.get("active"):
-    #     return jsonify({"ok": True, "cached": False, "answer": format_plans_text(), "meta": {"source": "subscribe_gate"}})
+    # Optional: enforce the same quota/subscription on /ask
+    sub = get_subscription_status(wa_phone)
+    is_active = bool(sub.get("active"))
+
+    if not is_active:
+        if not free_ai_allowed(wa_phone):
+            return jsonify({
+                "ok": True,
+                "cached": False,
+                "answer": "Daily free AI limit reached. Subscribe for unlimited. Reply PLANS in WhatsApp.",
+                "meta": {"source": "free_quota_block"}
+            })
 
     answer = ai_answer(question)
-    cache_set(question, answer)
+
+    # record free usage if non-subscriber and AI was used
+    if not is_active:
+        bump_daily_ai_count(wa_phone)
+
+    cache_set(question, answer, source="ai", priority=10)
     return jsonify({"ok": True, "cached": False, "answer": answer, "meta": {"source": "ai"}})
 
 # ------------------------------------------------------------
@@ -753,43 +781,41 @@ def whatsapp_webhook_inbound():
                 logging.info(f"WA_REPLY_CMD ok={ok} info={info}")
                 return "ok", 200
 
-            # 2) Always try cache first (free)
-            cached = None
-            try:
-                cached = cache_get(text_body)
-            except Exception:
-                cached = None
-
+            # 2) Prefer seed/cache first (free)
+            cached = cache_get(text_body)
             if cached:
                 ok, info = wa_reply(from_phone, cached)
                 logging.info(f"WA_REPLY_CACHE ok={ok} info={info}")
                 return "ok", 200
 
-            # 3) Enforce subscription for AI (cost control)
+            # 3) Subscription + daily free quota gating
             sub = get_subscription_status(from_phone)
             is_active = bool(sub.get("active"))
 
-            if not is_active and not AI_ALLOW_FREE_USERS:
-                msg_txt = (
-                    "You are not subscribed yet.\n\n"
-                    "Reply PLANS to see pricing and subscribe.\n"
-                    "After payment, reply STATUS.\n\n"
-                    "Tip: You can still use HELP / PLANS / STATUS anytime."
-                )
-                ok, info = wa_reply(from_phone, msg_txt)
-                logging.info(f"WA_REPLY_SUB_GATE ok={ok} info={info}")
-                return "ok", 200
+            if not is_active:
+                if not free_ai_allowed(from_phone):
+                    msg_txt = (
+                        "You have used your FREE AI answer for today.\n\n"
+                        "Reply PLANS to subscribe for unlimited access.\n"
+                        "Or try again tomorrow for another free answer."
+                    )
+                    ok, info = wa_reply(from_phone, msg_txt)
+                    logging.info(f"WA_REPLY_FREE_QUOTA_BLOCK ok={ok} info={info}")
+                    return "ok", 200
 
-            # 4) AI answer (paid users, or free allowed by env)
+            # 4) AI answer (paid users, or quota-allowed free users)
             try:
                 answer = ai_answer(text_body)
-                # cache it (even for paid users) to reduce future cost
-                cache_set(text_body, answer)
+
+                # record quota usage if non-subscriber and AI was used
+                if not is_active:
+                    bump_daily_ai_count(from_phone)
+
+                # cache it to reduce future cost
+                cache_set(text_body, answer, source="ai", priority=10)
 
                 ok, info = wa_reply(from_phone, answer)
                 logging.info(f"WA_REPLY_AI ok={ok} info={info}")
-
-                # If WhatsApp send fails, we still return 200 so Meta doesn't retry forever
                 return "ok", 200
 
             except Exception:
