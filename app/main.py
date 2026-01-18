@@ -1,13 +1,13 @@
 # app/main.py
 import os
+import re
 import json
 import hmac
 import hashlib
 import logging
 import uuid
-import random
-from datetime import datetime, timedelta, timezone
-from typing import Any, Optional, Dict, Tuple, List
+from datetime import datetime, timedelta, timezone, date
+from typing import Any, Optional, Dict, Tuple
 
 import requests
 from flask import Flask, request, jsonify
@@ -33,26 +33,34 @@ PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY", "").strip()
 PAYSTACK_WEBHOOK_SECRET = os.getenv("PAYSTACK_WEBHOOK_SECRET", PAYSTACK_SECRET_KEY).strip()
 PAYSTACK_CALLBACK_URL = os.getenv("PAYSTACK_CALLBACK_URL", "").strip()
 
-# WhatsApp Cloud API
+# WhatsApp Cloud API (kept, but you can ignore until you return to WA)
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "").strip()
 WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "").strip()
 WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "").strip()
-WHATSAPP_BUSINESS_ACCOUNT_ID = os.getenv("WHATSAPP_BUSINESS_ACCOUNT_ID", "").strip()  # optional
+WHATSAPP_BUSINESS_ACCOUNT_ID = os.getenv("WHATSAPP_BUSINESS_ACCOUNT_ID", "").strip()
 
-# AI (optional)
-AI_ENABLED = os.getenv("AI_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+# OpenAI (AI + TTS)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()  # example default
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+OPENAI_TTS_MODEL = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts").strip()  # if supported in your account
+OPENAI_TTS_VOICE = os.getenv("OPENAI_TTS_VOICE", "alloy").strip()
 
-# Usage control
-DAILY_TOTAL_LIMIT = int(os.getenv("DAILY_TOTAL_LIMIT", "100").strip())  # applies to ALL requests (cache/library/ai)
-FREE_AI_PER_DAY_NON_SUB = int(os.getenv("FREE_AI_PER_DAY_NON_SUB", "1").strip())  # marketing: 1 AI/day for non-subscribers
-AI_CREDITS_PER_MONTH = int(os.getenv("AI_CREDITS_PER_MONTH", "300").strip())
+# Storage (Supabase Storage)
+VOICE_BUCKET = os.getenv("VOICE_BUCKET", "voice-cache").strip()
+SUPABASE_STORAGE_URL = os.getenv("SUPABASE_STORAGE_URL", "").strip()  # optional; if blank we'll derive from SUPABASE_URL
+VOICE_PUBLIC_BASE = os.getenv("VOICE_PUBLIC_BASE", "").strip()
+# If VOICE_PUBLIC_BASE is blank, we will still store the object and return a best-effort public URL.
+# You can set it like: https://<project-ref>.supabase.co/storage/v1/object/public/voice-cache
 
-# OTP (optional enforcement)
-REQUIRE_OTP = os.getenv("REQUIRE_OTP", "false").strip().lower() in ("1", "true", "yes", "on")
-OTP_TTL_MINUTES = int(os.getenv("OTP_TTL_MINUTES", "10").strip())
-OTP_SENDER = os.getenv("OTP_SENDER", "whatsapp").strip().lower()  # whatsapp now, sms later
+# Usage limits
+FREE_DAILY_TOTAL_LIMIT = int(os.getenv("FREE_DAILY_TOTAL_LIMIT", "30").strip())       # free users total answers/day
+PAID_DAILY_TOTAL_LIMIT = int(os.getenv("PAID_DAILY_TOTAL_LIMIT", "2000").strip())     # paid users soft cap/day
+
+# Credits
+MONTHLY_AI_CREDITS = 300  # LOCKED by your decision
+VOICE_AI_COST = 3         # LOCKED
+TEXT_AI_COST = 1          # LOCKED
+VOICE_CACHED_FIRST_GEN_COST = 1  # LOCKED
 
 # CORS
 CORS_ALLOW_ORIGINS = os.getenv("CORS_ALLOW_ORIGINS", "http://localhost:3000").strip()
@@ -62,24 +70,25 @@ CORS(
     app,
     resources={r"/*": {"origins": allowed_origins}},
     supports_credentials=False,
-    allow_headers=["Content-Type", "x-admin-key", "x-session-token"],
+    allow_headers=["Content-Type", "x-admin-key"],
     methods=["GET", "POST", "OPTIONS"],
 )
 
 # ------------------------------------------------------------
-# Supabase
+# Supabase client
 # ------------------------------------------------------------
 if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
     logging.warning("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY missing. DB calls will fail.")
+
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 # ------------------------------------------------------------
-# Plans (time bound)
+# Plans (payments) - pricing rules
 # ------------------------------------------------------------
 PLAN_RULES = {
-    "monthly":   {"amount_kobo": 3000 * 100,  "days": 30,  "currency": "NGN", "ai_credits": AI_CREDITS_PER_MONTH},
-    "quarterly": {"amount_kobo": 8000 * 100,  "days": 90,  "currency": "NGN", "ai_credits": AI_CREDITS_PER_MONTH * 3},
-    "yearly":    {"amount_kobo": 30000 * 100, "days": 365, "currency": "NGN", "ai_credits": AI_CREDITS_PER_MONTH * 12},
+    "monthly":   {"amount_kobo": 3000 * 100,  "days": 30,  "currency": "NGN"},
+    "quarterly": {"amount_kobo": 8000 * 100,  "days": 90,  "currency": "NGN"},
+    "yearly":    {"amount_kobo": 30000 * 100, "days": 365, "currency": "NGN"},
 }
 
 # ------------------------------------------------------------
@@ -91,9 +100,8 @@ def now_utc() -> datetime:
 def iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat()
 
-def today_key_utc() -> str:
-    # YYYY-MM-DD
-    return now_utc().strftime("%Y-%m-%d")
+def today_utc() -> date:
+    return now_utc().date()
 
 def require_admin(req) -> Optional[Any]:
     key = req.headers.get("x-admin-key", "")
@@ -108,27 +116,19 @@ def normalize_phone(raw: str) -> str:
 
 def normalize_question(q: str) -> str:
     s = (q or "").strip().lower()
-    s = " ".join(s.split())
+    s = re.sub(r"\s+", " ", s)
     return s
 
-def safe_int(x, default=0) -> int:
+def safe_int(x: Any, default: int = 0) -> int:
     try:
         return int(x)
     except Exception:
         return default
 
-def parse_iso_dt(s: Optional[str]) -> Optional[datetime]:
-    if not s:
-        return None
-    try:
-        return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
-    except Exception:
-        return None
-
 # ------------------------------------------------------------
-# Subscriptions (table: user_subscriptions)
+# Subscription (authoritative: user_subscriptions)
 # ------------------------------------------------------------
-def get_subscription_status(wa_phone: str) -> Dict[str, Any]:
+def get_subscription_row(wa_phone: str) -> Optional[Dict[str, Any]]:
     wa_phone = normalize_phone(wa_phone)
     try:
         res = (
@@ -139,237 +139,117 @@ def get_subscription_status(wa_phone: str) -> Dict[str, Any]:
             .execute()
         )
         rows = res.data or []
-        if not rows:
-            return {"exists": False, "active": False, "plan": None, "status": "none", "expires_at": None}
-
-        row = rows[0]
-        expires_at = row.get("expires_at")
-        status = (row.get("status") or "none").lower()
-        plan = row.get("plan") or None
-
-        active = False
-        exp = parse_iso_dt(expires_at)
-        if status == "active" and exp:
-            active = exp > now_utc()
-        elif status == "active" and not exp:
-            active = True
-
-        return {"exists": True, "active": active, "plan": plan, "status": status, "expires_at": expires_at}
-    except Exception as e:
-        logging.exception("get_subscription_status failed")
-        return {"exists": False, "active": False, "plan": None, "status": "error", "expires_at": None, "error": str(e)[:200]}
-
-def activate_user_subscription(wa_phone: str, plan: str) -> None:
-    plan = (plan or "").strip().lower()
-    rule = PLAN_RULES.get(plan) or PLAN_RULES["monthly"]
-    days = int(rule["days"])
-    expires_at = iso(now_utc() + timedelta(days=days))
-
-    # update subscription
-    supabase.table("user_subscriptions").upsert({
-        "wa_phone": normalize_phone(wa_phone),
-        "plan": plan,
-        "status": "active",
-        "expires_at": expires_at,
-        "updated_at": iso(now_utc())
-    }, on_conflict="wa_phone").execute()
-
-    # allocate credits with rollover until plan expiry
-    allocate_subscription_credits(wa_phone, plan, expires_at)
-
-def upsert_pending_subscription(wa_phone: str, plan: str) -> None:
-    supabase.table("user_subscriptions").upsert({
-        "wa_phone": normalize_phone(wa_phone),
-        "plan": plan,
-        "status": "pending",
-        "expires_at": None,
-        "updated_at": iso(now_utc())
-    }, on_conflict="wa_phone").execute()
-
-# ------------------------------------------------------------
-# Credits (tables: ai_credits, ai_credit_topups)
-# ------------------------------------------------------------
-def get_credit_row(wa_phone: str) -> Dict[str, Any]:
-    wa_phone = normalize_phone(wa_phone)
-    try:
-        res = (
-            supabase.table("ai_credits")
-            .select("*")
-            .eq("wa_phone", wa_phone)
-            .limit(1)
-            .execute()
-        )
-        rows = res.data or []
-        return rows[0] if rows else {}
+        return rows[0] if rows else None
     except Exception:
-        logging.exception("get_credit_row failed")
-        return {}
+        logging.exception("get_subscription_row failed")
+        return None
 
-def allocate_subscription_credits(wa_phone: str, plan: str, expires_at_iso: str) -> None:
-    """
-    Add credits to ai_credits. Credits expire at subscription expiry.
-    """
-    wa_phone = normalize_phone(wa_phone)
-    plan = (plan or "").strip().lower()
-    rule = PLAN_RULES.get(plan) or PLAN_RULES["monthly"]
-    add = int(rule.get("ai_credits") or 0)
-
-    if add <= 0:
-        return
-
+def parse_iso_dt(s: Any) -> Optional[datetime]:
+    if not s:
+        return None
     try:
-        current = get_credit_row(wa_phone)
-        bal = safe_int(current.get("balance"), 0)
-        new_bal = bal + add
-
-        supabase.table("ai_credits").upsert({
-            "wa_phone": wa_phone,
-            "balance": new_bal,
-            "expires_at": expires_at_iso,
-            "updated_at": iso(now_utc()),
-        }, on_conflict="wa_phone").execute()
-
-        logging.info(f"CREDITS_ALLOC wa_phone={wa_phone} add={add} new_balance={new_bal} exp={expires_at_iso}")
+        return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
     except Exception:
-        logging.exception("allocate_subscription_credits failed")
+        return None
 
-def debit_ai_credit(wa_phone: str, n: int = 1) -> bool:
-    """
-    Decrement ai credits by n if available and not expired.
-    """
-    wa_phone = normalize_phone(wa_phone)
-    try:
-        row = get_credit_row(wa_phone)
-        bal = safe_int(row.get("balance"), 0)
-        exp = parse_iso_dt(row.get("expires_at"))
-        if exp and exp <= now_utc():
-            # expired => treat as 0
-            bal = 0
-
-        if bal < n:
-            return False
-
-        new_bal = bal - n
-        supabase.table("ai_credits").update({
-            "balance": new_bal,
-            "updated_at": iso(now_utc()),
-        }).eq("wa_phone", wa_phone).execute()
-
-        return True
-    except Exception:
-        logging.exception("debit_ai_credit failed")
+def is_subscription_active(sub: Optional[Dict[str, Any]]) -> bool:
+    if not sub:
         return False
+    status = (sub.get("status") or "").lower()
+    if status != "active":
+        return False
+    exp = parse_iso_dt(sub.get("expires_at"))
+    if not exp:
+        return False
+    return exp > now_utc()
 
-def add_topup_credits(wa_phone: str, credits: int, note: str = "manual") -> None:
-    """
-    Manual topup endpoint for now; later connect to Paystack.
-    """
-    wa_phone = normalize_phone(wa_phone)
-    credits = int(credits)
-    if credits <= 0:
-        return
+def plan_days(plan: str) -> int:
+    return safe_int(PLAN_RULES.get(plan, {}).get("days"), 30)
 
+def plan_total_credits(plan: str) -> int:
+    # LOCKED RULE: 300 AI credits per month across all plans.
+    # Total credits scale with plan duration; rollover only within duration.
+    days = plan_days(plan)
+    # Use integer month blocks: monthly=1, quarterly=3, yearly=12
+    if days >= 360:
+        months = 12
+    elif days >= 80:
+        months = 3
+    else:
+        months = 1
+    return MONTHLY_AI_CREDITS * months
+
+def plan_period_start(sub: Dict[str, Any]) -> Optional[datetime]:
+    # We derive start = expires_at - plan_days
+    exp = parse_iso_dt(sub.get("expires_at"))
+    if not exp:
+        return None
+    d = plan_days((sub.get("plan") or "monthly").lower())
+    return exp - timedelta(days=d)
+
+# ------------------------------------------------------------
+# Usage enforcement: daily total answers (cache + library + AI)
+# ------------------------------------------------------------
+def daily_total_usage_get(wa_phone: str) -> int:
     try:
-        # log topup
-        try:
-            supabase.table("ai_credit_topups").insert({
-                "wa_phone": wa_phone,
-                "credits": credits,
-                "note": note,
-                "created_at": iso(now_utc()),
-            }).execute()
-        except Exception:
-            # table may have different columns; ignore logging if insert fails
-            pass
+        res = (
+            supabase.table("daily_answer_usage")
+            .select("total_count")
+            .eq("wa_phone", normalize_phone(wa_phone))
+            .eq("day", str(today_utc()))
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        if not rows:
+            return 0
+        return safe_int(rows[0].get("total_count"), 0)
+    except Exception:
+        logging.exception("daily_total_usage_get failed")
+        return 0
 
-        # extend credits expiry:
-        # if user has active subscription, keep subscription expiry
-        sub = get_subscription_status(wa_phone)
-        exp_iso = sub.get("expires_at") if sub.get("active") else None
-
-        current = get_credit_row(wa_phone)
-        bal = safe_int(current.get("balance"), 0)
-        new_bal = bal + credits
-
-        payload = {
-            "wa_phone": wa_phone,
-            "balance": new_bal,
-            "updated_at": iso(now_utc()),
-        }
-        if exp_iso:
-            payload["expires_at"] = exp_iso
+def daily_total_usage_inc(wa_phone: str, inc: int = 1) -> None:
+    try:
+        wa_phone = normalize_phone(wa_phone)
+        d = str(today_utc())
+        # Upsert by PK (wa_phone, day)
+        # We cannot do atomic increment easily without RPC, so do read-update (best effort).
+        res = (
+            supabase.table("daily_answer_usage")
+            .select("total_count")
+            .eq("wa_phone", wa_phone)
+            .eq("day", d)
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        if rows:
+            new_val = safe_int(rows[0].get("total_count"), 0) + inc
+            supabase.table("daily_answer_usage").update({
+                "total_count": new_val,
+                "last_used_at": iso(now_utc()),
+            }).eq("wa_phone", wa_phone).eq("day", d).execute()
         else:
-            # non-subscriber: give a reasonable expiry window for topup credits
-            payload["expires_at"] = iso(now_utc() + timedelta(days=90))
-
-        supabase.table("ai_credits").upsert(payload, on_conflict="wa_phone").execute()
-        logging.info(f"CREDITS_TOPUP wa_phone={wa_phone} add={credits} new_balance={new_bal}")
+            supabase.table("daily_answer_usage").insert({
+                "wa_phone": wa_phone,
+                "day": d,
+                "total_count": inc,
+                "last_used_at": iso(now_utc()),
+            }).execute()
     except Exception:
-        logging.exception("add_topup_credits failed")
+        logging.exception("daily_total_usage_inc failed")
 
 # ------------------------------------------------------------
-# Daily usage limiting (tables: ai_daily_usage, ai_daily_quota)
+# AI daily usage (ai_daily_usage): count (all) and ai_count (AI-only)
 # ------------------------------------------------------------
-def get_daily_total_usage(wa_phone: str) -> int:
-    wa_phone = normalize_phone(wa_phone)
-    d = today_key_utc()
+def ai_daily_usage_inc(wa_phone: str, total_inc: int = 1, ai_inc: int = 0) -> None:
+    """
+    ai_daily_usage schema:
+      wa_phone (text), day (date), count (int4), ai_count (int4), last_used_at (timestamptz)
+    """
     try:
-        res = (
-            supabase.table("ai_daily_usage")
-            .select("count")
-            .eq("wa_phone", wa_phone)
-            .eq("day", d)
-            .limit(1)
-            .execute()
-        )
-        rows = res.data or []
-        if not rows:
-            return 0
-        return safe_int(rows[0].get("count"), 0)
-    except Exception:
-        # If schema differs, fail open but log
-        logging.exception("get_daily_total_usage failed")
-        return 0
-
-def inc_daily_total_usage(wa_phone: str, inc: int = 1) -> None:
-    wa_phone = normalize_phone(wa_phone)
-    d = today_key_utc()
-    try:
-        current = get_daily_total_usage(wa_phone)
-        new_val = current + inc
-        supabase.table("ai_daily_usage").upsert({
-            "wa_phone": wa_phone,
-            "day": d,
-            "count": new_val,
-            "updated_at": iso(now_utc()),
-        }, on_conflict="wa_phone,day").execute()
-    except Exception:
-        logging.exception("inc_daily_total_usage failed")
-
-def get_daily_ai_usage(wa_phone: str) -> int:
-    wa_phone = normalize_phone(wa_phone)
-    d = today_key_utc()
-    try:
-        res = (
-            supabase.table("ai_daily_usage")
-            .select("ai_count")
-            .eq("wa_phone", wa_phone)
-            .eq("day", d)
-            .limit(1)
-            .execute()
-        )
-        rows = res.data or []
-        if not rows:
-            return 0
-        return safe_int(rows[0].get("ai_count"), 0)
-    except Exception:
-        return 0
-
-def inc_daily_ai_usage(wa_phone: str, inc: int = 1) -> None:
-    wa_phone = normalize_phone(wa_phone)
-    d = today_key_utc()
-    try:
-        # read current row (maybe exists)
+        wa_phone = normalize_phone(wa_phone)
+        d = str(today_utc())
         res = (
             supabase.table("ai_daily_usage")
             .select("count,ai_count")
@@ -380,36 +260,138 @@ def inc_daily_ai_usage(wa_phone: str, inc: int = 1) -> None:
         )
         rows = res.data or []
         if rows:
-            count = safe_int(rows[0].get("count"), 0)
-            ai_count = safe_int(rows[0].get("ai_count"), 0)
+            cur_count = safe_int(rows[0].get("count"), 0)
+            cur_ai = safe_int(rows[0].get("ai_count"), 0)
+            supabase.table("ai_daily_usage").update({
+                "count": cur_count + total_inc,
+                "ai_count": cur_ai + ai_inc,
+                "last_used_at": iso(now_utc()),
+            }).eq("wa_phone", wa_phone).eq("day", d).execute()
         else:
-            count = 0
-            ai_count = 0
-
-        supabase.table("ai_daily_usage").upsert({
-            "wa_phone": wa_phone,
-            "day": d,
-            "count": count,  # total count handled separately in inc_daily_total_usage
-            "ai_count": ai_count + inc,
-            "updated_at": iso(now_utc()),
-        }, on_conflict="wa_phone,day").execute()
+            supabase.table("ai_daily_usage").insert({
+                "wa_phone": wa_phone,
+                "day": d,
+                "count": total_inc,
+                "ai_count": ai_inc,
+                "last_used_at": iso(now_utc()),
+            }).execute()
     except Exception:
-        # table may not have ai_count; ignore
-        pass
+        logging.exception("ai_daily_usage_inc failed")
 
 # ------------------------------------------------------------
-# Q&A sources
-# 1) qa_library (curated 1500)
-# 2) qa_cache (learned cache)
+# Credit ledger accounting
 # ------------------------------------------------------------
-def qa_library_get(question: str) -> Optional[str]:
+def ledger_add(wa_phone: str, kind: str, credits_delta: int, meta: Optional[Dict[str, Any]] = None) -> None:
+    try:
+        supabase.table("ai_credit_ledger").insert({
+            "wa_phone": normalize_phone(wa_phone),
+            "event_at": iso(now_utc()),
+            "kind": kind,
+            "credits_delta": int(credits_delta),
+            "meta": meta or {},
+        }).execute()
+    except Exception:
+        logging.exception("ledger_add failed")
+
+def credits_used_in_period(wa_phone: str, start: datetime, end: datetime) -> int:
+    """
+    Return positive number of credits USED (sum of negative deltas abs) within [start, end]
+    """
+    try:
+        res = (
+            supabase.table("ai_credit_ledger")
+            .select("credits_delta,event_at")
+            .eq("wa_phone", normalize_phone(wa_phone))
+            .gte("event_at", iso(start))
+            .lte("event_at", iso(end))
+            .execute()
+        )
+        rows = res.data or []
+        used = 0
+        for r in rows:
+            delta = safe_int(r.get("credits_delta"), 0)
+            if delta < 0:
+                used += abs(delta)
+        return used
+    except Exception:
+        logging.exception("credits_used_in_period failed")
+        return 0
+
+def topups_in_period(wa_phone: str, start: datetime, end: datetime) -> int:
+    """
+    Credits ADDED from topups in ledger in period.
+    """
+    try:
+        res = (
+            supabase.table("ai_credit_ledger")
+            .select("credits_delta,event_at,kind")
+            .eq("wa_phone", normalize_phone(wa_phone))
+            .gte("event_at", iso(start))
+            .lte("event_at", iso(end))
+            .execute()
+        )
+        rows = res.data or []
+        added = 0
+        for r in rows:
+            delta = safe_int(r.get("credits_delta"), 0)
+            if delta > 0:
+                added += delta
+        return added
+    except Exception:
+        logging.exception("topups_in_period failed")
+        return 0
+
+def credit_balance_for_user(wa_phone: str) -> Dict[str, Any]:
+    """
+    Returns:
+      active(bool), plan, period_start, period_end, allowance, used, topups, remaining
+    For free users: allowance=0 and remaining=0 (AI not allowed unless you later decide to enable free 1/day)
+    """
+    sub = get_subscription_row(wa_phone)
+    active = is_subscription_active(sub)
+    if not active:
+        return {
+            "active": False,
+            "plan": None,
+            "period_start": None,
+            "period_end": None,
+            "allowance": 0,
+            "used": 0,
+            "topups": 0,
+            "remaining": 0,
+        }
+
+    plan = (sub.get("plan") or "monthly").lower()
+    period_end = parse_iso_dt(sub.get("expires_at")) or now_utc()
+    period_start = plan_period_start(sub) or (period_end - timedelta(days=plan_days(plan)))
+
+    allowance = plan_total_credits(plan)
+    used = credits_used_in_period(wa_phone, period_start, period_end)
+    added = topups_in_period(wa_phone, period_start, period_end)
+    remaining = max(0, allowance + added - used)
+
+    return {
+        "active": True,
+        "plan": plan,
+        "period_start": iso(period_start),
+        "period_end": iso(period_end),
+        "allowance": allowance,
+        "used": used,
+        "topups": added,
+        "remaining": remaining,
+    }
+
+# ------------------------------------------------------------
+# QA library + cache
+# ------------------------------------------------------------
+def library_get(question: str) -> Optional[str]:
     nq = normalize_question(question)
     if not nq:
         return None
     try:
         res = (
             supabase.table("qa_library")
-            .select("id,answer,priority")
+            .select("answer,enabled,priority")
             .eq("normalized_question", nq)
             .eq("enabled", True)
             .order("priority", desc=True)
@@ -421,7 +403,7 @@ def qa_library_get(question: str) -> Optional[str]:
             return None
         return rows[0].get("answer")
     except Exception:
-        logging.exception("qa_library_get failed")
+        logging.exception("library_get failed")
         return None
 
 def cache_get(question: str) -> Optional[str]:
@@ -433,28 +415,26 @@ def cache_get(question: str) -> Optional[str]:
             supabase.table("qa_cache")
             .select("id,answer,use_count")
             .eq("normalized_question", nq)
+            .order("last_used_at", desc=True)
             .limit(1)
             .execute()
         )
         rows = res.data or []
         if not rows:
             return None
-
         row = rows[0]
         ans = row.get("answer")
-
-        # best-effort increment
+        # best-effort usage update
         try:
             cid = row.get("id")
             use_count = safe_int(row.get("use_count"), 0) + 1
             if cid:
                 supabase.table("qa_cache").update({
                     "use_count": use_count,
-                    "last_used_at": iso(now_utc())
+                    "last_used_at": iso(now_utc()),
                 }).eq("id", cid).execute()
         except Exception:
             pass
-
         return ans
     except Exception:
         logging.exception("cache_get failed")
@@ -474,347 +454,398 @@ def cache_set(question: str, answer: str) -> None:
             "created_at": iso(now_utc()),
         }).execute()
     except Exception:
-        # ignore if insert fails (duplicate/unique or schema mismatch)
+        # If you later make qa_cache.normalized_question UNIQUE, switch to upsert.
         return
 
 # ------------------------------------------------------------
-# AI Answer (OpenAI optional)
+# OpenAI AI Answer (text)
 # ------------------------------------------------------------
-def ai_answer(question: str) -> str:
-    # If OpenAI not configured, fall back to safe stub
-    if not AI_ENABLED:
-        return "AI is currently disabled. Please try again later."
+def ai_answer_text(question: str) -> str:
     if not OPENAI_API_KEY:
+        # Safe fallback (should not be used in production)
         return (
-            "AI is enabled but OPENAI_API_KEY is not set on the server.\n"
-            "Please try again later."
+            "AI is currently unavailable.\n\n"
+            "Please try again later or ask another question."
         )
 
-    # Minimal OpenAI call via HTTPS (keeps dependencies low)
+    # Keep prompts concise to reduce cost and increase speed.
+    sys = (
+        "You are Naija Tax Guide. Provide clear, simple, Nigeria-focused tax guidance. "
+        "Avoid jargon unless necessary. Use short bullet points when helpful. "
+        "If unsure, say so and advise confirming with FIRS/State IRS or a professional."
+    )
     try:
+        # Use Chat Completions style request (widely supported)
         url = "https://api.openai.com/v1/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "Content-Type": "application/json",
-        }
+        headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
         payload = {
             "model": OPENAI_MODEL,
             "messages": [
-                {"role": "system", "content": "You are Naija Tax Guide, an assistant that explains Nigerian tax concepts clearly and simply. Keep answers short, practical, and accurate."},
-                {"role": "user", "content": question},
+                {"role": "system", "content": sys},
+                {"role": "user", "content": question.strip()[:2000]},
             ],
             "temperature": 0.2,
         }
-        r = requests.post(url, headers=headers, json=payload, timeout=25)
+        r = requests.post(url, headers=headers, json=payload, timeout=35)
         if r.status_code >= 300:
-            logging.warning(f"OPENAI_FAIL status={r.status_code} body={r.text[:200]}")
-            return "Sorry — AI service is temporarily unavailable. Please try again."
-
+            logging.warning(f"OpenAI error {r.status_code}: {r.text[:200]}")
+            return "Sorry — I couldn’t generate an AI answer right now. Please try again."
         data = r.json()
-        msg = (((data.get("choices") or [])[0]).get("message") or {}).get("content") or ""
-        msg = msg.strip()
-        return msg if msg else "Sorry — I could not generate a response. Please rephrase your question."
+        msg = (((data.get("choices") or [])[0].get("message") or {}).get("content") or "").strip()
+        return msg or "Sorry — I couldn’t generate an AI answer right now. Please try again."
     except Exception:
-        logging.exception("ai_answer failed")
-        return "Sorry — AI error. Please try again."
+        logging.exception("ai_answer_text failed")
+        return "Sorry — I couldn’t generate an AI answer right now. Please try again."
 
 # ------------------------------------------------------------
-# WhatsApp Cloud API helpers
+# Voice generation + Supabase Storage upload
 # ------------------------------------------------------------
-def wa_api_url(path: str) -> str:
-    return f"https://graph.facebook.com/v24.0{path}"
+def derive_storage_base() -> str:
+    # If user provided VOICE_PUBLIC_BASE use it.
+    if VOICE_PUBLIC_BASE:
+        return VOICE_PUBLIC_BASE.rstrip("/")
+    # Derive from SUPABASE_URL: https://<ref>.supabase.co
+    # Public object URL:
+    #   https://<ref>.supabase.co/storage/v1/object/public/<bucket>/<path>
+    base = SUPABASE_STORAGE_URL.strip() or SUPABASE_URL.strip()
+    return (base.rstrip("/") + "/storage/v1/object/public/" + VOICE_BUCKET).rstrip("/")
 
-def send_whatsapp_text(to_wa_phone: str, text: str) -> Tuple[bool, str]:
-    if not WHATSAPP_TOKEN or not WHATSAPP_PHONE_NUMBER_ID:
-        return False, "WHATSAPP_TOKEN or WHATSAPP_PHONE_NUMBER_ID missing"
-
-    to_wa_phone = normalize_phone(to_wa_phone)
-    url = wa_api_url(f"/{WHATSAPP_PHONE_NUMBER_ID}/messages")
-    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
-
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to_wa_phone,
-        "type": "text",
-        "text": {"body": (text or "")[:3800]},
-    }
-
+def supabase_storage_upload(path: str, content_bytes: bytes, content_type: str = "audio/mpeg") -> Optional[str]:
+    """
+    Uploads bytes to Supabase Storage using REST.
+    Requires bucket to exist and (ideally) be public for direct URL access.
+    """
     try:
-        r = requests.post(url, headers=headers, json=payload, timeout=25)
+        base = (SUPABASE_STORAGE_URL.strip() or SUPABASE_URL.strip()).rstrip("/")
+        if not base:
+            return None
+        url = f"{base}/storage/v1/object/{VOICE_BUCKET}/{path.lstrip('/')}"
+        headers = {
+            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+            "apikey": SUPABASE_SERVICE_ROLE_KEY,
+            "Content-Type": content_type,
+            "x-upsert": "true",
+        }
+        r = requests.post(url, headers=headers, data=content_bytes, timeout=45)
         if r.status_code >= 300:
-            return False, f"WhatsApp send failed: {r.status_code} {r.text[:250]}"
-        return True, "ok"
-    except Exception as e:
-        return False, f"WhatsApp send exception: {str(e)[:200]}"
-
-# ------------------------------------------------------------
-# OTP (optional) stored in flow_sessions (best-effort)
-# ------------------------------------------------------------
-def otp_hash(code: str) -> str:
-    return hashlib.sha256(code.encode("utf-8")).hexdigest()
-
-def otp_store(wa_phone: str, code: str) -> str:
-    """
-    Store OTP in flow_sessions. If schema differs, we still return a token for client,
-    but verification may not work; logs will show.
-    """
-    token = uuid.uuid4().hex
-    exp = iso(now_utc() + timedelta(minutes=OTP_TTL_MINUTES))
-    try:
-        supabase.table("flow_sessions").insert({
-            "session_id": token,
-            "wa_phone": normalize_phone(wa_phone),
-            "kind": "otp",
-            "code_hash": otp_hash(code),
-            "expires_at": exp,
-            "created_at": iso(now_utc()),
-        }).execute()
+            logging.warning(f"Storage upload failed {r.status_code}: {r.text[:200]}")
+            return None
+        public_url = f"{derive_storage_base()}/{path.lstrip('/')}"
+        return public_url
     except Exception:
-        logging.exception("otp_store failed (flow_sessions schema may differ)")
-    return token
+        logging.exception("supabase_storage_upload failed")
+        return None
 
-def otp_verify(wa_phone: str, token: str, code: str) -> bool:
+def openai_tts(text: str, voice_style: str = "default") -> Optional[bytes]:
+    """
+    Generate speech bytes from text.
+    Note: endpoint availability can vary by account; if it fails we fallback gracefully.
+    """
+    if not OPENAI_API_KEY:
+        return None
+    try:
+        url = "https://api.openai.com/v1/audio/speech"
+        headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+        payload = {
+            "model": OPENAI_TTS_MODEL,
+            "voice": OPENAI_TTS_VOICE,
+            "input": text[:2500],
+            "format": "mp3",
+        }
+        r = requests.post(url, headers=headers, json=payload, timeout=60)
+        if r.status_code >= 300:
+            logging.warning(f"OpenAI TTS error {r.status_code}: {r.text[:200]}")
+            return None
+        return r.content
+    except Exception:
+        logging.exception("openai_tts failed")
+        return None
+
+def voice_cache_get(nq: str, provider: str, style: str) -> Optional[str]:
     try:
         res = (
-            supabase.table("flow_sessions")
-            .select("*")
-            .eq("session_id", token)
-            .eq("wa_phone", normalize_phone(wa_phone))
+            supabase.table("voice_cache")
+            .select("id,audio_url,use_count")
+            .eq("normalized_question", nq)
+            .eq("voice_provider", provider)
+            .eq("voice_style", style)
             .limit(1)
             .execute()
         )
         rows = res.data or []
         if not rows:
-            return False
+            return None
         row = rows[0]
-        exp = parse_iso_dt(row.get("expires_at"))
-        if exp and exp <= now_utc():
-            return False
-        return (row.get("code_hash") or "") == otp_hash(code)
+        # best-effort update
+        try:
+            vid = row.get("id")
+            use_count = safe_int(row.get("use_count"), 0) + 1
+            if vid:
+                supabase.table("voice_cache").update({
+                    "use_count": use_count,
+                    "last_used_at": iso(now_utc()),
+                }).eq("id", vid).execute()
+        except Exception:
+            pass
+        return row.get("audio_url")
     except Exception:
-        logging.exception("otp_verify failed")
-        return False
+        logging.exception("voice_cache_get failed")
+        return None
+
+def voice_cache_set(nq: str, provider: str, style: str, audio_url: str) -> None:
+    try:
+        # upsert by unique key
+        supabase.table("voice_cache").upsert({
+            "normalized_question": nq,
+            "voice_provider": provider,
+            "voice_style": style,
+            "audio_url": audio_url,
+            "use_count": 0,
+            "created_at": iso(now_utc()),
+            "last_used_at": iso(now_utc()),
+        }, on_conflict="normalized_question,voice_provider,voice_style").execute()
+    except Exception:
+        logging.exception("voice_cache_set failed")
+
+def ensure_voice_for_text(nq: str, text: str, provider: str, style: str) -> Tuple[Optional[str], bool]:
+    """
+    Returns (audio_url, was_generated_now)
+    """
+    cached_url = voice_cache_get(nq, provider, style)
+    if cached_url:
+        return cached_url, False
+
+    # Generate new audio bytes
+    if provider == "openai":
+        audio_bytes = openai_tts(text, style)
+    else:
+        audio_bytes = None
+
+    if not audio_bytes:
+        return None, False
+
+    # Upload to storage
+    # Use stable path derived from hash to avoid exploding storage paths.
+    key = hashlib.sha256(f"{provider}:{style}:{nq}".encode("utf-8")).hexdigest()[:24]
+    obj_path = f"{provider}/{style}/{key}.mp3"
+    url = supabase_storage_upload(obj_path, audio_bytes, "audio/mpeg")
+    if not url:
+        return None, False
+
+    voice_cache_set(nq, provider, style, url)
+    return url, True
 
 # ------------------------------------------------------------
-# Usage gating
+# Enforcement decisions
 # ------------------------------------------------------------
-def check_daily_total_limit(wa_phone: str) -> Tuple[bool, str]:
-    used = get_daily_total_usage(wa_phone)
-    if used >= DAILY_TOTAL_LIMIT:
-        return False, f"Daily limit reached ({DAILY_TOTAL_LIMIT}/day). Please try tomorrow."
-    return True, "ok"
+def free_or_paid_daily_limit(wa_phone: str) -> Tuple[int, bool]:
+    sub = get_subscription_row(wa_phone)
+    active = is_subscription_active(sub)
+    return (PAID_DAILY_TOTAL_LIMIT, True) if active else (FREE_DAILY_TOTAL_LIMIT, False)
 
-def can_use_ai(wa_phone: str) -> Tuple[bool, str, Dict[str, Any]]:
+def enforce_daily_total_limit_or_message(wa_phone: str) -> Optional[str]:
+    limit, is_paid = free_or_paid_daily_limit(wa_phone)
+    used = daily_total_usage_get(wa_phone)
+    if used >= limit:
+        if is_paid:
+            return (
+                "You’ve reached today’s usage safety limit. "
+                "Please try again later today or tomorrow."
+            )
+        return (
+            "You’ve reached today’s free limit (30/day). "
+            "Please try again tomorrow or subscribe for higher access."
+        )
+    return None
+
+def can_use_ai(wa_phone: str, credits_needed: int) -> Tuple[bool, str, Dict[str, Any]]:
     """
-    AI permission:
-    - If subscribed and has credits (ai_credits.balance), allow.
-    - If not subscribed: allow if daily free AI quota not exceeded.
+    Returns (allowed, reason, balance_info)
+    reason is user-friendly.
     """
-    sub = get_subscription_status(wa_phone)
-    credit_row = get_credit_row(wa_phone)
+    bal = credit_balance_for_user(wa_phone)
+    if not bal.get("active"):
+        return False, "AI is available for subscribers. Please subscribe to unlock AI answers.", bal
+    if bal.get("remaining", 0) < credits_needed:
+        return False, "You’ve used up your AI credits for this period. You can top up or wait for renewal.", bal
+    return True, "ok", bal
 
-    # subscribers: require credits balance > 0 and not expired
-    if sub.get("active"):
-        bal = safe_int(credit_row.get("balance"), 0)
-        exp = parse_iso_dt(credit_row.get("expires_at") or sub.get("expires_at"))
-        if exp and exp <= now_utc():
-            bal = 0
-        if bal <= 0:
-            return False, "AI credits finished. Please top up credits to continue.", {"subscribed": True, "balance": bal}
-        return True, "ok", {"subscribed": True, "balance": bal}
+# ------------------------------------------------------------
+# Core resolver: library -> cache -> AI
+# ------------------------------------------------------------
+def resolve_answer(wa_phone: str, question: str, mode: str, voice_provider: str, voice_style: str) -> Dict[str, Any]:
+    """
+    mode: "text" | "voice"
+    Returns dict:
+      ok, answer_text, audio_url(optional), credits_used, meta(admin)
+    """
+    wa_phone = normalize_phone(wa_phone)
+    question = (question or "").strip()
+    nq = normalize_question(question)
 
-    # non-subscribers: free daily AI quota
-    used_ai = get_daily_ai_usage(wa_phone)
-    if used_ai >= FREE_AI_PER_DAY_NON_SUB:
-        return False, "Free daily AI quota finished. Please subscribe to continue.", {"subscribed": False, "free_ai_used": used_ai}
-    return True, "ok", {"subscribed": False, "free_ai_used": used_ai}
+    # Enforce daily total answers cap (free 30/day, paid 2000/day)
+    msg = enforce_daily_total_limit_or_message(wa_phone)
+    if msg:
+        return {"ok": True, "answer_text": msg, "audio_url": None, "credits_used": 0, "meta": {"source": "limit"}}
+
+    # 1) qa_library
+    lib_ans = library_get(question)
+    if lib_ans:
+        daily_total_usage_inc(wa_phone, 1)
+        ai_daily_usage_inc(wa_phone, total_inc=1, ai_inc=0)
+
+        if mode == "voice":
+            audio_url, generated_now = ensure_voice_for_text(nq, lib_ans, voice_provider, voice_style)
+            credits_used = 0
+            if generated_now:
+                # Charge 1 credit only when generating voice for the first time for that nq+provider+style
+                allowed, reason, bal = can_use_ai(wa_phone, VOICE_CACHED_FIRST_GEN_COST)
+                if not allowed:
+                    # If user cannot pay 1 credit, fall back to text only (still answer).
+                    return {
+                        "ok": True,
+                        "answer_text": lib_ans,
+                        "audio_url": None,
+                        "credits_used": 0,
+                        "meta": {"source": "library", "voice": "blocked_no_credits", "reason": reason, "balance": bal},
+                    }
+                credits_used = VOICE_CACHED_FIRST_GEN_COST
+                ledger_add(wa_phone, "tts_cached_gen", -credits_used, {"source": "library", "nq": nq})
+                ai_daily_usage_inc(wa_phone, total_inc=0, ai_inc=0)  # AI not used; ledger covers cost accounting
+            return {
+                "ok": True,
+                "answer_text": lib_ans,
+                "audio_url": audio_url,
+                "credits_used": credits_used,
+                "meta": {"source": "library", "voice_generated_now": bool(generated_now)},
+            }
+
+        return {"ok": True, "answer_text": lib_ans, "audio_url": None, "credits_used": 0, "meta": {"source": "library"}}
+
+    # 2) qa_cache
+    cached = cache_get(question)
+    if cached:
+        daily_total_usage_inc(wa_phone, 1)
+        ai_daily_usage_inc(wa_phone, total_inc=1, ai_inc=0)
+
+        if mode == "voice":
+            audio_url, generated_now = ensure_voice_for_text(nq, cached, voice_provider, voice_style)
+            credits_used = 0
+            if generated_now:
+                allowed, reason, bal = can_use_ai(wa_phone, VOICE_CACHED_FIRST_GEN_COST)
+                if not allowed:
+                    return {
+                        "ok": True,
+                        "answer_text": cached,
+                        "audio_url": None,
+                        "credits_used": 0,
+                        "meta": {"source": "cache", "voice": "blocked_no_credits", "reason": reason, "balance": bal},
+                    }
+                credits_used = VOICE_CACHED_FIRST_GEN_COST
+                ledger_add(wa_phone, "tts_cached_gen", -credits_used, {"source": "cache", "nq": nq})
+            return {
+                "ok": True,
+                "answer_text": cached,
+                "audio_url": audio_url,
+                "credits_used": credits_used,
+                "meta": {"source": "cache", "voice_generated_now": bool(generated_now)},
+            }
+
+        return {"ok": True, "answer_text": cached, "audio_url": None, "credits_used": 0, "meta": {"source": "cache"}}
+
+    # 3) AI
+    # Determine credits needed
+    credits_needed = VOICE_AI_COST if mode == "voice" else TEXT_AI_COST
+    allowed, reason, bal = can_use_ai(wa_phone, credits_needed)
+    if not allowed:
+        # AI blocked: provide helpful fallback (no mention of cache/AI)
+        daily_total_usage_inc(wa_phone, 1)
+        ai_daily_usage_inc(wa_phone, total_inc=1, ai_inc=0)
+        msg = (
+            f"{reason}\n\n"
+            "You can still ask standard questions covered by our library. "
+            "If you need a custom answer now, please top up your AI credits."
+        )
+        return {"ok": True, "answer_text": msg, "audio_url": None, "credits_used": 0, "meta": {"source": "ai_blocked", "balance": bal}}
+
+    # Generate AI text
+    ans = ai_answer_text(question)
+
+    # Save into cache (so next time is free)
+    cache_set(question, ans)
+
+    # Charge credits
+    ledger_kind = "ai_voice" if mode == "voice" else "ai_text"
+    ledger_add(wa_phone, ledger_kind, -credits_needed, {"source": "ai", "nq": nq, "model": OPENAI_MODEL})
+
+    # Update daily usage counters
+    daily_total_usage_inc(wa_phone, 1)
+    ai_daily_usage_inc(wa_phone, total_inc=1, ai_inc=1)
+
+    if mode == "voice":
+        audio_url, _generated_now = ensure_voice_for_text(nq, ans, voice_provider, voice_style)
+        return {
+            "ok": True,
+            "answer_text": ans,
+            "audio_url": audio_url,
+            "credits_used": credits_needed,
+            "meta": {"source": "ai", "mode": "voice"},
+        }
+
+    return {"ok": True, "answer_text": ans, "audio_url": None, "credits_used": credits_needed, "meta": {"source": "ai", "mode": "text"}}
 
 # ------------------------------------------------------------
 # Health / Debug
 # ------------------------------------------------------------
 @app.get("/health")
 def health():
-    return jsonify({
-        "ok": True,
-        "service": "naija-tax-guide",
-        "time_utc": iso(now_utc()),
-        "ai_enabled": AI_ENABLED,
-        "require_otp": REQUIRE_OTP,
-        "daily_total_limit": DAILY_TOTAL_LIMIT,
-        "ai_credits_per_month": AI_CREDITS_PER_MONTH,
-    })
+    return jsonify({"ok": True, "service": "naija-tax-guide", "time_utc": iso(now_utc())})
 
 @app.get("/routes")
 def routes():
     out = []
     for rule in app.url_map.iter_rules():
-        out.append({
-            "endpoint": rule.endpoint,
-            "methods": sorted([m for m in rule.methods if m in ("GET", "POST", "OPTIONS")]),
-            "rule": str(rule),
-        })
+        out.append({"endpoint": rule.endpoint, "methods": sorted([m for m in rule.methods if m in ("GET","POST","OPTIONS")]), "rule": str(rule)})
     return jsonify(sorted(out, key=lambda x: x["rule"]))
 
 # ------------------------------------------------------------
-# AUTH (Web OTP)
-# ------------------------------------------------------------
-@app.post("/auth/request_otp")
-def auth_request_otp():
-    body = request.get_json(silent=True) or {}
-    wa_phone = normalize_phone(body.get("wa_phone") or "")
-    if not wa_phone:
-        return jsonify({"ok": False, "error": "wa_phone is required"}), 400
-
-    # generate 6-digit
-    code = f"{random.randint(100000, 999999)}"
-    token = otp_store(wa_phone, code)
-
-    # send OTP via WhatsApp
-    msg = f"Naija Tax Guide login code: {code}\nExpires in {OTP_TTL_MINUTES} minutes."
-    ok, info = send_whatsapp_text(wa_phone, msg)
-
-    logging.info(f"OTP_SEND wa_phone={wa_phone} ok={ok} info={info}")
-    if not ok:
-        return jsonify({"ok": False, "error": info}), 502
-
-    return jsonify({"ok": True, "otp_token": token})
-
-@app.post("/auth/verify_otp")
-def auth_verify_otp():
-    body = request.get_json(silent=True) or {}
-    wa_phone = normalize_phone(body.get("wa_phone") or "")
-    otp_token = (body.get("otp_token") or "").strip()
-    code = (body.get("code") or "").strip()
-
-    if not wa_phone or not otp_token or not code:
-        return jsonify({"ok": False, "error": "wa_phone, otp_token, and code are required"}), 400
-
-    if not otp_verify(wa_phone, otp_token, code):
-        return jsonify({"ok": False, "error": "Invalid or expired OTP"}), 401
-
-    # session token (simple)
-    session_token = uuid.uuid4().hex
-    exp = iso(now_utc() + timedelta(days=7))
-
-    # store session (best-effort)
-    try:
-        supabase.table("flow_sessions").insert({
-            "session_id": session_token,
-            "wa_phone": wa_phone,
-            "kind": "web_session",
-            "expires_at": exp,
-            "created_at": iso(now_utc()),
-        }).execute()
-    except Exception:
-        logging.exception("store web_session failed (flow_sessions schema may differ)")
-
-    return jsonify({"ok": True, "session_token": session_token, "expires_at": exp})
-
-def is_session_valid(wa_phone: str, session_token: str) -> bool:
-    if not REQUIRE_OTP:
-        return True
-    if not wa_phone or not session_token:
-        return False
-    try:
-        res = (
-            supabase.table("flow_sessions")
-            .select("*")
-            .eq("session_id", session_token)
-            .eq("wa_phone", normalize_phone(wa_phone))
-            .eq("kind", "web_session")
-            .limit(1)
-            .execute()
-        )
-        rows = res.data or []
-        if not rows:
-            return False
-        exp = parse_iso_dt(rows[0].get("expires_at"))
-        return (not exp) or (exp > now_utc())
-    except Exception:
-        return False
-
-# ------------------------------------------------------------
-# ASK (Web chat + shared logic)
+# Public: ASK (web chat, telegram later, whatsapp later)
 # ------------------------------------------------------------
 @app.post("/ask")
 def ask():
     body = request.get_json(silent=True) or {}
     wa_phone = normalize_phone(body.get("wa_phone") or "")
     question = (body.get("question") or "").strip()
-    session_token = request.headers.get("x-session-token", "").strip() or (body.get("session_token") or "").strip()
+
+    # mode = "text" or "voice"
+    mode = (body.get("mode") or "text").strip().lower()
+    if mode not in ("text", "voice"):
+        mode = "text"
+
+    voice_provider = (body.get("voice_provider") or "openai").strip().lower()
+    voice_style = (body.get("voice_style") or "default").strip().lower()
 
     if not wa_phone:
         return jsonify({"ok": False, "error": "wa_phone is required"}), 400
     if not question:
         return jsonify({"ok": False, "error": "question is required"}), 400
 
-    if REQUIRE_OTP and not is_session_valid(wa_phone, session_token):
-        return jsonify({"ok": False, "error": "OTP required. Please login first."}), 401
+    result = resolve_answer(wa_phone, question, mode, voice_provider, voice_style)
 
-    # daily total cap (prevents abuse even for cache)
-    ok, msg = check_daily_total_limit(wa_phone)
-    if not ok:
-        return jsonify({"ok": False, "error": msg}), 429
-
-    # 1) qa_library
-    lib = qa_library_get(question)
-    if lib:
-        inc_daily_total_usage(wa_phone, 1)
-        return jsonify({"ok": True, "source": "qa_library", "answer": lib})
-
-    # 2) qa_cache
-    cached = cache_get(question)
-    if cached:
-        inc_daily_total_usage(wa_phone, 1)
-        return jsonify({"ok": True, "source": "qa_cache", "answer": cached})
-
-    # 3) AI (needs credits or free daily AI quota)
-    allowed, reason, meta = can_use_ai(wa_phone)
-    if not allowed:
-        inc_daily_total_usage(wa_phone, 1)
-        return jsonify({"ok": False, "error": reason, "meta": meta}), 402
-
-    # debit credit for subscribers OR consume free AI for non-subs
-    sub = get_subscription_status(wa_phone)
-    if sub.get("active"):
-        if not debit_ai_credit(wa_phone, 1):
-            inc_daily_total_usage(wa_phone, 1)
-            return jsonify({"ok": False, "error": "AI credits finished. Please top up credits to continue."}), 402
-    else:
-        inc_daily_ai_usage(wa_phone, 1)
-
-    answer = ai_answer(question)
-    cache_set(question, answer)
-
-    # increment total usage after work completes
-    inc_daily_total_usage(wa_phone, 1)
-
-    return jsonify({"ok": True, "source": "ai", "answer": answer})
+    # IMPORTANT: do not expose meta/source to normal users
+    resp = {
+        "ok": True,
+        "answer": result.get("answer_text"),
+        "audio_url": result.get("audio_url"),
+        "credits_used": result.get("credits_used", 0),
+        # optionally expose remaining credits (user-friendly)
+        "credits": credit_balance_for_user(wa_phone),
+    }
+    # Hide internal routing details (admin-only)
+    return jsonify(resp)
 
 # ------------------------------------------------------------
-# Manual topup endpoint (admin only for now)
-# Later connect to Paystack for public topups
-# ------------------------------------------------------------
-@app.post("/admin/credits/topup")
-def admin_credits_topup():
-    auth = require_admin(request)
-    if auth:
-        return auth
-
-    body = request.get_json(silent=True) or {}
-    wa_phone = normalize_phone(body.get("wa_phone") or "")
-    credits = safe_int(body.get("credits"), 0)
-    note = (body.get("note") or "manual").strip()
-
-    if not wa_phone or credits <= 0:
-        return jsonify({"ok": False, "error": "wa_phone and credits>0 required"}), 400
-
-    add_topup_credits(wa_phone, credits, note=note)
-    row = get_credit_row(wa_phone)
-    return jsonify({"ok": True, "wa_phone": wa_phone, "balance": safe_int(row.get("balance"), 0), "expires_at": row.get("expires_at")})
-
-# ------------------------------------------------------------
-# Paystack: Initialize (subscription purchase)
+# Paystack: Initialize
 # ------------------------------------------------------------
 @app.post("/paystack/initialize")
 def paystack_initialize():
@@ -835,11 +866,9 @@ def paystack_initialize():
 
     rule = PLAN_RULES[plan]
     reference = uuid.uuid4().hex[:12]
-
     amount_kobo = int(rule["amount_kobo"])
     amount = amount_kobo / 100.0
 
-    # 1) Payment row
     try:
         supabase.table("payments").insert({
             "reference": reference,
@@ -858,13 +887,18 @@ def paystack_initialize():
         logging.exception("Failed inserting payment row")
         return jsonify({"ok": False, "error": f"db_insert_failed: {str(e)[:300]}"}), 500
 
-    # 2) Subscription pending
+    # Mark subscription pending (so you can see intent)
     try:
-        upsert_pending_subscription(wa_phone, plan)
+        supabase.table("user_subscriptions").upsert({
+            "wa_phone": wa_phone,
+            "plan": plan,
+            "status": "pending",
+            "expires_at": None,
+            "updated_at": iso(now_utc()),
+        }, on_conflict="wa_phone").execute()
     except Exception:
         pass
 
-    # 3) Paystack init
     headers = {"Authorization": f"Bearer {PAYSTACK_SECRET_KEY}", "Content-Type": "application/json"}
     payload = {
         "email": email,
@@ -876,21 +910,14 @@ def paystack_initialize():
         payload["callback_url"] = PAYSTACK_CALLBACK_URL
 
     r = requests.post("https://api.paystack.co/transaction/initialize", headers=headers, json=payload, timeout=25)
-
     try:
         data = r.json()
     except Exception:
-        try:
-            supabase.table("payments").update({"status": "failed"}).eq("reference", reference).execute()
-        except Exception:
-            pass
+        supabase.table("payments").update({"status": "failed"}).eq("reference", reference).execute()
         return jsonify({"ok": False, "error": f"Paystack non-JSON response: {r.text[:200]}"}), 502
 
     if r.status_code >= 300 or not data.get("status"):
-        try:
-            supabase.table("payments").update({"status": "failed"}).eq("reference", reference).execute()
-        except Exception:
-            pass
+        supabase.table("payments").update({"status": "failed"}).eq("reference", reference).execute()
         msg = data.get("message") or f"HTTP {r.status_code}"
         return jsonify({"ok": False, "error": f"Paystack init failed: {msg}"}), 400
 
@@ -898,7 +925,7 @@ def paystack_initialize():
     return jsonify({"ok": True, "reference": reference, "authorization_url": auth_url})
 
 # ------------------------------------------------------------
-# Paystack: Webhook (activate subscription + allocate credits)
+# Paystack: Webhook
 # ------------------------------------------------------------
 @app.post("/paystack/webhook")
 def paystack_webhook():
@@ -925,12 +952,8 @@ def paystack_webhook():
     if not reference:
         return "ok", 200
 
-    try:
-        pay_row = supabase.table("payments").select("*").eq("reference", reference).limit(1).execute()
-        rows = pay_row.data or []
-    except Exception:
-        rows = []
-
+    pay_row = supabase.table("payments").select("*").eq("reference", reference).limit(1).execute()
+    rows = pay_row.data or []
     if not rows:
         logging.warning(f"Webhook reference not found in payments: {reference}")
         return "ok", 200
@@ -948,138 +971,90 @@ def paystack_webhook():
         return "ok", 200
 
     if is_success:
-        amount_kobo = safe_int(data.get("amount") or pay.get("amount_kobo") or 0)
+        amount_kobo = safe_int(data.get("amount"), safe_int(pay.get("amount_kobo"), 0))
         amount = amount_kobo / 100.0
 
-        try:
-            supabase.table("payments").update({
-                "status": "success",
-                "paid_at": iso(now_utc()),
-                "amount_kobo": amount_kobo,
-                "amount": amount,
-                "currency": data.get("currency") or pay.get("currency") or "NGN",
-            }).eq("reference", reference).execute()
-        except Exception:
-            pass
+        supabase.table("payments").update({
+            "status": "success",
+            "paid_at": iso(now_utc()),
+            "amount_kobo": amount_kobo,
+            "amount": amount,
+            "currency": data.get("currency") or pay.get("currency") or "NGN",
+        }).eq("reference", reference).execute()
 
-        # Activate + allocate credits
-        activate_user_subscription(wa_phone, plan)
-
-    return "ok", 200
-
-# ------------------------------------------------------------
-# WhatsApp Webhook (Meta verification + inbound messages)
-# ------------------------------------------------------------
-@app.get("/whatsapp/webhook")
-def whatsapp_webhook_verify():
-    mode = request.args.get("hub.mode", "")
-    token = request.args.get("hub.verify_token", "")
-    challenge = request.args.get("hub.challenge", "")
-
-    logging.info(f"WA_VERIFY_HIT mode={mode} token_len={len(token)} has_challenge={bool(challenge)}")
-
-    if mode == "subscribe" and token and WHATSAPP_VERIFY_TOKEN and token == WHATSAPP_VERIFY_TOKEN:
-        return challenge, 200
-
-    return "forbidden", 403
-
-@app.post("/whatsapp/webhook")
-def whatsapp_webhook_inbound():
-    payload = request.get_json(silent=True) or {}
-
-    # Log inbound webhook hit
-    try:
-        field = (((payload.get("entry") or [])[0].get("changes") or [])[0]).get("field")
-    except Exception:
-        field = None
-    logging.info(f"WA_WEBHOOK_HIT field={field} keys={list(payload.keys())}")
-
-    try:
-        entry = (payload.get("entry") or [])[0]
-        change = (entry.get("changes") or [])[0]
-        value = change.get("value") or {}
-    except Exception:
-        return "ok", 200
-
-    # Inbound messages
-    messages = value.get("messages") or []
-    if messages:
-        msg = messages[0]
-        from_phone = normalize_phone(msg.get("from") or "")
-        msg_type = msg.get("type") or ""
-
-        text_body = ""
-        if msg_type == "text":
-            text_body = ((msg.get("text") or {}).get("body") or "").strip()
-
-        logging.info(f"WA_MESSAGE from={from_phone} type={msg_type} body={text_body[:120]}")
-
-        if from_phone and text_body:
-            # daily total cap applies to WA also
-            ok, reason = check_daily_total_limit(from_phone)
-            if not ok:
-                send_whatsapp_text(from_phone, reason)
-                return "ok", 200
-
-            # 1) qa_library
-            lib = qa_library_get(text_body)
-            if lib:
-                inc_daily_total_usage(from_phone, 1)
-                ok2, info2 = send_whatsapp_text(from_phone, lib)
-                logging.info(f"WA_REPLY_LIBRARY ok={ok2} info={info2}")
-                return "ok", 200
-
-            # 2) qa_cache
-            cached = cache_get(text_body)
-            if cached:
-                inc_daily_total_usage(from_phone, 1)
-                ok2, info2 = send_whatsapp_text(from_phone, cached)
-                logging.info(f"WA_REPLY_CACHE ok={ok2} info={info2}")
-                return "ok", 200
-
-            # 3) AI
-            allowed, msg2, meta = can_use_ai(from_phone)
-            if not allowed:
-                inc_daily_total_usage(from_phone, 1)
-                send_whatsapp_text(from_phone, msg2)
-                logging.info(f"WA_REPLY_NOAI reason={msg2}")
-                return "ok", 200
-
-            sub = get_subscription_status(from_phone)
-            if sub.get("active"):
-                if not debit_ai_credit(from_phone, 1):
-                    inc_daily_total_usage(from_phone, 1)
-                    send_whatsapp_text(from_phone, "AI credits finished. Please top up credits to continue.")
-                    return "ok", 200
-            else:
-                inc_daily_ai_usage(from_phone, 1)
-
-            answer = ai_answer(text_body)
-            cache_set(text_body, answer)
-            inc_daily_total_usage(from_phone, 1)
-
-            ok2, info2 = send_whatsapp_text(from_phone, answer)
-            logging.info(f"WA_REPLY_AI ok={ok2} info={info2}")
-
-            return "ok", 200
-
-    # Status updates
-    statuses = value.get("statuses") or []
-    if statuses:
-        st = statuses[0]
-        logging.info(f"WA_STATUS id={st.get('id')} status={st.get('status')} to={st.get('recipient_id')}")
+        # Activate subscription: expires_at = now + plan_days
+        expires_at = iso(now_utc() + timedelta(days=plan_days(plan)))
+        supabase.table("user_subscriptions").upsert({
+            "wa_phone": normalize_phone(wa_phone),
+            "plan": plan,
+            "status": "active",
+            "expires_at": expires_at,
+            "updated_at": iso(now_utc()),
+        }, on_conflict="wa_phone").execute()
 
     return "ok", 200
 
 # ------------------------------------------------------------
 # Admin endpoints
 # ------------------------------------------------------------
+@app.get("/admin/metrics")
+def admin_metrics():
+    auth = require_admin(request)
+    if auth:
+        return auth
+
+    # High value metrics for admin: credits used today, top users, etc.
+    try:
+        d = str(today_utc())
+        usage = supabase.table("ai_daily_usage").select("wa_phone,count,ai_count").eq("day", d).execute().data or []
+        total_answers = sum(safe_int(u.get("count"), 0) for u in usage)
+        total_ai = sum(safe_int(u.get("ai_count"), 0) for u in usage)
+        top = sorted(usage, key=lambda x: safe_int(x.get("count"), 0), reverse=True)[:10]
+    except Exception:
+        total_answers, total_ai, top = 0, 0, []
+
+    return jsonify({
+        "ok": True,
+        "day": str(today_utc()),
+        "total_answers_today": total_answers,
+        "total_ai_calls_today": total_ai,
+        "top_users_today": top,
+    })
+
+@app.post("/admin/topup")
+def admin_topup():
+    auth = require_admin(request)
+    if auth:
+        return auth
+    body = request.get_json(silent=True) or {}
+    wa_phone = normalize_phone(body.get("wa_phone") or "")
+    credits = safe_int(body.get("credits"), 0)
+    if not wa_phone or credits <= 0:
+        return jsonify({"ok": False, "error": "wa_phone and positive credits required"}), 400
+
+    # Record topup in table and ledger
+    ref = uuid.uuid4().hex[:10]
+    try:
+        supabase.table("ai_credit_topups").insert({
+            "wa_phone": wa_phone,
+            "credits": credits,
+            "status": "success",
+            "provider": "manual",
+            "reference": ref,
+            "created_at": iso(now_utc()),
+            "paid_at": iso(now_utc()),
+        }).execute()
+    except Exception:
+        pass
+
+    ledger_add(wa_phone, "topup", +credits, {"provider": "manual", "reference": ref})
+    return jsonify({"ok": True, "wa_phone": wa_phone, "credits_added": credits, "reference": ref})
+
 @app.get("/admin/subscriptions")
 def admin_subscriptions():
     auth = require_admin(request)
     if auth:
         return auth
-
     res = (
         supabase.table("user_subscriptions")
         .select("wa_phone,plan,status,expires_at,updated_at")
@@ -1093,7 +1068,6 @@ def admin_payments():
     auth = require_admin(request)
     if auth:
         return auth
-
     res = (
         supabase.table("payments")
         .select("reference,wa_phone,provider,plan,amount,amount_kobo,currency,status,created_at,paid_at")
@@ -1102,15 +1076,63 @@ def admin_payments():
     )
     return jsonify(res.data or [])
 
-@app.get("/admin/credits")
-def admin_credits():
-    auth = require_admin(request)
-    if auth:
-        return auth
+# ------------------------------------------------------------
+# WhatsApp webhook endpoints (kept; you can ignore until you return to WA)
+# ------------------------------------------------------------
+def wa_api_url(path: str) -> str:
+    return f"https://graph.facebook.com/v24.0{path}"
 
-    wa_phone = normalize_phone(request.args.get("wa_phone") or "")
-    q = supabase.table("ai_credits").select("*")
-    if wa_phone:
-        q = q.eq("wa_phone", wa_phone)
-    res = q.execute()
-    return jsonify(res.data or [])
+def send_whatsapp_text(to_wa_phone: str, text: str) -> Tuple[bool, str]:
+    if not WHATSAPP_TOKEN or not WHATSAPP_PHONE_NUMBER_ID:
+        return False, "WHATSAPP_TOKEN or WHATSAPP_PHONE_NUMBER_ID missing"
+    to_wa_phone = normalize_phone(to_wa_phone)
+    url = wa_api_url(f"/{WHATSAPP_PHONE_NUMBER_ID}/messages")
+    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
+    payload = {"messaging_product": "whatsapp", "to": to_wa_phone, "type": "text", "text": {"body": (text or "")[:3800]}}
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=25)
+        if r.status_code >= 300:
+            return False, f"WhatsApp send failed: {r.status_code} {r.text[:250]}"
+        return True, "ok"
+    except Exception as e:
+        return False, f"WhatsApp send exception: {str(e)[:200]}"
+
+@app.get("/whatsapp/webhook")
+def whatsapp_webhook_verify():
+    mode = request.args.get("hub.mode", "")
+    token = request.args.get("hub.verify_token", "")
+    challenge = request.args.get("hub.challenge", "")
+    logging.info(f"WA_VERIFY_HIT mode={mode} token_len={len(token)} has_challenge={bool(challenge)}")
+    if mode == "subscribe" and token and WHATSAPP_VERIFY_TOKEN and token == WHATSAPP_VERIFY_TOKEN:
+        return challenge, 200
+    return "forbidden", 403
+
+@app.post("/whatsapp/webhook")
+def whatsapp_webhook_inbound():
+    payload = request.get_json(silent=True) or {}
+    logging.info(f"WA_WEBHOOK_HIT keys={list(payload.keys())}")
+
+    try:
+        entry = (payload.get("entry") or [])[0]
+        change = (entry.get("changes") or [])[0]
+        value = change.get("value") or {}
+    except Exception:
+        return "ok", 200
+
+    messages = value.get("messages") or []
+    if messages:
+        msg = messages[0]
+        from_phone = normalize_phone(msg.get("from") or "")
+        msg_type = msg.get("type") or ""
+
+        text_body = ""
+        if msg_type == "text":
+            text_body = ((msg.get("text") or {}).get("body") or "").strip()
+
+        if from_phone and text_body:
+            # Respond via the same resolver (text mode)
+            result = resolve_answer(from_phone, text_body, "text", "openai", "default")
+            ok, info = send_whatsapp_text(from_phone, result.get("answer_text") or "OK")
+            logging.info(f"WA_REPLY ok={ok} info={info}")
+
+    return "ok", 200
