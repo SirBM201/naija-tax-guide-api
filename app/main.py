@@ -1,4 +1,3 @@
-# app/main.py
 import os
 import re
 import json
@@ -33,7 +32,7 @@ PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY", "").strip()
 PAYSTACK_WEBHOOK_SECRET = os.getenv("PAYSTACK_WEBHOOK_SECRET", PAYSTACK_SECRET_KEY).strip()
 PAYSTACK_CALLBACK_URL = os.getenv("PAYSTACK_CALLBACK_URL", "").strip()
 
-# WhatsApp Cloud API (kept, but you can ignore until you return to WA)
+# WhatsApp Cloud API (kept, but can be ignored until WA is resumed)
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "").strip()
 WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "").strip()
 WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "").strip()
@@ -42,25 +41,25 @@ WHATSAPP_BUSINESS_ACCOUNT_ID = os.getenv("WHATSAPP_BUSINESS_ACCOUNT_ID", "").str
 # OpenAI (AI + TTS)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
-OPENAI_TTS_MODEL = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts").strip()  # if supported in your account
+OPENAI_TTS_MODEL = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts").strip()  # if supported
 OPENAI_TTS_VOICE = os.getenv("OPENAI_TTS_VOICE", "alloy").strip()
 
 # Storage (Supabase Storage)
 VOICE_BUCKET = os.getenv("VOICE_BUCKET", "voice-cache").strip()
 SUPABASE_STORAGE_URL = os.getenv("SUPABASE_STORAGE_URL", "").strip()  # optional; if blank we'll derive from SUPABASE_URL
 VOICE_PUBLIC_BASE = os.getenv("VOICE_PUBLIC_BASE", "").strip()
-# If VOICE_PUBLIC_BASE is blank, we will still store the object and return a best-effort public URL.
-# You can set it like: https://<project-ref>.supabase.co/storage/v1/object/public/voice-cache
+# VOICE_PUBLIC_BASE example:
+#   https://<project-ref>.supabase.co/storage/v1/object/public/voice-cache
 
 # Usage limits
-FREE_DAILY_TOTAL_LIMIT = int(os.getenv("FREE_DAILY_TOTAL_LIMIT", "30").strip())       # free users total answers/day
-PAID_DAILY_TOTAL_LIMIT = int(os.getenv("PAID_DAILY_TOTAL_LIMIT", "2000").strip())     # paid users soft cap/day
+FREE_DAILY_TOTAL_LIMIT = int(os.getenv("FREE_DAILY_TOTAL_LIMIT", "30").strip())
+PAID_DAILY_TOTAL_LIMIT = int(os.getenv("PAID_DAILY_TOTAL_LIMIT", "2000").strip())
 
-# Credits
-MONTHLY_AI_CREDITS = 300  # LOCKED by your decision
-VOICE_AI_COST = 3         # LOCKED
-TEXT_AI_COST = 1          # LOCKED
-VOICE_CACHED_FIRST_GEN_COST = 1  # LOCKED
+# Credits (LOCKED business rules)
+MONTHLY_AI_CREDITS = 300
+VOICE_AI_COST = 3
+TEXT_AI_COST = 1
+VOICE_CACHED_FIRST_GEN_COST = 1
 
 # CORS
 CORS_ALLOW_ORIGINS = os.getenv("CORS_ALLOW_ORIGINS", "http://localhost:3000").strip()
@@ -83,7 +82,7 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 # ------------------------------------------------------------
-# Plans (payments) - pricing rules
+# Plans (payments)
 # ------------------------------------------------------------
 PLAN_RULES = {
     "monthly":   {"amount_kobo": 3000 * 100,  "days": 30,  "currency": "NGN"},
@@ -111,8 +110,7 @@ def require_admin(req) -> Optional[Any]:
 
 def normalize_phone(raw: str) -> str:
     s = (raw or "").strip()
-    s = s.replace(" ", "").replace("+", "")
-    return s
+    return s.replace(" ", "").replace("+", "")
 
 def normalize_question(q: str) -> str:
     s = (q or "").strip().lower()
@@ -155,8 +153,7 @@ def parse_iso_dt(s: Any) -> Optional[datetime]:
 def is_subscription_active(sub: Optional[Dict[str, Any]]) -> bool:
     if not sub:
         return False
-    status = (sub.get("status") or "").lower()
-    if status != "active":
+    if (sub.get("status") or "").lower() != "active":
         return False
     exp = parse_iso_dt(sub.get("expires_at"))
     if not exp:
@@ -168,9 +165,7 @@ def plan_days(plan: str) -> int:
 
 def plan_total_credits(plan: str) -> int:
     # LOCKED RULE: 300 AI credits per month across all plans.
-    # Total credits scale with plan duration; rollover only within duration.
     days = plan_days(plan)
-    # Use integer month blocks: monthly=1, quarterly=3, yearly=12
     if days >= 360:
         months = 12
     elif days >= 80:
@@ -180,7 +175,6 @@ def plan_total_credits(plan: str) -> int:
     return MONTHLY_AI_CREDITS * months
 
 def plan_period_start(sub: Dict[str, Any]) -> Optional[datetime]:
-    # We derive start = expires_at - plan_days
     exp = parse_iso_dt(sub.get("expires_at"))
     if not exp:
         return None
@@ -212,8 +206,7 @@ def daily_total_usage_inc(wa_phone: str, inc: int = 1) -> None:
     try:
         wa_phone = normalize_phone(wa_phone)
         d = str(today_utc())
-        # Upsert by PK (wa_phone, day)
-        # We cannot do atomic increment easily without RPC, so do read-update (best effort).
+
         res = (
             supabase.table("daily_answer_usage")
             .select("total_count")
@@ -279,7 +272,7 @@ def ai_daily_usage_inc(wa_phone: str, total_inc: int = 1, ai_inc: int = 0) -> No
         logging.exception("ai_daily_usage_inc failed")
 
 # ------------------------------------------------------------
-# Credit ledger accounting
+# Credit ledger accounting (admin/internal)
 # ------------------------------------------------------------
 def ledger_add(wa_phone: str, kind: str, credits_delta: int, meta: Optional[Dict[str, Any]] = None) -> None:
     try:
@@ -294,9 +287,6 @@ def ledger_add(wa_phone: str, kind: str, credits_delta: int, meta: Optional[Dict
         logging.exception("ledger_add failed")
 
 def credits_used_in_period(wa_phone: str, start: datetime, end: datetime) -> int:
-    """
-    Return positive number of credits USED (sum of negative deltas abs) within [start, end]
-    """
     try:
         res = (
             supabase.table("ai_credit_ledger")
@@ -318,9 +308,6 @@ def credits_used_in_period(wa_phone: str, start: datetime, end: datetime) -> int
         return 0
 
 def topups_in_period(wa_phone: str, start: datetime, end: datetime) -> int:
-    """
-    Credits ADDED from topups in ledger in period.
-    """
     try:
         res = (
             supabase.table("ai_credit_ledger")
@@ -343,9 +330,8 @@ def topups_in_period(wa_phone: str, start: datetime, end: datetime) -> int:
 
 def credit_balance_for_user(wa_phone: str) -> Dict[str, Any]:
     """
-    Returns:
-      active(bool), plan, period_start, period_end, allowance, used, topups, remaining
-    For free users: allowance=0 and remaining=0 (AI not allowed unless you later decide to enable free 1/day)
+    Internal helper for enforcement decisions.
+    NOTE: This is NOT returned to normal users (per your rule).
     """
     sub = get_subscription_row(wa_phone)
     active = is_subscription_active(sub)
@@ -424,6 +410,7 @@ def cache_get(question: str) -> Optional[str]:
             return None
         row = rows[0]
         ans = row.get("answer")
+
         # best-effort usage update
         try:
             cid = row.get("id")
@@ -435,6 +422,7 @@ def cache_get(question: str) -> Optional[str]:
                 }).eq("id", cid).execute()
         except Exception:
             pass
+
         return ans
     except Exception:
         logging.exception("cache_get failed")
@@ -454,7 +442,6 @@ def cache_set(question: str, answer: str) -> None:
             "created_at": iso(now_utc()),
         }).execute()
     except Exception:
-        # If you later make qa_cache.normalized_question UNIQUE, switch to upsert.
         return
 
 # ------------------------------------------------------------
@@ -462,20 +449,14 @@ def cache_set(question: str, answer: str) -> None:
 # ------------------------------------------------------------
 def ai_answer_text(question: str) -> str:
     if not OPENAI_API_KEY:
-        # Safe fallback (should not be used in production)
-        return (
-            "AI is currently unavailable.\n\n"
-            "Please try again later or ask another question."
-        )
+        return "AI is currently unavailable. Please try again later."
 
-    # Keep prompts concise to reduce cost and increase speed.
     sys = (
         "You are Naija Tax Guide. Provide clear, simple, Nigeria-focused tax guidance. "
         "Avoid jargon unless necessary. Use short bullet points when helpful. "
         "If unsure, say so and advise confirming with FIRS/State IRS or a professional."
     )
     try:
-        # Use Chat Completions style request (widely supported)
         url = "https://api.openai.com/v1/chat/completions"
         headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
         payload = {
@@ -501,20 +482,12 @@ def ai_answer_text(question: str) -> str:
 # Voice generation + Supabase Storage upload
 # ------------------------------------------------------------
 def derive_storage_base() -> str:
-    # If user provided VOICE_PUBLIC_BASE use it.
     if VOICE_PUBLIC_BASE:
         return VOICE_PUBLIC_BASE.rstrip("/")
-    # Derive from SUPABASE_URL: https://<ref>.supabase.co
-    # Public object URL:
-    #   https://<ref>.supabase.co/storage/v1/object/public/<bucket>/<path>
     base = SUPABASE_STORAGE_URL.strip() or SUPABASE_URL.strip()
     return (base.rstrip("/") + "/storage/v1/object/public/" + VOICE_BUCKET).rstrip("/")
 
 def supabase_storage_upload(path: str, content_bytes: bytes, content_type: str = "audio/mpeg") -> Optional[str]:
-    """
-    Uploads bytes to Supabase Storage using REST.
-    Requires bucket to exist and (ideally) be public for direct URL access.
-    """
     try:
         base = (SUPABASE_STORAGE_URL.strip() or SUPABASE_URL.strip()).rstrip("/")
         if not base:
@@ -530,17 +503,12 @@ def supabase_storage_upload(path: str, content_bytes: bytes, content_type: str =
         if r.status_code >= 300:
             logging.warning(f"Storage upload failed {r.status_code}: {r.text[:200]}")
             return None
-        public_url = f"{derive_storage_base()}/{path.lstrip('/')}"
-        return public_url
+        return f"{derive_storage_base()}/{path.lstrip('/')}"
     except Exception:
         logging.exception("supabase_storage_upload failed")
         return None
 
 def openai_tts(text: str, voice_style: str = "default") -> Optional[bytes]:
-    """
-    Generate speech bytes from text.
-    Note: endpoint availability can vary by account; if it fails we fallback gracefully.
-    """
     if not OPENAI_API_KEY:
         return None
     try:
@@ -576,6 +544,7 @@ def voice_cache_get(nq: str, provider: str, style: str) -> Optional[str]:
         if not rows:
             return None
         row = rows[0]
+
         # best-effort update
         try:
             vid = row.get("id")
@@ -587,6 +556,7 @@ def voice_cache_get(nq: str, provider: str, style: str) -> Optional[str]:
                 }).eq("id", vid).execute()
         except Exception:
             pass
+
         return row.get("audio_url")
     except Exception:
         logging.exception("voice_cache_get failed")
@@ -594,7 +564,6 @@ def voice_cache_get(nq: str, provider: str, style: str) -> Optional[str]:
 
 def voice_cache_set(nq: str, provider: str, style: str, audio_url: str) -> None:
     try:
-        # upsert by unique key
         supabase.table("voice_cache").upsert({
             "normalized_question": nq,
             "voice_provider": provider,
@@ -608,24 +577,14 @@ def voice_cache_set(nq: str, provider: str, style: str, audio_url: str) -> None:
         logging.exception("voice_cache_set failed")
 
 def ensure_voice_for_text(nq: str, text: str, provider: str, style: str) -> Tuple[Optional[str], bool]:
-    """
-    Returns (audio_url, was_generated_now)
-    """
     cached_url = voice_cache_get(nq, provider, style)
     if cached_url:
         return cached_url, False
 
-    # Generate new audio bytes
-    if provider == "openai":
-        audio_bytes = openai_tts(text, style)
-    else:
-        audio_bytes = None
-
+    audio_bytes = openai_tts(text, style) if provider == "openai" else None
     if not audio_bytes:
         return None, False
 
-    # Upload to storage
-    # Use stable path derived from hash to avoid exploding storage paths.
     key = hashlib.sha256(f"{provider}:{style}:{nq}".encode("utf-8")).hexdigest()[:24]
     obj_path = f"{provider}/{style}/{key}.mp3"
     url = supabase_storage_upload(obj_path, audio_bytes, "audio/mpeg")
@@ -648,21 +607,11 @@ def enforce_daily_total_limit_or_message(wa_phone: str) -> Optional[str]:
     used = daily_total_usage_get(wa_phone)
     if used >= limit:
         if is_paid:
-            return (
-                "You’ve reached today’s usage safety limit. "
-                "Please try again later today or tomorrow."
-            )
-        return (
-            "You’ve reached today’s free limit (30/day). "
-            "Please try again tomorrow or subscribe for higher access."
-        )
+            return "You’ve reached today’s usage safety limit. Please try again later today or tomorrow."
+        return "You’ve reached today’s free limit (30/day). Please try again tomorrow or subscribe for higher access."
     return None
 
 def can_use_ai(wa_phone: str, credits_needed: int) -> Tuple[bool, str, Dict[str, Any]]:
-    """
-    Returns (allowed, reason, balance_info)
-    reason is user-friendly.
-    """
     bal = credit_balance_for_user(wa_phone)
     if not bal.get("active"):
         return False, "AI is available for subscribers. Please subscribe to unlock AI answers.", bal
@@ -674,19 +623,13 @@ def can_use_ai(wa_phone: str, credits_needed: int) -> Tuple[bool, str, Dict[str,
 # Core resolver: library -> cache -> AI
 # ------------------------------------------------------------
 def resolve_answer(wa_phone: str, question: str, mode: str, voice_provider: str, voice_style: str) -> Dict[str, Any]:
-    """
-    mode: "text" | "voice"
-    Returns dict:
-      ok, answer_text, audio_url(optional), credits_used, meta(admin)
-    """
     wa_phone = normalize_phone(wa_phone)
     question = (question or "").strip()
     nq = normalize_question(question)
 
-    # Enforce daily total answers cap (free 30/day, paid 2000/day)
     msg = enforce_daily_total_limit_or_message(wa_phone)
     if msg:
-        return {"ok": True, "answer_text": msg, "audio_url": None, "credits_used": 0, "meta": {"source": "limit"}}
+        return {"ok": True, "answer_text": msg, "audio_url": None, "meta": {"source": "limit"}}
 
     # 1) qa_library
     lib_ans = library_get(question)
@@ -696,31 +639,22 @@ def resolve_answer(wa_phone: str, question: str, mode: str, voice_provider: str,
 
         if mode == "voice":
             audio_url, generated_now = ensure_voice_for_text(nq, lib_ans, voice_provider, voice_style)
-            credits_used = 0
+
+            # Charge 1 credit only if voice must be generated for the first time
             if generated_now:
-                # Charge 1 credit only when generating voice for the first time for that nq+provider+style
                 allowed, reason, bal = can_use_ai(wa_phone, VOICE_CACHED_FIRST_GEN_COST)
                 if not allowed:
-                    # If user cannot pay 1 credit, fall back to text only (still answer).
                     return {
                         "ok": True,
                         "answer_text": lib_ans,
                         "audio_url": None,
-                        "credits_used": 0,
                         "meta": {"source": "library", "voice": "blocked_no_credits", "reason": reason, "balance": bal},
                     }
-                credits_used = VOICE_CACHED_FIRST_GEN_COST
-                ledger_add(wa_phone, "tts_cached_gen", -credits_used, {"source": "library", "nq": nq})
-                ai_daily_usage_inc(wa_phone, total_inc=0, ai_inc=0)  # AI not used; ledger covers cost accounting
-            return {
-                "ok": True,
-                "answer_text": lib_ans,
-                "audio_url": audio_url,
-                "credits_used": credits_used,
-                "meta": {"source": "library", "voice_generated_now": bool(generated_now)},
-            }
+                ledger_add(wa_phone, "tts_cached_gen", -VOICE_CACHED_FIRST_GEN_COST, {"source": "library", "nq": nq})
 
-        return {"ok": True, "answer_text": lib_ans, "audio_url": None, "credits_used": 0, "meta": {"source": "library"}}
+            return {"ok": True, "answer_text": lib_ans, "audio_url": audio_url, "meta": {"source": "library"}}
+
+        return {"ok": True, "answer_text": lib_ans, "audio_url": None, "meta": {"source": "library"}}
 
     # 2) qa_cache
     cached = cache_get(question)
@@ -730,7 +664,7 @@ def resolve_answer(wa_phone: str, question: str, mode: str, voice_provider: str,
 
         if mode == "voice":
             audio_url, generated_now = ensure_voice_for_text(nq, cached, voice_provider, voice_style)
-            credits_used = 0
+
             if generated_now:
                 allowed, reason, bal = can_use_ai(wa_phone, VOICE_CACHED_FIRST_GEN_COST)
                 if not allowed:
@@ -738,27 +672,18 @@ def resolve_answer(wa_phone: str, question: str, mode: str, voice_provider: str,
                         "ok": True,
                         "answer_text": cached,
                         "audio_url": None,
-                        "credits_used": 0,
                         "meta": {"source": "cache", "voice": "blocked_no_credits", "reason": reason, "balance": bal},
                     }
-                credits_used = VOICE_CACHED_FIRST_GEN_COST
-                ledger_add(wa_phone, "tts_cached_gen", -credits_used, {"source": "cache", "nq": nq})
-            return {
-                "ok": True,
-                "answer_text": cached,
-                "audio_url": audio_url,
-                "credits_used": credits_used,
-                "meta": {"source": "cache", "voice_generated_now": bool(generated_now)},
-            }
+                ledger_add(wa_phone, "tts_cached_gen", -VOICE_CACHED_FIRST_GEN_COST, {"source": "cache", "nq": nq})
 
-        return {"ok": True, "answer_text": cached, "audio_url": None, "credits_used": 0, "meta": {"source": "cache"}}
+            return {"ok": True, "answer_text": cached, "audio_url": audio_url, "meta": {"source": "cache"}}
+
+        return {"ok": True, "answer_text": cached, "audio_url": None, "meta": {"source": "cache"}}
 
     # 3) AI
-    # Determine credits needed
     credits_needed = VOICE_AI_COST if mode == "voice" else TEXT_AI_COST
     allowed, reason, bal = can_use_ai(wa_phone, credits_needed)
     if not allowed:
-        # AI blocked: provide helpful fallback (no mention of cache/AI)
         daily_total_usage_inc(wa_phone, 1)
         ai_daily_usage_inc(wa_phone, total_inc=1, ai_inc=0)
         msg = (
@@ -766,33 +691,22 @@ def resolve_answer(wa_phone: str, question: str, mode: str, voice_provider: str,
             "You can still ask standard questions covered by our library. "
             "If you need a custom answer now, please top up your AI credits."
         )
-        return {"ok": True, "answer_text": msg, "audio_url": None, "credits_used": 0, "meta": {"source": "ai_blocked", "balance": bal}}
+        return {"ok": True, "answer_text": msg, "audio_url": None, "meta": {"source": "ai_blocked", "balance": bal}}
 
-    # Generate AI text
     ans = ai_answer_text(question)
-
-    # Save into cache (so next time is free)
     cache_set(question, ans)
 
-    # Charge credits
     ledger_kind = "ai_voice" if mode == "voice" else "ai_text"
     ledger_add(wa_phone, ledger_kind, -credits_needed, {"source": "ai", "nq": nq, "model": OPENAI_MODEL})
 
-    # Update daily usage counters
     daily_total_usage_inc(wa_phone, 1)
     ai_daily_usage_inc(wa_phone, total_inc=1, ai_inc=1)
 
     if mode == "voice":
-        audio_url, _generated_now = ensure_voice_for_text(nq, ans, voice_provider, voice_style)
-        return {
-            "ok": True,
-            "answer_text": ans,
-            "audio_url": audio_url,
-            "credits_used": credits_needed,
-            "meta": {"source": "ai", "mode": "voice"},
-        }
+        audio_url, _ = ensure_voice_for_text(nq, ans, voice_provider, voice_style)
+        return {"ok": True, "answer_text": ans, "audio_url": audio_url, "meta": {"source": "ai"}}
 
-    return {"ok": True, "answer_text": ans, "audio_url": None, "credits_used": credits_needed, "meta": {"source": "ai", "mode": "text"}}
+    return {"ok": True, "answer_text": ans, "audio_url": None, "meta": {"source": "ai"}}
 
 # ------------------------------------------------------------
 # Health / Debug
@@ -805,11 +719,15 @@ def health():
 def routes():
     out = []
     for rule in app.url_map.iter_rules():
-        out.append({"endpoint": rule.endpoint, "methods": sorted([m for m in rule.methods if m in ("GET","POST","OPTIONS")]), "rule": str(rule)})
+        out.append({
+            "endpoint": rule.endpoint,
+            "methods": sorted([m for m in rule.methods if m in ("GET", "POST", "OPTIONS")]),
+            "rule": str(rule),
+        })
     return jsonify(sorted(out, key=lambda x: x["rule"]))
 
 # ------------------------------------------------------------
-# Public: ASK (web chat, telegram later, whatsapp later)
+# Public: /ask  (RULE: users see ONLY answer + audio_url + plan_expiry)
 # ------------------------------------------------------------
 @app.post("/ask")
 def ask():
@@ -817,7 +735,6 @@ def ask():
     wa_phone = normalize_phone(body.get("wa_phone") or "")
     question = (body.get("question") or "").strip()
 
-    # mode = "text" or "voice"
     mode = (body.get("mode") or "text").strip().lower()
     if mode not in ("text", "voice"):
         mode = "text"
@@ -832,17 +749,34 @@ def ask():
 
     result = resolve_answer(wa_phone, question, mode, voice_provider, voice_style)
 
-    # IMPORTANT: do not expose meta/source to normal users
-    resp = {
+    sub = get_subscription_row(wa_phone)
+    plan_expiry = sub.get("expires_at") if is_subscription_active(sub) else None
+
+    return jsonify({
         "ok": True,
         "answer": result.get("answer_text"),
         "audio_url": result.get("audio_url"),
-        "credits_used": result.get("credits_used", 0),
-        # optionally expose remaining credits (user-friendly)
-        "credits": credit_balance_for_user(wa_phone),
-    }
-    # Hide internal routing details (admin-only)
-    return jsonify(resp)
+        "plan_expiry": plan_expiry,
+    })
+
+# ------------------------------------------------------------
+# Public: /me  (optional) - plan info ONLY (no credits)
+# ------------------------------------------------------------
+@app.post("/me")
+def me():
+    body = request.get_json(silent=True) or {}
+    wa_phone = normalize_phone(body.get("wa_phone") or "")
+    if not wa_phone:
+        return jsonify({"ok": False, "error": "wa_phone is required"}), 400
+
+    sub = get_subscription_row(wa_phone)
+    active = is_subscription_active(sub)
+    return jsonify({
+        "ok": True,
+        "subscribed": bool(active),
+        "plan": (sub.get("plan") if active else None) if sub else None,
+        "plan_expiry": (sub.get("expires_at") if active else None) if sub else None,
+    })
 
 # ------------------------------------------------------------
 # Paystack: Initialize
@@ -887,7 +821,6 @@ def paystack_initialize():
         logging.exception("Failed inserting payment row")
         return jsonify({"ok": False, "error": f"db_insert_failed: {str(e)[:300]}"}), 500
 
-    # Mark subscription pending (so you can see intent)
     try:
         supabase.table("user_subscriptions").upsert({
             "wa_phone": wa_phone,
@@ -904,7 +837,7 @@ def paystack_initialize():
         "email": email,
         "amount": amount_kobo,
         "reference": reference,
-        "metadata": {"wa_phone": wa_phone, "plan": plan}
+        "metadata": {"wa_phone": wa_phone, "plan": plan},
     }
     if PAYSTACK_CALLBACK_URL:
         payload["callback_url"] = PAYSTACK_CALLBACK_URL
@@ -982,7 +915,6 @@ def paystack_webhook():
             "currency": data.get("currency") or pay.get("currency") or "NGN",
         }).eq("reference", reference).execute()
 
-        # Activate subscription: expires_at = now + plan_days
         expires_at = iso(now_utc() + timedelta(days=plan_days(plan)))
         supabase.table("user_subscriptions").upsert({
             "wa_phone": normalize_phone(wa_phone),
@@ -1003,7 +935,6 @@ def admin_metrics():
     if auth:
         return auth
 
-    # High value metrics for admin: credits used today, top users, etc.
     try:
         d = str(today_utc())
         usage = supabase.table("ai_daily_usage").select("wa_phone,count,ai_count").eq("day", d).execute().data or []
@@ -1026,13 +957,13 @@ def admin_topup():
     auth = require_admin(request)
     if auth:
         return auth
+
     body = request.get_json(silent=True) or {}
     wa_phone = normalize_phone(body.get("wa_phone") or "")
     credits = safe_int(body.get("credits"), 0)
     if not wa_phone or credits <= 0:
         return jsonify({"ok": False, "error": "wa_phone and positive credits required"}), 400
 
-    # Record topup in table and ledger
     ref = uuid.uuid4().hex[:10]
     try:
         supabase.table("ai_credit_topups").insert({
@@ -1077,7 +1008,7 @@ def admin_payments():
     return jsonify(res.data or [])
 
 # ------------------------------------------------------------
-# WhatsApp webhook endpoints (kept; you can ignore until you return to WA)
+# WhatsApp webhook endpoints (kept; can be ignored until WA is resumed)
 # ------------------------------------------------------------
 def wa_api_url(path: str) -> str:
     return f"https://graph.facebook.com/v24.0{path}"
@@ -1130,7 +1061,6 @@ def whatsapp_webhook_inbound():
             text_body = ((msg.get("text") or {}).get("body") or "").strip()
 
         if from_phone and text_body:
-            # Respond via the same resolver (text mode)
             result = resolve_answer(from_phone, text_body, "text", "openai", "default")
             ok, info = send_whatsapp_text(from_phone, result.get("answer_text") or "OK")
             logging.info(f"WA_REPLY ok={ok} info={info}")
