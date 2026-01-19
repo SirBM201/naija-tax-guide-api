@@ -385,6 +385,43 @@ SYNONYMS: Dict[str, List[str]] = {
     "cgt": ["capital gains tax"],
 }
 
+
+# ------------------------------------------------------------
+# Multilingual Answers (Library)
+# ------------------------------------------------------------
+SUPPORTED_LANGS = ("en", "pcm", "yo", "ig", "ha")
+ANSWER_COLS = "answer,answer_en,answer_pcm,answer_yo,answer_ig,answer_ha"
+
+def pick_answer(row: dict, lang: str) -> Optional[str]:
+    """
+    Pick the best answer field for the selected language.
+    Falls back to English, then legacy 'answer'.
+    """
+    if not row:
+        return None
+    lang = (lang or "en").strip().lower()
+    if lang not in SUPPORTED_LANGS:
+        lang = "en"
+
+    # Prefer explicit language column if present
+    key = f"answer_{lang}"
+    v = (row.get(key) or "").strip() if isinstance(row.get(key), str) else row.get(key)
+    if v:
+        return v
+
+    # Fallback to English
+    v = (row.get("answer_en") or "").strip() if isinstance(row.get("answer_en"), str) else row.get("answer_en")
+    if v:
+        return v
+
+    # Legacy
+    v = (row.get("answer") or "").strip() if isinstance(row.get("answer"), str) else row.get("answer")
+    if v:
+        return v
+
+    return None
+
+
 def expand_queries(nq: str) -> List[str]:
     out = [nq]
     joined = nq
@@ -413,7 +450,7 @@ def expand_queries(nq: str) -> List[str]:
 
 _RPC_MISSING = set()
 
-def _rpc_best_answer(fn_name: str, norm_query: str) -> Optional[str]:
+def _rpc_best_answer(fn_name: str, norm_query: str, lang: str = "en") -> Optional[str]:
     if not ENABLE_TYPO_TOLERANT:
         return None
     if not norm_query:
@@ -429,7 +466,7 @@ def _rpc_best_answer(fn_name: str, norm_query: str) -> Optional[str]:
         rows = res.data or []
         if rows:
             # expects rows like: {answer: "...", score: 0.42, normalized_question: "..."}
-            return rows[0].get("answer")
+            return pick_answer(rows[0], lang)
         return None
     except Exception as e:
         # Function might not exist yet; avoid spamming logs repeatedly
@@ -444,7 +481,7 @@ def _rpc_best_answer(fn_name: str, norm_query: str) -> Optional[str]:
 # ------------------------------------------------------------
 # QA library + cache
 # ------------------------------------------------------------
-def library_get(question: str) -> Optional[str]:
+def library_get(question: str, lang: str = "en") -> Optional[str]:
     nq = normalize_question(question)
     if not nq:
         return None
@@ -456,7 +493,7 @@ def library_get(question: str) -> Optional[str]:
         for c in candidates:
             res = (
                 supabase.table("qa_library")
-                .select("answer,enabled,priority,normalized_question")
+                .select(f"{ANSWER_COLS},enabled,priority,normalized_question")
                 .eq("normalized_question", c)
                 .eq("enabled", True)
                 .order("priority", desc=True)
@@ -465,10 +502,10 @@ def library_get(question: str) -> Optional[str]:
             )
             rows = res.data or []
             if rows:
-                return rows[0].get("answer")
+                return pick_answer(rows[0], lang)
 
         # 1b) typo-tolerant similarity match (pg_trgm via RPC)
-        ans_sim = _rpc_best_answer("qa_library_search", candidates[0])
+        ans_sim = _rpc_best_answer("qa_library_search", candidates[0], lang)
         if ans_sim:
             return ans_sim
 
@@ -490,7 +527,7 @@ def library_get(question: str) -> Optional[str]:
         for kw in keywords:
             q = (
                 supabase.table("qa_library")
-                .select("answer,normalized_question,priority")
+                .select(f"{ANSWER_COLS},normalized_question,priority")
                 .eq("enabled", True)
             )
 
@@ -526,14 +563,14 @@ def library_get(question: str) -> Optional[str]:
         logging.exception("library_get failed")
         return None
 
-def cache_get(question: str) -> Optional[str]:
+def cache_get(question: str, lang: str = "en") -> Optional[str]:
     nq = normalize_question(question)
     if not nq:
         return None
     try:
         res = (
             supabase.table("qa_cache")
-            .select("id,answer,use_count")
+            .select(f"id,{ANSWER_COLS},use_count")
             .eq("normalized_question", nq)
             .order("last_used_at", desc=True)
             .limit(1)
@@ -541,7 +578,7 @@ def cache_get(question: str) -> Optional[str]:
         )
         rows = res.data or []
         if not rows:
-            ans_sim = _rpc_best_answer("qa_cache_search", nq)
+            ans_sim = _rpc_best_answer("qa_cache_search", nq, lang)
             if ans_sim:
                 return ans_sim
             return None
@@ -787,7 +824,7 @@ def can_use_ai(wa_phone: str, credits_needed: int) -> Tuple[bool, str, Dict[str,
 # ------------------------------------------------------------
 # Core resolver
 # ------------------------------------------------------------
-def resolve_answer(wa_phone: str, question: str, mode: str, voice_provider: str, voice_style: str) -> Dict[str, Any]:
+def resolve_answer(wa_phone: str, question: str, mode: str, voice_provider: str, voice_style: str, lang: str = "en") -> Dict[str, Any]:
     wa_phone = normalize_phone(wa_phone)
     question = (question or "").strip()
     nq = normalize_question(question)
@@ -797,7 +834,7 @@ def resolve_answer(wa_phone: str, question: str, mode: str, voice_provider: str,
         return {"ok": True, "answer_text": msg, "audio_url": None, "credits_used": 0, "meta": {"source": "limit"}}
 
     # 1) library
-    lib_ans = library_get(question)
+    lib_ans = library_get(question, lang)
     if lib_ans:
         daily_total_usage_inc(wa_phone, 1)
         ai_daily_usage_inc(wa_phone, total_inc=1, ai_inc=0)
@@ -899,7 +936,7 @@ def ask():
     if not question:
         return jsonify({"ok": False, "error": "question is required"}), 400
 
-    result = resolve_answer(wa_phone, question, mode, voice_provider, voice_style)
+    result = resolve_answer(wa_phone, question, mode, voice_provider, voice_style, lang)
 
     return jsonify({
         "ok": True,
