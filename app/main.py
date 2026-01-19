@@ -19,6 +19,18 @@ from supabase import create_client
 # ------------------------------------------------------------
 app = Flask(__name__)
 
+# ------------------------------------------------------------
+# Error logging (ensures stack traces show in Koyeb logs)
+# ------------------------------------------------------------
+@app.errorhandler(Exception)
+def _unhandled_exception_handler(e):
+    try:
+        logging.exception("Unhandled exception: %s", e)
+    except Exception:
+        pass
+    return jsonify({"ok": False, "error": "internal_error"}), 500
+
+
 # Ensure logs always go to stdout on Koyeb (Gunicorn captures stdout/stderr)
 logging.basicConfig(
     level=logging.INFO,
@@ -74,7 +86,7 @@ OPENAI_TTS_MODEL = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts").strip()
 OPENAI_TTS_VOICE = os.getenv("OPENAI_TTS_VOICE", "alloy").strip()
 
 # Storage (Supabase Storage)
-VOICE_BUCKET = os.getenv("VOICE_BUCKET", "voice-cache").strip()
+VOICE_BUCKET = os.getenv("VOICE_BUCKET", "voice-help content").strip()
 SUPABASE_STORAGE_URL = os.getenv("SUPABASE_STORAGE_URL", "").strip()  # optional
 VOICE_PUBLIC_BASE = os.getenv("VOICE_PUBLIC_BASE", "").strip()
 
@@ -522,8 +534,8 @@ def expand_queries(nq: str) -> List[str]:
 # ------------------------------------------------------------
 # Typo-tolerant search via Supabase RPC (pg_trgm similarity)
 # You must create the SQL functions in Supabase:
-#  - qa_library_search(norm_query text, min_sim real, limit_n int)
-#  - qa_cache_search(norm_query text, min_sim real, limit_n int)
+#  - qa_help content_search(norm_query text, min_sim real, limit_n int)
+#  - qa_help content_search(norm_query text, min_sim real, limit_n int)
 # If functions are not present, code safely falls back.
 # ------------------------------------------------------------
 
@@ -558,9 +570,9 @@ def _rpc_best_answer(fn_name: str, norm_query: str, lang: str = "en") -> Optiona
         return None
 
 # ------------------------------------------------------------
-# QA library + cache
+# QA help content + help content
 # ------------------------------------------------------------
-def library_get(question: str, lang: str = "en") -> Optional[str]:
+def help content_get(question: str, lang: str = "en") -> Optional[str]:
     nq = normalize_question(question)
     if not nq:
         return None
@@ -571,7 +583,7 @@ def library_get(question: str, lang: str = "en") -> Optional[str]:
         # 1) exact match
         for c in candidates:
             res = (
-                supabase.table("qa_library")
+                supabase.table("qa_help content")
                 .select(f"{ANSWER_COLS},enabled,priority,normalized_question")
                 .eq("normalized_question", c)
                 .eq("enabled", True)
@@ -584,7 +596,7 @@ def library_get(question: str, lang: str = "en") -> Optional[str]:
                 return pick_answer(rows[0], lang)
 
         # 1b) typo-tolerant similarity match (pg_trgm via RPC)
-        ans_sim = _rpc_best_answer("qa_library_search", candidates[0], lang)
+        ans_sim = _rpc_best_answer("qa_help content_search", candidates[0], lang)
         if ans_sim:
             return ans_sim
 
@@ -605,7 +617,7 @@ def library_get(question: str, lang: str = "en") -> Optional[str]:
 
         for kw in keywords:
             q = (
-                supabase.table("qa_library")
+                supabase.table("qa_help content")
                 .select(f"{ANSWER_COLS},normalized_question,priority")
                 .eq("enabled", True)
             )
@@ -639,16 +651,16 @@ def library_get(question: str, lang: str = "en") -> Optional[str]:
         return best_answer
 
     except Exception:
-        logging.exception("library_get failed")
+        logging.exception("help content_get failed")
         return None
 
-def cache_get(question: str, lang: str = "en") -> Optional[str]:
+def help content_get(question: str, lang: str = "en") -> Optional[str]:
     nq = normalize_question(question)
     if not nq:
         return None
     try:
         res = (
-            supabase.table("qa_cache")
+            supabase.table("qa_help content")
             .select("id,answer,use_count")
             .eq("normalized_question", nq)
             .order("last_used_at", desc=True)
@@ -665,7 +677,7 @@ def cache_get(question: str, lang: str = "en") -> Optional[str]:
             cid = row.get("id")
             use_count = safe_int(row.get("use_count"), 0) + 1
             if cid:
-                supabase.table("qa_cache").update({
+                supabase.table("qa_help content").update({
                     "use_count": use_count,
                     "last_used_at": iso(now_utc()),
                 }).eq("id", cid).execute()
@@ -674,15 +686,15 @@ def cache_get(question: str, lang: str = "en") -> Optional[str]:
 
         return ans
     except Exception:
-        logging.exception("cache_get failed")
+        logging.exception("help content_get failed")
         return None
 
-def cache_set(question: str, answer: str) -> None:
+def help content_set(question: str, answer: str) -> None:
     nq = normalize_question(question)
     if not nq or not (answer or "").strip():
         return
     try:
-        supabase.table("qa_cache").insert({
+        supabase.table("qa_help content").insert({
             "normalized_question": nq,
             "answer": (answer or "").strip(),
             "tags": [],
@@ -802,10 +814,10 @@ def openai_tts(text: str, voice_style: str = "default") -> Optional[bytes]:
         logging.exception("openai_tts failed")
         return None
 
-def voice_cache_get(nq: str, provider: str, style: str) -> Optional[str]:
+def voice_help content_get(nq: str, provider: str, style: str) -> Optional[str]:
     try:
         res = (
-            supabase.table("voice_cache")
+            supabase.table("voice_help content")
             .select("id,audio_url,use_count")
             .eq("normalized_question", nq)
             .eq("voice_provider", provider)
@@ -821,7 +833,7 @@ def voice_cache_get(nq: str, provider: str, style: str) -> Optional[str]:
             vid = row.get("id")
             use_count = safe_int(row.get("use_count"), 0) + 1
             if vid:
-                supabase.table("voice_cache").update({
+                supabase.table("voice_help content").update({
                     "use_count": use_count,
                     "last_used_at": iso(now_utc()),
                 }).eq("id", vid).execute()
@@ -829,12 +841,12 @@ def voice_cache_get(nq: str, provider: str, style: str) -> Optional[str]:
             pass
         return row.get("audio_url")
     except Exception:
-        logging.exception("voice_cache_get failed")
+        logging.exception("voice_help content_get failed")
         return None
 
-def voice_cache_set(nq: str, provider: str, style: str, audio_url: str) -> None:
+def voice_help content_set(nq: str, provider: str, style: str, audio_url: str) -> None:
     try:
-        supabase.table("voice_cache").upsert({
+        supabase.table("voice_help content").upsert({
             "normalized_question": nq,
             "voice_provider": provider,
             "voice_style": style,
@@ -844,12 +856,12 @@ def voice_cache_set(nq: str, provider: str, style: str, audio_url: str) -> None:
             "last_used_at": iso(now_utc()),
         }, on_conflict="normalized_question,voice_provider,voice_style").execute()
     except Exception:
-        logging.exception("voice_cache_set failed")
+        logging.exception("voice_help content_set failed")
 
 def ensure_voice_for_text(nq: str, text: str, provider: str, style: str) -> Tuple[Optional[str], bool]:
-    cached_url = voice_cache_get(nq, provider, style)
-    if cached_url:
-        return cached_url, False
+    help contentd_url = voice_help content_get(nq, provider, style)
+    if help contentd_url:
+        return help contentd_url, False
 
     audio_bytes = openai_tts(text, style) if provider == "openai" else None
     if not audio_bytes:
@@ -861,7 +873,7 @@ def ensure_voice_for_text(nq: str, text: str, provider: str, style: str) -> Tupl
     if not url:
         return None, False
 
-    voice_cache_set(nq, provider, style, url)
+    voice_help content_set(nq, provider, style, url)
     return url, True
 
 # ------------------------------------------------------------
@@ -909,8 +921,8 @@ def resolve_answer(wa_phone: str, question: str, mode: str, voice_provider: str,
     if msg:
         return {"ok": True, "answer_text": msg, "audio_url": None, "credits_used": 0, "meta": {"source": "limit"}}
 
-    # 1) library
-    lib_ans = library_get(question, lang)
+    # 1) help content
+    lib_ans = help content_get(question, lang)
     if lib_ans:
         daily_total_usage_inc(wa_phone, 1)
         ai_daily_usage_inc(wa_phone, total_inc=1, ai_inc=0)
@@ -921,31 +933,31 @@ def resolve_answer(wa_phone: str, question: str, mode: str, voice_provider: str,
             if generated_now:
                 allowed, _, _ = can_use_ai(wa_phone, VOICE_CACHED_FIRST_GEN_COST)
                 if not allowed:
-                    return {"ok": True, "answer_text": lib_ans, "audio_url": None, "credits_used": 0, "meta": {"source": "library", "voice": "blocked"}}
+                    return {"ok": True, "answer_text": lib_ans, "audio_url": None, "credits_used": 0, "meta": {"source": "help content", "voice": "blocked"}}
                 credits_used = VOICE_CACHED_FIRST_GEN_COST
-                ledger_add(wa_phone, "tts_cached_gen", -credits_used, {"source": "library", "nq": nq})
-            return {"ok": True, "answer_text": lib_ans, "audio_url": audio_url, "credits_used": credits_used, "meta": {"source": "library"}}
+                ledger_add(wa_phone, "tts_help contentd_gen", -credits_used, {"source": "help content", "nq": nq})
+            return {"ok": True, "answer_text": lib_ans, "audio_url": audio_url, "credits_used": credits_used, "meta": {"source": "help content"}}
 
-        return {"ok": True, "answer_text": lib_ans, "audio_url": None, "credits_used": 0, "meta": {"source": "library"}}
+        return {"ok": True, "answer_text": lib_ans, "audio_url": None, "credits_used": 0, "meta": {"source": "help content"}}
 
-    # 2) cache
-    cached = cache_get(question)
-    if cached:
+    # 2) help content
+    help contentd = help content_get(question)
+    if help contentd:
         daily_total_usage_inc(wa_phone, 1)
         ai_daily_usage_inc(wa_phone, total_inc=1, ai_inc=0)
 
         if mode == "voice":
-            audio_url, generated_now = ensure_voice_for_text(nq, cached, voice_provider, voice_style)
+            audio_url, generated_now = ensure_voice_for_text(nq, help contentd, voice_provider, voice_style)
             credits_used = 0
             if generated_now:
                 allowed, _, _ = can_use_ai(wa_phone, VOICE_CACHED_FIRST_GEN_COST)
                 if not allowed:
-                    return {"ok": True, "answer_text": cached, "audio_url": None, "credits_used": 0, "meta": {"source": "cache", "voice": "blocked"}}
+                    return {"ok": True, "answer_text": help contentd, "audio_url": None, "credits_used": 0, "meta": {"source": "help content", "voice": "blocked"}}
                 credits_used = VOICE_CACHED_FIRST_GEN_COST
-                ledger_add(wa_phone, "tts_cached_gen", -credits_used, {"source": "cache", "nq": nq})
-            return {"ok": True, "answer_text": cached, "audio_url": audio_url, "credits_used": credits_used, "meta": {"source": "cache"}}
+                ledger_add(wa_phone, "tts_help contentd_gen", -credits_used, {"source": "help content", "nq": nq})
+            return {"ok": True, "answer_text": help contentd, "audio_url": audio_url, "credits_used": credits_used, "meta": {"source": "help content"}}
 
-        return {"ok": True, "answer_text": cached, "audio_url": None, "credits_used": 0, "meta": {"source": "cache"}}
+        return {"ok": True, "answer_text": help contentd, "audio_url": None, "credits_used": 0, "meta": {"source": "help content"}}
 
     # 3) AI fallback
     credits_needed = VOICE_AI_COST if mode == "voice" else TEXT_AI_COST
@@ -957,7 +969,7 @@ def resolve_answer(wa_phone: str, question: str, mode: str, voice_provider: str,
         return {"ok": True, "answer_text": msg, "audio_url": None, "credits_used": 0, "meta": {"source": "ai_blocked"}}
 
     ans = ai_answer_text(question, lang=lang)
-    cache_set(question, ans)
+    help content_set(question, ans)
 
     ledger_kind = "ai_voice" if mode == "voice" else "ai_text"
     ledger_add(wa_phone, ledger_kind, -credits_needed, {"source": "ai", "nq": nq, "model": OPENAI_MODEL})
@@ -976,7 +988,8 @@ def resolve_answer(wa_phone: str, question: str, mode: str, voice_provider: str,
 # ------------------------------------------------------------
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "service": "naija-tax-guide", "time_utc": iso(now_utc())})
+    return jsonify({"ok": True, "status": "healthy"}), 200
+
 
 @app.get("/routes")
 def routes():
