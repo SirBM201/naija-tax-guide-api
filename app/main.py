@@ -18,7 +18,35 @@ from supabase import create_client
 # App
 # ------------------------------------------------------------
 app = Flask(__name__)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+# Ensure logs always go to stdout on Koyeb (Gunicorn captures stdout/stderr)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    force=True,
+)
+
+# Basic request logging so Koyeb logs show activity
+@app.before_request
+def _log_request():
+    try:
+        logging.info("REQ %s %s", request.method, request.path)
+    except Exception:
+        pass
+
+@app.after_request
+def _log_response(resp):
+    try:
+        logging.info("RES %s %s -> %s", request.method, request.path, resp.status_code)
+    except Exception:
+        pass
+    return resp
+
+@app.errorhandler(Exception)
+def _handle_unexpected(err):
+    # Always log stacktrace, but return a safe message to the client
+    logging.exception("Unhandled error: %s", err)
+    return jsonify({"ok": False, "error": "Something went wrong while processing your request. Please try again."}), 500
 
 # ------------------------------------------------------------
 # ENV
@@ -71,6 +99,24 @@ CORS(
     allow_headers=["Content-Type", "x-admin-key"],
     methods=["GET", "POST", "OPTIONS"],
 )
+
+
+@app.before_request
+def _log_incoming_request():
+    # Confirms requests are reaching Koyeb even if something fails later.
+    try:
+        logging.info("REQ %s %s", request.method, request.path)
+    except Exception:
+        pass
+
+
+@app.after_request
+def _log_response(resp):
+    try:
+        logging.info("RES %s %s -> %s", request.method, request.path, resp.status_code)
+    except Exception:
+        pass
+    return resp
 
 # ------------------------------------------------------------
 # Supabase client
@@ -385,6 +431,76 @@ SYNONYMS: Dict[str, List[str]] = {
     "cgt": ["capital gains tax"],
 }
 
+
+# ------------------------------------------------------------
+# Multilingual Answers (Library)
+# ------------------------------------------------------------
+SUPPORTED_LANGS = ("en", "pcm", "yo", "ig", "ha")
+ANSWER_COLS = "answer,answer_en,answer_pcm,answer_yo,answer_ig,answer_ha"
+
+
+# -----------------------------
+# Answer selection by language
+# -----------------------------
+LANG_TO_COL = {
+    "en": "answer_en",
+    "pcm": "answer_pcm",
+    "yo": "answer_yo",
+    "ig": "answer_ig",
+    "ha": "answer_ha",
+}
+
+# Some legacy schemas may have duplicated columns (e.g., answer_pidgin, answer_hausa, answer_yoruba, answer_igbo).
+LEGACY_FALLBACK_COLS = {
+    "pcm": ["answer_pidgin"],
+    "ha": ["answer_hausa"],
+    "yo": ["answer_yoruba"],
+    "ig": ["answer_igbo"],
+}
+
+def pick_answer(row: dict, lang: str) -> str:
+    """Pick the best answer text for the requested language with safe fallbacks."""
+    lang = (lang or "en").lower().strip()
+    # 1) language-specific
+    col = LANG_TO_COL.get(lang, "answer_en")
+    v = (row.get(col) or "").strip() if isinstance(row, dict) else ""
+    if v:
+        return v
+    # 1b) legacy aliases
+    for c in LEGACY_FALLBACK_COLS.get(lang, []):
+        v = (row.get(c) or "").strip()
+        if v:
+            return v
+    # 2) English
+    v = (row.get("answer_en") or "").strip()
+    if v:
+        return v
+    # 3) old single-column answer
+    return (row.get("answer") or "").strip()
+
+    lang = (lang or "en").strip().lower()
+    if lang not in SUPPORTED_LANGS:
+        lang = "en"
+
+    # Prefer explicit language column if present
+    key = f"answer_{lang}"
+    v = (row.get(key) or "").strip() if isinstance(row.get(key), str) else row.get(key)
+    if v:
+        return v
+
+    # Fallback to English
+    v = (row.get("answer_en") or "").strip() if isinstance(row.get("answer_en"), str) else row.get("answer_en")
+    if v:
+        return v
+
+    # Legacy
+    v = (row.get("answer") or "").strip() if isinstance(row.get("answer"), str) else row.get("answer")
+    if v:
+        return v
+
+    return None
+
+
 def expand_queries(nq: str) -> List[str]:
     out = [nq]
     joined = nq
@@ -413,7 +529,7 @@ def expand_queries(nq: str) -> List[str]:
 
 _RPC_MISSING = set()
 
-def _rpc_best_answer(fn_name: str, norm_query: str) -> Optional[str]:
+def _rpc_best_answer(fn_name: str, norm_query: str, lang: str = "en") -> Optional[str]:
     if not ENABLE_TYPO_TOLERANT:
         return None
     if not norm_query:
@@ -429,7 +545,7 @@ def _rpc_best_answer(fn_name: str, norm_query: str) -> Optional[str]:
         rows = res.data or []
         if rows:
             # expects rows like: {answer: "...", score: 0.42, normalized_question: "..."}
-            return rows[0].get("answer")
+            return pick_answer(rows[0], lang)
         return None
     except Exception as e:
         # Function might not exist yet; avoid spamming logs repeatedly
@@ -444,7 +560,7 @@ def _rpc_best_answer(fn_name: str, norm_query: str) -> Optional[str]:
 # ------------------------------------------------------------
 # QA library + cache
 # ------------------------------------------------------------
-def library_get(question: str) -> Optional[str]:
+def library_get(question: str, lang: str = "en") -> Optional[str]:
     nq = normalize_question(question)
     if not nq:
         return None
@@ -456,7 +572,7 @@ def library_get(question: str) -> Optional[str]:
         for c in candidates:
             res = (
                 supabase.table("qa_library")
-                .select("answer,enabled,priority,normalized_question")
+                .select(f"{ANSWER_COLS},enabled,priority,normalized_question")
                 .eq("normalized_question", c)
                 .eq("enabled", True)
                 .order("priority", desc=True)
@@ -465,10 +581,10 @@ def library_get(question: str) -> Optional[str]:
             )
             rows = res.data or []
             if rows:
-                return rows[0].get("answer")
+                return pick_answer(rows[0], lang)
 
         # 1b) typo-tolerant similarity match (pg_trgm via RPC)
-        ans_sim = _rpc_best_answer("qa_library_search", candidates[0])
+        ans_sim = _rpc_best_answer("qa_library_search", candidates[0], lang)
         if ans_sim:
             return ans_sim
 
@@ -490,7 +606,7 @@ def library_get(question: str) -> Optional[str]:
         for kw in keywords:
             q = (
                 supabase.table("qa_library")
-                .select("answer,normalized_question,priority")
+                .select(f"{ANSWER_COLS},normalized_question,priority")
                 .eq("enabled", True)
             )
 
@@ -518,7 +634,7 @@ def library_get(question: str) -> Optional[str]:
 
                 if score > best_score:
                     best_score = score
-                    best_answer = r.get("answer")
+                    best_answer = pick_answer(r, lang)
 
         return best_answer
 
@@ -526,7 +642,7 @@ def library_get(question: str) -> Optional[str]:
         logging.exception("library_get failed")
         return None
 
-def cache_get(question: str) -> Optional[str]:
+def cache_get(question: str, lang: str = "en") -> Optional[str]:
     nq = normalize_question(question)
     if not nq:
         return None
@@ -541,9 +657,6 @@ def cache_get(question: str) -> Optional[str]:
         )
         rows = res.data or []
         if not rows:
-            ans_sim = _rpc_best_answer("qa_cache_search", nq)
-            if ans_sim:
-                return ans_sim
             return None
         row = rows[0]
         ans = row.get("answer")
@@ -585,7 +698,7 @@ def cache_set(question: str, answer: str) -> None:
 # ------------------------------------------------------------
 def ai_answer_text(question: str, lang: str = "en") -> str:
     if not OPENAI_API_KEY:
-        return "AI is currently unavailable. Please try again later."
+        return "Service is temporarily unavailable. Please try again later."
 
     sys = (
         "You are Naija Hustle Tax Guide. Provide clear, simple, Nigeria-focused tax guidance. "
@@ -787,7 +900,7 @@ def can_use_ai(wa_phone: str, credits_needed: int) -> Tuple[bool, str, Dict[str,
 # ------------------------------------------------------------
 # Core resolver
 # ------------------------------------------------------------
-def resolve_answer(wa_phone: str, question: str, mode: str, voice_provider: str, voice_style: str) -> Dict[str, Any]:
+def resolve_answer(wa_phone: str, question: str, mode: str, voice_provider: str, voice_style: str, lang: str = "en") -> Dict[str, Any]:
     wa_phone = normalize_phone(wa_phone)
     question = (question or "").strip()
     nq = normalize_question(question)
@@ -797,7 +910,7 @@ def resolve_answer(wa_phone: str, question: str, mode: str, voice_provider: str,
         return {"ok": True, "answer_text": msg, "audio_url": None, "credits_used": 0, "meta": {"source": "limit"}}
 
     # 1) library
-    lib_ans = library_get(question)
+    lib_ans = library_get(question, lang)
     if lib_ans:
         daily_total_usage_inc(wa_phone, 1)
         ai_daily_usage_inc(wa_phone, total_inc=1, ai_inc=0)
@@ -840,7 +953,7 @@ def resolve_answer(wa_phone: str, question: str, mode: str, voice_provider: str,
     if not allowed:
         daily_total_usage_inc(wa_phone, 1)
         ai_daily_usage_inc(wa_phone, total_inc=1, ai_inc=0)
-        msg = f"{reason}\n\nYou can still ask standard questions covered by our library."
+        msg = f"{reason}\n\nPlease subscribe to continue asking questions."
         return {"ok": True, "answer_text": msg, "audio_url": None, "credits_used": 0, "meta": {"source": "ai_blocked"}}
 
     ans = ai_answer_text(question, lang=lang)
@@ -885,7 +998,8 @@ def ask():
     wa_phone = normalize_phone(body.get("wa_phone") or "")
     question = (body.get("question") or "").strip()
 
-    lang = (body.get("lang") or "en").strip().lower()
+    # Accept either "lang" or "language" from the frontend, default to English.
+    lang = (body.get("lang") or body.get("language") or "en").strip().lower()
 
     mode = (body.get("mode") or "text").strip().lower()
     if mode not in ("text", "voice"):
@@ -899,14 +1013,23 @@ def ask():
     if not question:
         return jsonify({"ok": False, "error": "question is required"}), 400
 
-    result = resolve_answer(wa_phone, question, mode, voice_provider, voice_style)
-
-    return jsonify({
-        "ok": True,
-        "answer": result.get("answer_text"),
-        "audio_url": result.get("audio_url"),
-        "plan_expiry": get_plan_expiry_iso(wa_phone),
-    })
+    try:
+        logging.info("ASK wa_phone=%s lang=%s mode=%s q=%s", wa_phone, lang, mode, question[:200])
+        result = resolve_answer(wa_phone, question, mode, voice_provider, voice_style, lang)
+        return jsonify({
+            "ok": True,
+            "answer": result.get("answer_text"),
+            "audio_url": result.get("audio_url"),
+            "plan_expiry": get_plan_expiry_iso(wa_phone),
+        })
+    except Exception as e:
+        logging.exception("ASK failed wa_phone=%s lang=%s mode=%s", wa_phone, lang, mode)
+        # Never expose internal wording to the end user.
+        return jsonify({
+            "ok": False,
+            "error": "Something went wrong while processing your request. Please try again.",
+            "plan_expiry": get_plan_expiry_iso(wa_phone),
+        }), 500
 
 # ------------------------------------------------------------
 # Paystack: Initialize
