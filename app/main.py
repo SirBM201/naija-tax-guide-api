@@ -404,6 +404,44 @@ def expand_queries(nq: str) -> List[str]:
     return uniq
 
 # ------------------------------------------------------------
+# Typo-tolerant search via Supabase RPC (pg_trgm similarity)
+# You must create the SQL functions in Supabase:
+#  - qa_library_search(norm_query text, min_sim real, limit_n int)
+#  - qa_cache_search(norm_query text, min_sim real, limit_n int)
+# If functions are not present, code safely falls back.
+# ------------------------------------------------------------
+
+_RPC_MISSING = set()
+
+def _rpc_best_answer(fn_name: str, norm_query: str) -> Optional[str]:
+    if not ENABLE_TYPO_TOLERANT:
+        return None
+    if not norm_query:
+        return None
+    if fn_name in _RPC_MISSING:
+        return None
+    try:
+        res = supabase.rpc(fn_name, {
+            "norm_query": norm_query,
+            "min_sim": SIMILARITY_MIN,
+            "limit_n": 5
+        }).execute()
+        rows = res.data or []
+        if rows:
+            # expects rows like: {answer: "...", score: 0.42, normalized_question: "..."}
+            return rows[0].get("answer")
+        return None
+    except Exception as e:
+        # Function might not exist yet; avoid spamming logs repeatedly
+        msg = str(e)
+        if "function" in msg and ("does not exist" in msg or "not found" in msg):
+            _RPC_MISSING.add(fn_name)
+            logging.warning("RPC %s not found in Supabase. Falling back to non-similarity search.", fn_name)
+            return None
+        logging.exception("RPC %s failed", fn_name)
+        return None
+
+# ------------------------------------------------------------
 # QA library + cache
 # ------------------------------------------------------------
 def library_get(question: str) -> Optional[str]:
@@ -429,29 +467,55 @@ def library_get(question: str) -> Optional[str]:
             if rows:
                 return rows[0].get("answer")
 
+        # 1b) typo-tolerant similarity match (pg_trgm via RPC)
+        ans_sim = _rpc_best_answer("qa_library_search", candidates[0])
+        if ans_sim:
+            return ans_sim
+
         # 2) contains match (ILIKE) + scoring
         tokens = nq.split()
-        keywords = [t for t in tokens if len(t) >= 3] or tokens
+
+        # Use longer keywords to avoid bad substring matches (e.g., "tin" matching "maintain").
+        SAFE_ACRONYMS = {"vat", "tin", "paye", "wht", "firs", "pit", "cit", "cgt"}
+        keywords = [t for t in tokens if (len(t) >= 4) or (t in SAFE_ACRONYMS)]
+        if not keywords:
+            keywords = tokens
+
+        # Keep it small to protect DB performance
         keywords = keywords[:3]
 
         best_answer = None
         best_score = -1
 
         for kw in keywords:
-            res = (
+            q = (
                 supabase.table("qa_library")
                 .select("answer,normalized_question,priority")
                 .eq("enabled", True)
-                .ilike("normalized_question", f"%{kw}%")
-                .limit(25)
-                .execute()
             )
+
+            # For short acronyms, try to match as a word boundary using OR patterns.
+            if kw in SAFE_ACRONYMS and len(kw) <= 4:
+                # matches: "kw ...", "... kw ...", "... kw"
+                q = q.or_(
+                    f"normalized_question.ilike.{kw} %,normalized_question.ilike.% {kw} %,normalized_question.ilike.% {kw}"
+                )
+            else:
+                q = q.ilike("normalized_question", f"%{kw}%")
+
+            res = q.limit(25).execute()
             rows = res.data or []
+
             for r in rows:
                 cand_q = (r.get("normalized_question") or "")
+                cand_tokens = set(cand_q.split())
                 pri = safe_int(r.get("priority"), 0)
-                hits = sum(1 for k in keywords if k in cand_q)
-                score = (hits * 10) + pri + (min(len(cand_q), 120) // 10)
+
+                hits = sum(1 for k in keywords if k in cand_tokens)
+
+                # score: prioritize more keyword hits, then priority, then slightly prefer shorter (more specific) questions
+                score = (hits * 100) + (pri * 5) - (min(len(cand_q), 160) // 10)
+
                 if score > best_score:
                     best_score = score
                     best_answer = r.get("answer")
@@ -477,6 +541,9 @@ def cache_get(question: str) -> Optional[str]:
         )
         rows = res.data or []
         if not rows:
+            ans_sim = _rpc_best_answer("qa_cache_search", nq)
+            if ans_sim:
+                return ans_sim
             return None
         row = rows[0]
         ans = row.get("answer")
@@ -516,7 +583,7 @@ def cache_set(question: str, answer: str) -> None:
 # ------------------------------------------------------------
 # OpenAI AI Answer (text)
 # ------------------------------------------------------------
-def ai_answer_text(question: str) -> str:
+def ai_answer_text(question: str, lang: str = "en") -> str:
     if not OPENAI_API_KEY:
         return "AI is currently unavailable. Please try again later."
 
@@ -525,6 +592,29 @@ def ai_answer_text(question: str) -> str:
         "Avoid jargon unless necessary. Use short bullet points when helpful. "
         "If unsure, say so and advise confirming with FIRS/State IRS or a professional."
     )
+
+    # Language output (for multi-language expansion: English, Pidgin, Yoruba, Igbo, Hausa)
+    # Note: Library answers are currently stored in English; this only affects AI-generated responses.
+    lang = (lang or "en").strip().lower()
+    if lang in ("pidgin", "pigin", "naija", "naija pidgin"):
+        lang = "pcm"
+    if lang in ("yoruba", "yo"):
+        lang = "yo"
+    if lang in ("igbo", "ig"):
+        lang = "ig"
+    if lang in ("hausa", "ha"):
+        lang = "ha"
+
+    if lang == "pcm":
+        sys += "\nRespond in Nigerian Pidgin (clear and respectful)."
+    elif lang == "yo":
+        sys += "\nRespond in Yoruba (simple and clear)."
+    elif lang == "ig":
+        sys += "\nRespond in Igbo (simple and clear)."
+    elif lang == "ha":
+        sys += "\nRespond in Hausa (simple and clear)."
+    else:
+        sys += "\nRespond in English."
 
     try:
         url = "https://api.openai.com/v1/chat/completions"
@@ -747,7 +837,7 @@ def resolve_answer(wa_phone: str, question: str, mode: str, voice_provider: str,
         msg = f"{reason}\n\nYou can still ask standard questions covered by our library."
         return {"ok": True, "answer_text": msg, "audio_url": None, "credits_used": 0, "meta": {"source": "ai_blocked"}}
 
-    ans = ai_answer_text(question)
+    ans = ai_answer_text(question, lang=lang)
     cache_set(question, ans)
 
     ledger_kind = "ai_voice" if mode == "voice" else "ai_text"
@@ -788,6 +878,8 @@ def ask():
     body = request.get_json(silent=True) or {}
     wa_phone = normalize_phone(body.get("wa_phone") or "")
     question = (body.get("question") or "").strip()
+
+    lang = (body.get("lang") or "en").strip().lower()
 
     mode = (body.get("mode") or "text").strip().lower()
     if mode not in ("text", "voice"):
