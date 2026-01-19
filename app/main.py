@@ -760,22 +760,28 @@ def free_or_paid_daily_limit(wa_phone: str) -> Tuple[int, bool]:
     return (PAID_DAILY_TOTAL_LIMIT, True) if active else (FREE_DAILY_TOTAL_LIMIT, False)
 
 def enforce_daily_total_limit_or_message(wa_phone: str) -> Optional[str]:
+    """Return a user-facing message if today's limit is exceeded (no internal jargon)."""
     limit, is_paid = free_or_paid_daily_limit(wa_phone)
     used = daily_total_usage_get(wa_phone)
     if used >= limit:
-        return (
-            "You’ve reached today’s usage safety limit. Please try again later today or tomorrow."
-            if is_paid
-            else "You’ve reached today’s free limit (30/day). Please try again tomorrow or subscribe for higher access."
-        )
+        if is_paid:
+            return "You’ve reached today’s limit for your plan. Please try again tomorrow or upgrade your plan."
+        # Free user (no active subscription)
+        return "You’ve reached today’s free plan limit. Please try again tomorrow or subscribe via /pricing for higher access."
     return None
 
 def can_use_ai(wa_phone: str, credits_needed: int) -> Tuple[bool, str, Dict[str, Any]]:
+    """AI gating without exposing 'AI' wording to end-users."""
     bal = credit_balance_for_user(wa_phone)
+
+    # If user has no active subscription, we present the same free-limit message
     if not bal.get("active"):
-        return False, "AI is available for subscribers. Please subscribe to unlock AI answers.", bal
+        return False, "You’ve reached today’s free plan limit. Please subscribe via /pricing for higher access.", bal
+
+    # If user is subscribed but has exhausted credits/allowance, present plan-limit message
     if bal.get("remaining", 0) < credits_needed:
-        return False, "You’ve used up your AI credits for this period. You can top up or wait for renewal.", bal
+        return False, "You’ve reached your current plan limit for this period. Please top up or renew/upgrade via /pricing.", bal
+
     return True, "ok", bal
 
 # ------------------------------------------------------------
