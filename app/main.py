@@ -114,7 +114,12 @@ def normalize_phone(raw: str) -> str:
 
 def normalize_question(q: str) -> str:
     s = (q or "").strip().lower()
-    s = re.sub(r"\s+", " ", s)
+
+    # remove punctuation and symbols (keeps letters/numbers/spaces)
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+
+    # collapse spaces
+    s = re.sub(r"\s+", " ", s).strip()
     return s
 
 def safe_int(x: Any, default: int = 0) -> int:
