@@ -185,6 +185,111 @@ def parse_iso_dt(s: Any) -> Optional[datetime]:
         return None
 
 # ------------------------------------------------------------
+# Markdown output formatter (server-side post-processor)
+# This improves structure without changing the AI model or increasing costs meaningfully.
+# ------------------------------------------------------------
+DISCLAIMER = (
+    "_Disclaimer: This is general guidance. For binding advice, confirm with FIRS / your State IRS "
+    "or a qualified tax professional._"
+)
+
+_MD_H_RE = re.compile(r"(?m)^\s{0,3}#{1,6}\s+")
+_MD_LIST_RE = re.compile(r"(?m)^\s{0,3}(-|\*|\d+\.)\s+")
+_MD_TABLE_RE = re.compile(r"(?m)^\s*\|.+\|\s*$")
+
+def _clean_md(text: Optional[str]) -> str:
+    t = (text or "").strip()
+    t = t.replace("\r\n", "\n").replace("\r", "\n")
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
+
+def _looks_like_markdown(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    if _MD_H_RE.search(t):
+        return True
+    if _MD_LIST_RE.search(t):
+        return True
+    if _MD_TABLE_RE.search(t):
+        return True
+    # common emphasis/code markers
+    if "```" in t or "**" in t or "_" in t:
+        return True
+    return False
+
+def strip_markdown_for_tts(md: str) -> str:
+    """
+    Convert markdown-ish answer to simple readable text for voice.
+    (Keeps content; removes headings, bullets, code fences, links formatting.)
+    """
+    t = _clean_md(md)
+    if not t:
+        return ""
+    # Remove code fences
+    t = re.sub(r"```[\s\S]*?```", "", t)
+    # Links: [text](url) -> text
+    t = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", t)
+    # Headings: "### Title" -> "Title"
+    t = re.sub(r"(?m)^\s{0,3}#{1,6}\s+", "", t)
+    # Bullets -> sentence
+    t = re.sub(r"(?m)^\s{0,3}(-|\*|\d+\.)\s+", "- ", t)
+    # Bold/italic markers
+    t = t.replace("**", "").replace("__", "").replace("*", "").replace("_", "")
+    # Collapse whitespace
+    t = re.sub(r"\n{3,}", "\n\n", t).strip()
+    return t
+
+def format_markdown_answer(question: str, raw_answer: str) -> str:
+    """
+    Wrap raw answer into a consistent, professional Markdown structure.
+
+    Rules:
+    - If the answer already looks like structured Markdown, we keep it and only append a disclaimer once.
+    - Otherwise, we wrap it into standard sections.
+    """
+    q = _clean_md(question)
+    a = _clean_md(raw_answer)
+
+    if not a:
+        return (
+            "### Direct Answer\n"
+            "I couldn't generate a reliable answer for that question.\n\n"
+            "### What I need from you\n"
+            "- Your **state of operation**\n"
+            "- Are you an **individual** or a **business**?\n"
+            "- What type of income/transaction is involved?\n\n"
+            f"{DISCLAIMER}"
+        )
+
+    # Avoid duplicating disclaimer
+    if "Disclaimer:" in a or "_Disclaimer:" in a:
+        return a
+
+    # If already structured, keep it and append disclaimer at end
+    if _looks_like_markdown(a):
+        return f"{a}\n\n{DISCLAIMER}"
+
+    # Default wrapper
+    return (
+        f"### Direct Answer\n{a}\n\n"
+        "### What to do next\n"
+        "- Confirm if this applies to your **state** and your **business type**.\n"
+        "- Keep supporting documents (invoices/receipts, bank statements, contracts).\n"
+        "- If uncertain, verify with **FIRS / State IRS** before filing.\n\n"
+        "### Documents to keep\n"
+        "- Invoices / receipts\n"
+        "- Bank statements\n"
+        "- Contracts / engagement letters\n"
+        "- Payment evidence / schedules\n\n"
+        "### Common mistakes\n"
+        "- Filing without confirming the correct authority (FIRS vs State IRS)\n"
+        "- Poor record keeping (missing invoices/receipts)\n"
+        "- Mixing personal and business transactions without documentation\n\n"
+        f"{DISCLAIMER}"
+    )
+
+# ------------------------------------------------------------
 # Subscription (user_subscriptions)
 # ------------------------------------------------------------
 def get_subscription_row(wa_phone: str) -> Optional[Dict[str, Any]]:
@@ -436,17 +541,12 @@ SYNONYMS: Dict[str, List[str]] = {
     "cgt": ["capital gains tax"],
 }
 
-
 # ------------------------------------------------------------
 # Multilingual Answers (Library)
 # ------------------------------------------------------------
 SUPPORTED_LANGS = ("en", "pcm", "yo", "ig", "ha")
 ANSWER_COLS = "answer,answer_en,answer_pcm,answer_yo,answer_ig,answer_ha"
 
-
-# -----------------------------
-# Answer selection by language
-# -----------------------------
 LANG_TO_COL = {
     "en": "answer_en",
     "pcm": "answer_pcm",
@@ -455,7 +555,6 @@ LANG_TO_COL = {
     "ha": "answer_ha",
 }
 
-# Some legacy schemas may have duplicated columns (e.g., answer_pidgin, answer_hausa, answer_yoruba, answer_igbo).
 LEGACY_FALLBACK_COLS = {
     "pcm": ["answer_pidgin"],
     "ha": ["answer_hausa"],
@@ -466,45 +565,28 @@ LEGACY_FALLBACK_COLS = {
 def pick_answer(row: dict, lang: str) -> str:
     """Pick the best answer text for the requested language with safe fallbacks."""
     lang = (lang or "en").lower().strip()
+    if lang not in SUPPORTED_LANGS:
+        lang = "en"
+
     # 1) language-specific
     col = LANG_TO_COL.get(lang, "answer_en")
     v = (row.get(col) or "").strip() if isinstance(row, dict) else ""
     if v:
         return v
+
     # 1b) legacy aliases
     for c in LEGACY_FALLBACK_COLS.get(lang, []):
         v = (row.get(c) or "").strip()
         if v:
             return v
+
     # 2) English
     v = (row.get("answer_en") or "").strip()
     if v:
         return v
+
     # 3) old single-column answer
     return (row.get("answer") or "").strip()
-
-    lang = (lang or "en").strip().lower()
-    if lang not in SUPPORTED_LANGS:
-        lang = "en"
-
-    # Prefer explicit language column if present
-    key = f"answer_{lang}"
-    v = (row.get(key) or "").strip() if isinstance(row.get(key), str) else row.get(key)
-    if v:
-        return v
-
-    # Fallback to English
-    v = (row.get("answer_en") or "").strip() if isinstance(row.get("answer_en"), str) else row.get("answer_en")
-    if v:
-        return v
-
-    # Legacy
-    v = (row.get("answer") or "").strip() if isinstance(row.get("answer"), str) else row.get("answer")
-    if v:
-        return v
-
-    return None
-
 
 def expand_queries(nq: str) -> List[str]:
     out = [nq]
@@ -526,12 +608,7 @@ def expand_queries(nq: str) -> List[str]:
 
 # ------------------------------------------------------------
 # Typo-tolerant search via Supabase RPC (pg_trgm similarity)
-# You must create the SQL functions in Supabase:
-#  - qa_library_search(norm_query text, min_sim real, limit_n int)
-#  - qa_cache_search(norm_query text, min_sim real, limit_n int)
-# If functions are not present, code safely falls back.
 # ------------------------------------------------------------
-
 _RPC_MISSING = set()
 
 def _rpc_best_answer(fn_name: str, norm_query: str, lang: str = "en") -> Optional[str]:
@@ -549,11 +626,9 @@ def _rpc_best_answer(fn_name: str, norm_query: str, lang: str = "en") -> Optiona
         }).execute()
         rows = res.data or []
         if rows:
-            # expects rows like: {answer: "...", score: 0.42, normalized_question: "..."}
             return pick_answer(rows[0], lang)
         return None
     except Exception as e:
-        # Function might not exist yet; avoid spamming logs repeatedly
         msg = str(e)
         if "function" in msg and ("does not exist" in msg or "not found" in msg):
             _RPC_MISSING.add(fn_name)
@@ -566,6 +641,9 @@ def _rpc_best_answer(fn_name: str, norm_query: str, lang: str = "en") -> Optiona
 # QA library + cache
 # ------------------------------------------------------------
 def library_get(question: str, lang: str = "en") -> Optional[str]:
+    if not ENABLE_QA_LIBRARY:
+        return None
+
     nq = normalize_question(question)
     if not nq:
         return None
@@ -596,13 +674,11 @@ def library_get(question: str, lang: str = "en") -> Optional[str]:
         # 2) contains match (ILIKE) + scoring
         tokens = nq.split()
 
-        # Use longer keywords to avoid bad substring matches (e.g., "tin" matching "maintain").
         SAFE_ACRONYMS = {"vat", "tin", "paye", "wht", "firs", "pit", "cit", "cgt"}
         keywords = [t for t in tokens if (len(t) >= 4) or (t in SAFE_ACRONYMS)]
         if not keywords:
             keywords = tokens
 
-        # Keep it small to protect DB performance
         keywords = keywords[:3]
 
         best_answer = None
@@ -615,9 +691,7 @@ def library_get(question: str, lang: str = "en") -> Optional[str]:
                 .eq("enabled", True)
             )
 
-            # For short acronyms, try to match as a word boundary using OR patterns.
             if kw in SAFE_ACRONYMS and len(kw) <= 4:
-                # matches: "kw ...", "... kw ...", "... kw"
                 q = q.or_(
                     f"normalized_question.ilike.{kw} %,normalized_question.ilike.% {kw} %,normalized_question.ilike.% {kw}"
                 )
@@ -633,8 +707,6 @@ def library_get(question: str, lang: str = "en") -> Optional[str]:
                 pri = safe_int(r.get("priority"), 0)
 
                 hits = sum(1 for k in keywords if k in cand_tokens)
-
-                # score: prioritize more keyword hits, then priority, then slightly prefer shorter (more specific) questions
                 score = (hits * 100) + (pri * 5) - (min(len(cand_q), 160) // 10)
 
                 if score > best_score:
@@ -647,7 +719,10 @@ def library_get(question: str, lang: str = "en") -> Optional[str]:
         logging.exception("library_get failed")
         return None
 
-def cache_get(question: str, lang: str = "en") -> Optional[str]:
+def cache_get(question: str) -> Optional[str]:
+    if not ENABLE_QA_CACHE:
+        return None
+
     nq = normalize_question(question)
     if not nq:
         return None
@@ -706,13 +781,16 @@ def ai_answer_text(question: str, lang: str = "en") -> str:
         return "Service is temporarily unavailable. Please try again later."
 
     sys = (
-        "You are Naija Hustle Tax Guide. Provide clear, simple, Nigeria-focused tax guidance. "
-        "Avoid jargon unless necessary. Use short bullet points when helpful. "
-        "If unsure, say so and advise confirming with FIRS/State IRS or a professional."
+        "You are Naija Hustle Tax Guide.\n"
+        "Provide Nigeria-focused tax guidance that is clear, professional, and actionable.\n"
+        "Write in Markdown with this structure:\n"
+        "1) ### Direct Answer (2–6 short sentences)\n"
+        "2) ### What to do next (3–6 bullet points)\n"
+        "3) ### Documents to keep (bullets)\n"
+        "4) ### Common mistakes (bullets)\n"
+        "Keep it concise. Avoid legal overconfidence. If uncertain, say so and advise confirming with FIRS/State IRS or a qualified tax professional."
     )
 
-    # Language output (for multi-language expansion: English, Pidgin, Yoruba, Igbo, Hausa)
-    # Note: Library answers are currently stored in English; this only affects AI-generated responses.
     lang = (lang or "en").strip().lower()
     if lang in ("pidgin", "pigin", "naija", "naija pidgin"):
         lang = "pcm"
@@ -747,14 +825,14 @@ def ai_answer_text(question: str, lang: str = "en") -> str:
         }
         r = requests.post(url, headers=headers, json=payload, timeout=35)
         if r.status_code >= 300:
-            logging.warning(f"OpenAI error {r.status_code}: {r.text[:200]}")
-            return "Sorry — I couldn’t generate an AI answer right now. Please try again."
+            logging.warning("OpenAI error %s: %s", r.status_code, (r.text or "")[:200])
+            return "Sorry — I couldn’t generate an answer right now. Please try again."
         data = r.json()
         msg = (((data.get("choices") or [])[0].get("message") or {}).get("content") or "").strip()
-        return msg or "Sorry — I couldn’t generate an AI answer right now. Please try again."
+        return msg or "Sorry — I couldn’t generate an answer right now. Please try again."
     except Exception:
         logging.exception("ai_answer_text failed")
-        return "Sorry — I couldn’t generate an AI answer right now. Please try again."
+        return "Sorry — I couldn’t generate an answer right now. Please try again."
 
 # ------------------------------------------------------------
 # Voice generation + Supabase Storage upload
@@ -779,7 +857,7 @@ def supabase_storage_upload(path: str, content_bytes: bytes, content_type: str =
         }
         r = requests.post(url, headers=headers, data=content_bytes, timeout=45)
         if r.status_code >= 300:
-            logging.warning(f"Storage upload failed {r.status_code}: {r.text[:200]}")
+            logging.warning("Storage upload failed %s: %s", r.status_code, (r.text or "")[:200])
             return None
         return f"{derive_storage_base()}/{path.lstrip('/')}"
     except Exception:
@@ -800,7 +878,7 @@ def openai_tts(text: str, voice_style: str = "default") -> Optional[bytes]:
         }
         r = requests.post(url, headers=headers, json=payload, timeout=60)
         if r.status_code >= 300:
-            logging.warning(f"OpenAI TTS error {r.status_code}: {r.text[:200]}")
+            logging.warning("OpenAI TTS error %s: %s", r.status_code, (r.text or "")[:200])
             return None
         return r.content
     except Exception:
@@ -851,12 +929,17 @@ def voice_cache_set(nq: str, provider: str, style: str, audio_url: str) -> None:
     except Exception:
         logging.exception("voice_cache_set failed")
 
-def ensure_voice_for_text(nq: str, text: str, provider: str, style: str) -> Tuple[Optional[str], bool]:
+def ensure_voice_for_text(nq: str, md_text: str, provider: str, style: str) -> Tuple[Optional[str], bool]:
+    """
+    Generate voice for an answer.
+    Important: the answer is Markdown, so we strip formatting for TTS input.
+    """
     cached_url = voice_cache_get(nq, provider, style)
     if cached_url:
         return cached_url, False
 
-    audio_bytes = openai_tts(text, style) if provider == "openai" else None
+    tts_text = strip_markdown_for_tts(md_text)
+    audio_bytes = openai_tts(tts_text, style) if provider == "openai" else None
     if not audio_bytes:
         return None, False
 
@@ -884,7 +967,6 @@ def enforce_daily_total_limit_or_message(wa_phone: str) -> Optional[str]:
     if used >= limit:
         if is_paid:
             return "You’ve reached today’s limit for your plan. Please try again tomorrow or upgrade your plan."
-        # Free user (no active subscription)
         return "You’ve reached today’s free plan limit. Please try again tomorrow or subscribe via /pricing for higher access."
     return None
 
@@ -892,11 +974,9 @@ def can_use_ai(wa_phone: str, credits_needed: int) -> Tuple[bool, str, Dict[str,
     """AI gating without exposing 'AI' wording to end-users."""
     bal = credit_balance_for_user(wa_phone)
 
-    # If user has no active subscription, we present the same free-limit message
     if not bal.get("active"):
         return False, "You’ve reached today’s free plan limit. Please subscribe via /pricing for higher access.", bal
 
-    # If user is subscribed but has exhausted credits/allowance, present plan-limit message
     if bal.get("remaining", 0) < credits_needed:
         return False, "You’ve reached your current plan limit for this period. Please top up or renew/upgrade via /pricing.", bal
 
@@ -905,52 +985,62 @@ def can_use_ai(wa_phone: str, credits_needed: int) -> Tuple[bool, str, Dict[str,
 # ------------------------------------------------------------
 # Core resolver
 # ------------------------------------------------------------
-def resolve_answer(wa_phone: str, question: str, mode: str, voice_provider: str, voice_style: str, lang: str = "en") -> Dict[str, Any]:
+def resolve_answer(
+    wa_phone: str,
+    question: str,
+    mode: str,
+    voice_provider: str,
+    voice_style: str,
+    lang: str = "en",
+) -> Dict[str, Any]:
     wa_phone = normalize_phone(wa_phone)
     question = (question or "").strip()
     nq = normalize_question(question)
 
     msg = enforce_daily_total_limit_or_message(wa_phone)
     if msg:
-        return {"ok": True, "answer_text": msg, "audio_url": None, "credits_used": 0, "meta": {"source": "limit"}}
+        formatted = format_markdown_answer(question, msg)
+        return {"ok": True, "answer_text": formatted, "audio_url": None, "credits_used": 0, "meta": {"source": "limit"}}
 
     # 1) library
     lib_ans = library_get(question, lang)
     if lib_ans:
+        formatted = format_markdown_answer(question, lib_ans)
         daily_total_usage_inc(wa_phone, 1)
         ai_daily_usage_inc(wa_phone, total_inc=1, ai_inc=0)
 
         if mode == "voice":
-            audio_url, generated_now = ensure_voice_for_text(nq, lib_ans, voice_provider, voice_style)
+            audio_url, generated_now = ensure_voice_for_text(nq, formatted, voice_provider, voice_style)
             credits_used = 0
             if generated_now:
                 allowed, _, _ = can_use_ai(wa_phone, VOICE_CACHED_FIRST_GEN_COST)
                 if not allowed:
-                    return {"ok": True, "answer_text": lib_ans, "audio_url": None, "credits_used": 0, "meta": {"source": "library", "voice": "blocked"}}
+                    return {"ok": True, "answer_text": formatted, "audio_url": None, "credits_used": 0, "meta": {"source": "library", "voice": "blocked"}}
                 credits_used = VOICE_CACHED_FIRST_GEN_COST
                 ledger_add(wa_phone, "tts_cached_gen", -credits_used, {"source": "library", "nq": nq})
-            return {"ok": True, "answer_text": lib_ans, "audio_url": audio_url, "credits_used": credits_used, "meta": {"source": "library"}}
+            return {"ok": True, "answer_text": formatted, "audio_url": audio_url, "credits_used": credits_used, "meta": {"source": "library"}}
 
-        return {"ok": True, "answer_text": lib_ans, "audio_url": None, "credits_used": 0, "meta": {"source": "library"}}
+        return {"ok": True, "answer_text": formatted, "audio_url": None, "credits_used": 0, "meta": {"source": "library"}}
 
     # 2) cache
     cached = cache_get(question)
     if cached:
+        formatted = format_markdown_answer(question, cached)
         daily_total_usage_inc(wa_phone, 1)
         ai_daily_usage_inc(wa_phone, total_inc=1, ai_inc=0)
 
         if mode == "voice":
-            audio_url, generated_now = ensure_voice_for_text(nq, cached, voice_provider, voice_style)
+            audio_url, generated_now = ensure_voice_for_text(nq, formatted, voice_provider, voice_style)
             credits_used = 0
             if generated_now:
                 allowed, _, _ = can_use_ai(wa_phone, VOICE_CACHED_FIRST_GEN_COST)
                 if not allowed:
-                    return {"ok": True, "answer_text": cached, "audio_url": None, "credits_used": 0, "meta": {"source": "cache", "voice": "blocked"}}
+                    return {"ok": True, "answer_text": formatted, "audio_url": None, "credits_used": 0, "meta": {"source": "cache", "voice": "blocked"}}
                 credits_used = VOICE_CACHED_FIRST_GEN_COST
                 ledger_add(wa_phone, "tts_cached_gen", -credits_used, {"source": "cache", "nq": nq})
-            return {"ok": True, "answer_text": cached, "audio_url": audio_url, "credits_used": credits_used, "meta": {"source": "cache"}}
+            return {"ok": True, "answer_text": formatted, "audio_url": audio_url, "credits_used": credits_used, "meta": {"source": "cache"}}
 
-        return {"ok": True, "answer_text": cached, "audio_url": None, "credits_used": 0, "meta": {"source": "cache"}}
+        return {"ok": True, "answer_text": formatted, "audio_url": None, "credits_used": 0, "meta": {"source": "cache"}}
 
     # 3) AI fallback
     credits_needed = VOICE_AI_COST if mode == "voice" else TEXT_AI_COST
@@ -959,9 +1049,11 @@ def resolve_answer(wa_phone: str, question: str, mode: str, voice_provider: str,
         daily_total_usage_inc(wa_phone, 1)
         ai_daily_usage_inc(wa_phone, total_inc=1, ai_inc=0)
         msg = f"{reason}\n\nPlease subscribe to continue asking questions."
-        return {"ok": True, "answer_text": msg, "audio_url": None, "credits_used": 0, "meta": {"source": "ai_blocked"}}
+        formatted = format_markdown_answer(question, msg)
+        return {"ok": True, "answer_text": formatted, "audio_url": None, "credits_used": 0, "meta": {"source": "ai_blocked"}}
 
-    ans = ai_answer_text(question, lang=lang)
+    ans_raw = ai_answer_text(question, lang=lang)
+    ans = format_markdown_answer(question, ans_raw)
     cache_set(question, ans)
 
     ledger_kind = "ai_voice" if mode == "voice" else "ai_text"
@@ -1027,9 +1119,8 @@ def ask():
             "audio_url": result.get("audio_url"),
             "plan_expiry": get_plan_expiry_iso(wa_phone),
         })
-    except Exception as e:
+    except Exception:
         logging.exception("ASK failed wa_phone=%s lang=%s mode=%s", wa_phone, lang, mode)
-        # Never expose internal wording to the end user.
         return jsonify({
             "ok": False,
             "error": "Something went wrong while processing your request. Please try again.",
@@ -1146,7 +1237,7 @@ def paystack_webhook():
     pay_row = supabase.table("payments").select("*").eq("reference", reference).limit(1).execute()
     rows = pay_row.data or []
     if not rows:
-        logging.warning(f"Webhook reference not found in payments: {reference}")
+        logging.warning("Webhook reference not found in payments: %s", reference)
         return "ok", 200
 
     pay = rows[0]
@@ -1158,7 +1249,7 @@ def paystack_webhook():
     plan = plan or meta.get("plan")
 
     if not wa_phone or not plan:
-        logging.warning(f"Webhook missing wa_phone/plan for reference={reference}")
+        logging.warning("Webhook missing wa_phone/plan for reference=%s", reference)
         return "ok", 200
 
     if is_success:
@@ -1292,7 +1383,7 @@ def whatsapp_webhook_verify():
     mode = request.args.get("hub.mode", "")
     token = request.args.get("hub.verify_token", "")
     challenge = request.args.get("hub.challenge", "")
-    logging.info(f"WA_VERIFY_HIT mode={mode} token_len={len(token)} has_challenge={bool(challenge)}")
+    logging.info("WA_VERIFY_HIT mode=%s token_len=%s has_challenge=%s", mode, len(token), bool(challenge))
     if mode == "subscribe" and token and WHATSAPP_VERIFY_TOKEN and token == WHATSAPP_VERIFY_TOKEN:
         return challenge, 200
     return "forbidden", 403
@@ -1300,7 +1391,7 @@ def whatsapp_webhook_verify():
 @app.post("/whatsapp/webhook")
 def whatsapp_webhook_inbound():
     payload = request.get_json(silent=True) or {}
-    logging.info(f"WA_WEBHOOK_HIT keys={list(payload.keys())}")
+    logging.info("WA_WEBHOOK_HIT keys=%s", list(payload.keys()))
 
     try:
         entry = (payload.get("entry") or [])[0]
@@ -1320,8 +1411,8 @@ def whatsapp_webhook_inbound():
             text_body = ((msg.get("text") or {}).get("body") or "").strip()
 
         if from_phone and text_body:
-            result = resolve_answer(from_phone, text_body, "text", "openai", "default")
-            ok, info = send_whatsapp_text(from_phone, result.get("answer_text") or "OK")
-            logging.info(f"WA_REPLY ok={ok} info={info}")
+            result = resolve_answer(from_phone, text_body, "text", "openai", "default", "en")
+            ok, info = send_whatsapp_text(from_phone, strip_markdown_for_tts(result.get("answer_text") or "OK"))
+            logging.info("WA_REPLY ok=%s info=%s", ok, info)
 
     return "ok", 200
