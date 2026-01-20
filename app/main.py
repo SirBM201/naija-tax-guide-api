@@ -1068,6 +1068,95 @@ def resolve_answer(
 
     return {"ok": True, "answer_text": ans, "audio_url": None, "credits_used": credits_needed, "meta": {"source": "ai"}}
 
+# app/main.py (ADD THIS helper)
+
+import re
+
+def _norm(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _is_short_question(q: str) -> bool:
+    return len(_norm(q).split()) <= 3
+
+def _tin_who_policy(q: str) -> str:
+    return (
+        "### Direct Answer\n"
+        "**TIN is not something you “pay”.** It is a **Tax Identification Number** you **register for**.\n\n"
+        "**Who should get a TIN in Nigeria?**\n"
+        "- **Individuals** earning taxable income (salary, business, freelance, contracts)\n"
+        "- **Sole proprietors** and **partnerships** doing business\n"
+        "- **Companies** registered with CAC (TIN is often issued alongside/after registration processes)\n"
+        "- Anyone who needs to **file taxes**, open **business bank accounts**, bid for **contracts**, or do formal business transactions that require tax identity\n\n"
+        "### What I need from you (to be specific)\n"
+        "- Are you an **individual** or a **business/company**?\n"
+        "- Which **state** are you operating from?\n\n"
+        "_Disclaimer: This is general guidance. For binding advice, confirm with FIRS / your State IRS or a qualified tax professional._"
+    )
+
+def _answer_quality_gate(question: str, answer: str) -> bool:
+    """
+    Non-AI relevance check:
+    - If question mentions 'tin', answer must mention 'tin' or 'tax identification'
+    - If question asks 'who', answer should include 'individual'/'business'/'company' or similar
+    """
+    q = _norm(question)
+    a = _norm(answer)
+
+    if "tin" in q:
+        if not ("tin" in a or "tax identification" in a):
+            return False
+
+    if q.startswith("who") or " who " in q:
+        if not any(k in a for k in ["individual", "business", "company", "employer", "employee", "taxpayer"]):
+            return False
+
+    return True
+
+def answer_engine_reply(phone: str, text: str) -> str:
+    """
+    This is called by message_router when no flow matches.
+    You can connect it to your existing library/cache/AI code.
+    For now, it fixes TIN and blocks irrelevant answers.
+    """
+
+    q = (text or "").strip()
+    nq = _norm(q)
+
+    # 1) Strong deterministic fix for the common issue you showed
+    if "tin" in nq and any(k in nq for k in ["who", "need", "needs", "should", "pay", "pays"]):
+        return _tin_who_policy(q)
+
+    # 2) If question is too short, request clarification (prevents bad guesses)
+    if _is_short_question(q):
+        return (
+            "### Quick clarification\n"
+            "To answer correctly, please tell me:\n"
+            "- Are you asking as an **individual** or a **business**?\n"
+            "- Which **state** are you in?\n"
+            "- What is the transaction/income involved?\n\n"
+            "_Disclaimer: This is general guidance. For binding advice, confirm with FIRS / your State IRS or a qualified tax professional._"
+        )
+
+    # 3) Use your existing resolver here (library/cache/AI)
+    #    Replace the line below with your real call, e.g.:
+    #    ans = resolve_answer(phone, q, mode="text", voice_provider="openai", voice_style="default", lang="en")["answer_text"]
+    ans = "I’m ready to answer, but your resolver is not wired here yet."
+
+    # 4) Quality gate: if answer is not relevant, ask clarification instead
+    if not _answer_quality_gate(q, ans):
+        return (
+            "### I need one quick detail\n"
+            "I want to be accurate. Please clarify:\n"
+            "- Are you asking as an **individual** or a **business/company**?\n"
+            "- Which **state** are you operating from?\n\n"
+            "_Disclaimer: This is general guidance. For binding advice, confirm with FIRS / your State IRS or a qualified tax professional._"
+        )
+
+    return ans
+
 # ------------------------------------------------------------
 # Health / Debug
 # ------------------------------------------------------------
