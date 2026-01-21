@@ -1,18 +1,15 @@
 # app/main.py
 # ============================================================
 # Naija Tax Guide – Production Main App
-# (Single-file, copy‑replace safe)
+# Implements a 7‑Layer Professional Answer Framework
 # ============================================================
 
 import os
 import re
 import json
-import hmac
-import hashlib
 import logging
-import uuid
-from datetime import datetime, timedelta, timezone, date
-from typing import Any, Optional, Dict, Tuple, List
+from datetime import datetime, timezone
+from typing import Optional
 
 import requests
 from flask import Flask, request, jsonify
@@ -20,51 +17,23 @@ from flask_cors import CORS
 from supabase import create_client
 
 # ------------------------------------------------------------
-# App
+# App & Logging
 # ------------------------------------------------------------
 app = Flask(__name__)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    force=True,
-)
-
-# ------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------
-def now_utc() -> datetime:
-    return datetime.now(timezone.utc)
-
-def iso(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).isoformat()
-
-def today_utc() -> date:
-    return now_utc().date()
-
-def normalize_phone(raw: str) -> str:
-    return (raw or "").replace("+", "").replace(" ", "").strip()
-
-def safe_int(x: Any, default: int = 0) -> int:
-    try:
-        return int(x)
-    except Exception:
-        return default
-
-def parse_iso_dt(s: Any) -> Optional[datetime]:
-    if not s:
-        return None
-    try:
-        return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
-    except Exception:
-        return None
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", force=True)
 
 # ------------------------------------------------------------
 # ENV
 # ------------------------------------------------------------
-SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+# ------------------------------------------------------------
+# CORS
+# ------------------------------------------------------------
+CORS(app)
 
 # ------------------------------------------------------------
 # Supabase
@@ -72,98 +41,93 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 # ------------------------------------------------------------
-# Markdown formatter (NON‑AI)
+# Helpers
 # ------------------------------------------------------------
+def now_utc():
+    return datetime.now(timezone.utc).isoformat()
+
+def normalize_question(q: str) -> str:
+    q = (q or "").lower()
+    q = re.sub(r"[^a-z0-9\s]", " ", q)
+    return re.sub(r"\s+", " ", q).strip()
+
 DISCLAIMER = (
-    "_Disclaimer: This is general guidance. For binding advice, confirm with FIRS / your State IRS "
-    "or a qualified tax professional._"
+    "_Disclaimer: This is general guidance. "
+    "Confirm with FIRS / State IRS or a qualified tax professional._"
 )
 
-def format_markdown_answer(question: str, raw_answer: str) -> str:
-    a = (raw_answer or "").strip()
-    if not a:
-        return (
-            "### Direct Answer\n"
-            "I need more details to answer correctly.\n\n"
-            "- Are you an **individual** or a **business**?\n"
-            "- Which **state** are you in?\n\n"
-            f"{DISCLAIMER}"
-        )
+def format_answer(question: str, answer: str) -> str:
+    return f"""
+**Jurisdiction:** Nigeria (FIRS / State IRS)
 
-    if "###" in a:
-        return f"{a}\n\n{DISCLAIMER}"
+### Direct Answer
+{answer}
 
-    return (
-        f"### Direct Answer\n{a}\n\n"
-        "### What to do next\n"
-        "- Confirm your state tax authority\n"
-        "- Keep records and receipts\n\n"
-        "### Common mistakes\n"
-        "- Filing with wrong authority\n"
-        "- Poor documentation\n\n"
-        f"{DISCLAIMER}"
-    )
+### Who Is Responsible?
+- Final consumers bear VAT cost
+- Businesses collect and remit
+
+### Exemptions
+- Basic food items
+- Medical services
+- Educational services
+
+### Compliance Checklist
+- Confirm registration
+- Check exemptions
+- File returns on time
+
+### Clarification Needed
+- Individual or business?
+- State of operation?
+
+{DISCLAIMER}
+""".strip()
 
 # ------------------------------------------------------------
-# AI (fallback only)
+# AI
 # ------------------------------------------------------------
-def ai_answer_text(question: str) -> str:
+def ai_answer(question: str) -> str:
     if not OPENAI_API_KEY:
-        return "Service temporarily unavailable."
-
+        return "AI temporarily unavailable."
     payload = {
-        "model": "gpt-4o-mini",
+        "model": OPENAI_MODEL,
         "messages": [
-            {"role": "system", "content": "You are a Nigerian tax assistant. Respond professionally in Markdown."},
-            {"role": "user", "content": question},
+            {"role": "system", "content": "You are a Nigerian tax assistant."},
+            {"role": "user", "content": question[:2000]},
         ],
         "temperature": 0.2,
     }
-
-    r = requests.post(
-        "https://api.openai.com/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json=payload,
-        timeout=30,
-    )
-
-    if r.status_code >= 300:
-        return "Unable to generate answer at the moment."
-
-    return r.json()["choices"][0]["message"]["content"]
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload, timeout=30)
+    data = r.json()
+    return data["choices"][0]["message"]["content"].strip()
 
 # ------------------------------------------------------------
-# Core Resolver
+# Resolver
 # ------------------------------------------------------------
-def resolve_answer(phone: str, question: str) -> str:
-    # (Library + cache would sit here)
-    ai_raw = ai_answer_text(question)
-    return format_markdown_answer(question, ai_raw)
+def resolve_answer(question: str) -> str:
+    nq = normalize_question(question)
+    res = supabase.table("qa_library").select("answer").eq("normalized_question", nq).limit(1).execute().data
+    if res:
+        return format_answer(question, res[0]["answer"])
+    return format_answer(question, ai_answer(question))
 
 # ------------------------------------------------------------
 # Routes
 # ------------------------------------------------------------
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "time": iso(now_utc())})
+    return jsonify({"ok": True, "time": now_utc()})
 
 @app.post("/ask")
 def ask():
     body = request.get_json(silent=True) or {}
-    wa_phone = normalize_phone(body.get("wa_phone"))
-    question = (body.get("question") or "").strip()
+    q = (body.get("question") or "").strip()
+    if not q:
+        return jsonify({"ok": False, "error": "question required"}), 400
+    return jsonify({"ok": True, "answer": resolve_answer(q)})
 
-    if not wa_phone or not question:
-        return jsonify({"ok": False, "error": "wa_phone and question required"}), 400
-
-    answer = resolve_answer(wa_phone, question)
-
-    return jsonify({
-        "ok": True,
-        "answer": answer,
-        "audio_url": None,
-        "plan_expiry": None,
-    })
+# ------------------------------------------------------------
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
