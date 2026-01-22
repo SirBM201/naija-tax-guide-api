@@ -22,16 +22,16 @@ app = Flask(__name__)
 
 # Ensure logs always go to stdout on Koyeb (Gunicorn captures stdout/stderr)
 logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    force=True,
+)
 
 # ------------------------------------------------------------
 # Optional Supabase RPC availability cache
 # ------------------------------------------------------------
 _RPC_AVAILABLE = None  # None=unknown, False=missing, True=available
 _RPC_MISSING_LOGGED = False
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    force=True,
-)
 
 def _env_bool(name: str, default: bool = False) -> bool:
     """Parse common truthy/falsey strings from environment variables."""
