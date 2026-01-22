@@ -516,29 +516,24 @@ def ai_daily_usage_inc(wa_phone: str, total_inc: int = 1, ai_inc: int = 0) -> No
 # ------------------------------------------------------------
 # Credit ledger
 # ------------------------------------------------------------
-def ledger_add(wa_phone: str, kind: str, credits_delta: int, meta: Optional[Dict[str, Any]] = None) -> None:
-    if not _ai_ledger_available():
+
+def ledger_add(wa_phone: str, credits_delta: int, reason: str) -> None:
+    """
+    Optional: record credit movements. Safe no-op unless ENABLE_AI_LEDGER=1.
+    """
+    if not LEDGER_ENABLED:
         return
     try:
-        supabase.table("ai_credit_ledger").insert({
+        supabase.table(AI_CREDIT_LEDGER_TABLE).insert({
             "wa_phone": wa_phone,
-            "kind": kind,
             "credits_delta": credits_delta,
-            "meta": meta or {},
+            "reason": reason,
             "event_at": iso(now_utc()),
         }).execute()
     except Exception:
-        logging.exception("ledger_add failed")
-        return
+        # If the table doesn't exist (or schema differs), we do not break the app.
+        logging.warning("ledger_add skipped (table missing or schema mismatch).")
 
-
-    # 2) English
-    v = (row.get("answer_en") or "").strip()
-    if v:
-        return v
-
-    # 3) old single-column answer
-    return (row.get("answer") or "").strip()
 
 def expand_queries(nq: str) -> List[str]:
     out = [nq]
@@ -894,19 +889,46 @@ def voice_cache_get(nq: str, provider: str, style: str) -> Optional[str]:
         logging.exception("voice_cache_get failed")
         return None
 
-def voice_cache_set(nq: str, provider: str, style: str, audio_url: str) -> None:
+
+def voice_cache_set(normalized_question: str, voice_provider: str, voice_style: str, audio_url: str) -> None:
+    """
+    Persist audio cache. Some Supabase setups may not have a UNIQUE constraint on
+    (normalized_question, voice_provider, voice_style), so we cannot rely on ON CONFLICT.
+    We therefore do a simple "select-then-update-else-insert".
+    """
     try:
-        supabase.table("voice_cache").upsert({
-            "normalized_question": nq,
-            "voice_provider": provider,
-            "voice_style": style,
+        existing = (
+            supabase.table("voice_cache")
+            .select("id")
+            .eq("normalized_question", normalized_question)
+            .eq("voice_provider", voice_provider)
+            .eq("voice_style", voice_style)
+            .limit(1)
+            .execute()
+        ).data or []
+        if existing:
+            row_id = existing[0].get("id")
+            if row_id:
+                supabase.table("voice_cache").update({
+                    "audio_url": audio_url,
+                    "use_count": 0,
+                    "updated_at": iso(now_utc()),
+                }).eq("id", row_id).execute()
+                return
+
+        # Fallback insert
+        supabase.table("voice_cache").insert({
+            "normalized_question": normalized_question,
+            "voice_provider": voice_provider,
+            "voice_style": voice_style,
             "audio_url": audio_url,
             "use_count": 0,
             "created_at": iso(now_utc()),
-            "last_used_at": iso(now_utc()),
-        }, on_conflict="normalized_question,voice_provider,voice_style").execute()
+            "updated_at": iso(now_utc()),
+        }).execute()
     except Exception:
         logging.exception("voice_cache_set failed")
+
 
 def ensure_voice_for_text(nq: str, md_text: str, provider: str, style: str) -> Tuple[Optional[str], bool]:
     """
