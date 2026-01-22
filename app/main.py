@@ -1673,61 +1673,6 @@ def tg_send_audio(chat_id: int, audio_url: str, caption: str = "") -> Tuple[bool
     except Exception as e:
         return False, f"sendAudio exception: {str(e)[:200]}"
 
-@app.post("/telegram/webhook/<secret>")
-def telegram_webhook(secret: str):
-    # 1) Basic secret protection (recommended)
-    if TELEGRAM_WEBHOOK_SECRET:
-        if secret != TELEGRAM_WEBHOOK_SECRET:
-            return "forbidden", 403
-
-    update = request.get_json(silent=True) or {}
-
-    # Telegram can send different update types; we focus on text messages.
-    msg = update.get("message") or update.get("edited_message") or {}
-    if not msg:
-        return "ok", 200
-
-    chat = msg.get("chat") or {}
-    chat_id = chat.get("id")
-    if chat_id is None:
-        return "ok", 200
-
-    text = (msg.get("text") or "").strip()
-    if not text:
-        # Optionally handle stickers/voice/photos later
-        return "ok", 200
-
-    # Commands
-    if text in ("/start", "/help"):
-        help_text = (
-            "Welcome to Naija Tax Guide.\n\n"
-            "Send your tax question in plain text and I will reply.\n"
-            "Example: Who pays VAT?\n\n"
-            "Note: This is general guidance. Confirm with FIRS/State IRS or a qualified professional."
-        )
-        tg_send_message(int(chat_id), help_text)
-        return "ok", 200
-
-    # Reuse the answer engine.
-    # For Telegram, we use chat_id as an identifier (not a phone number). We normalize it into a pseudo-id.
-    # This keeps usage tracking consistent without exposing anything to the user.
-    pseudo_phone = f"tg_{chat_id}"
-    try:
-        # Telegram: keep answers short-ish (Telegram UI is fine, but avoid extremely long replies).
-        ans_md = answer_engine_reply(pseudo_phone, text, lang="en")
-        ans_plain = strip_markdown_for_tts(ans_md)  # safer for Telegram (avoid Markdown parsing issues)
-
-        ok, info = tg_send_message(int(chat_id), ans_plain)
-
-        # OPTIONAL: if your engine returned a voice URL (future), you can send audio too.
-        # For now we only send text to keep it stable.
-        logging.info("TG_REPLY ok=%s info=%s chat_id=%s", ok, info, chat_id)
-    except Exception:
-        logging.exception("telegram_webhook failed")
-        # Fail-safe reply
-        tg_send_message(int(chat_id), "Sorry — something went wrong. Please try again.")
-    return "ok", 200
-
 
 @app.post("/telegram/webhook")
 def telegram_webhook_no_secret():
