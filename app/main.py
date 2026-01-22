@@ -66,6 +66,19 @@ SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
 # RPC search minimum similarity (used by Supabase RPC qa_library_search)
 RPC_MIN_SIM = float(os.getenv("RPC_MIN_SIM", "0.55"))
 
+# Columns to fetch from qa_library for multi-language answers
+ANSWER_COLS = "answer,answer_en,answer_pcm,answer_yo,answer_ig,answer_ha"
+
+# Fallback synonym map (used by expand_queries). Keep small and safe.
+SYNONYMS = globals().get("SYNONYMS") or {
+    # tax abbreviations
+    "wht": ["withholding tax", "with-holding tax"],
+    "vat": ["value added tax", "value-added tax"],
+    "paye": ["pay as you earn", "pay-as-you-earn"],
+    "tin": ["tax identification number"],
+}
+
+
 
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
 
