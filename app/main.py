@@ -1079,9 +1079,11 @@ def resolve_answer(
     wa_phone: str,
     question: str,
     mode: str,
-    voice_provider: str,
-    voice_style: str,
+    voice_provider: str = "openai",
+    voice_style: str = "default",
     lang: str = "en",
+    source: str = "web",
+    **_ignored: Any,
 ) -> Dict[str, Any]:
     wa_phone = normalize_phone(wa_phone)
     question = (question or "").strip()
