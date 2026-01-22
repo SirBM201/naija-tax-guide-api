@@ -11,6 +11,7 @@ from typing import Any, Optional, Dict, Tuple, List
 
 import requests
 from flask import Flask, request, jsonify
+from werkzeug.exceptions import HTTPException
 from flask_cors import CORS
 from supabase import create_client
 
@@ -41,6 +42,10 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 @app.errorhandler(Exception)
 def _handle_unexpected(err):
+    # Let Flask/Werkzeug handle HTTP errors (404/405/etc.) properly.
+    if isinstance(err, HTTPException):
+        return jsonify({"ok": False, "error": err.name}), err.code
+
     # Always log stacktrace, but return a safe message to the client
     logging.exception("Unhandled error: %s", err)
     return jsonify({"ok": False, "error": "Something went wrong while processing your request. Please try again."}), 500
@@ -1613,6 +1618,21 @@ def telegram_webhook(secret: str):
         # Fail-safe reply
         tg_send_message(int(chat_id), "Sorry — something went wrong. Please try again.")
     return "ok", 200
+
+
+@app.post("/telegram/webhook")
+def telegram_webhook_no_secret():
+    # Compatibility endpoint: allows webhook URL without /<secret>.
+    # If TELEGRAM_WEBHOOK_SECRET is set, enforce it via Telegram's secret header.
+    expected = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
+    if expected:
+        got = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "").strip()
+        if not got or got != expected:
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    # Call the main handler with a placeholder secret (it will pass because we already checked above).
+    return telegram_webhook(secret=expected or "no-secret")
+
 
 @app.get("/telegram/webhook-info")
 def telegram_webhook_info():
