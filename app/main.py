@@ -31,6 +31,7 @@ logging.basicConfig(
 # Optional Supabase RPC availability cache
 # ------------------------------------------------------------
 _RPC_AVAILABLE = None  # None=unknown, False=missing, True=available
+_AI_LEDGER_AVAILABLE = None  # None=unknown, False=missing, True=available
 _RPC_MISSING_LOGGED = False
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -516,153 +517,20 @@ def ai_daily_usage_inc(wa_phone: str, total_inc: int = 1, ai_inc: int = 0) -> No
 # Credit ledger
 # ------------------------------------------------------------
 def ledger_add(wa_phone: str, kind: str, credits_delta: int, meta: Optional[Dict[str, Any]] = None) -> None:
+    if not _ai_ledger_available():
+        return
     try:
         supabase.table("ai_credit_ledger").insert({
-            "wa_phone": normalize_phone(wa_phone),
-            "event_at": iso(now_utc()),
+            "wa_phone": wa_phone,
             "kind": kind,
-            "credits_delta": int(credits_delta),
+            "credits_delta": credits_delta,
             "meta": meta or {},
+            "event_at": iso(now_utc()),
         }).execute()
     except Exception:
         logging.exception("ledger_add failed")
+        return
 
-def credits_used_in_period(wa_phone: str, start: datetime, end: datetime) -> int:
-    try:
-        res = (
-            supabase.table("ai_credit_ledger")
-            .select("credits_delta,event_at")
-            .eq("wa_phone", normalize_phone(wa_phone))
-            .gte("event_at", iso(start))
-            .lte("event_at", iso(end))
-            .execute()
-        )
-        rows = res.data or []
-        used = 0
-        for r in rows:
-            delta = safe_int(r.get("credits_delta"), 0)
-            if delta < 0:
-                used += abs(delta)
-        return used
-    except Exception:
-        logging.exception("credits_used_in_period failed")
-        return 0
-
-def topups_in_period(wa_phone: str, start: datetime, end: datetime) -> int:
-    try:
-        res = (
-            supabase.table("ai_credit_ledger")
-            .select("credits_delta,event_at")
-            .eq("wa_phone", normalize_phone(wa_phone))
-            .gte("event_at", iso(start))
-            .lte("event_at", iso(end))
-            .execute()
-        )
-        rows = res.data or []
-        added = 0
-        for r in rows:
-            delta = safe_int(r.get("credits_delta"), 0)
-            if delta > 0:
-                added += delta
-        return added
-    except Exception:
-        logging.exception("topups_in_period failed")
-        return 0
-
-def credit_balance_for_user(wa_phone: str) -> Dict[str, Any]:
-    # internal, not returned to regular users
-    sub = get_subscription_row(wa_phone)
-    active = is_subscription_active(sub)
-    if not active:
-        return {"active": False, "remaining": 0}
-
-    plan = (sub.get("plan") or "monthly").lower()
-    period_end = parse_iso_dt(sub.get("expires_at")) or now_utc()
-    period_start = plan_period_start(sub) or (period_end - timedelta(days=plan_days(plan)))
-
-    allowance = plan_total_credits(plan)
-    used = credits_used_in_period(wa_phone, period_start, period_end)
-    added = topups_in_period(wa_phone, period_start, period_end)
-    remaining = max(0, allowance + added - used)
-
-    return {
-        "active": True,
-        "plan": plan,
-        "period_start": iso(period_start),
-        "period_end": iso(period_end),
-        "allowance": allowance,
-        "used": used,
-        "topups": added,
-        "remaining": remaining,
-    }
-
-# ------------------------------------------------------------
-# QA matching: synonyms + expansions
-# ------------------------------------------------------------
-SYNONYMS: Dict[str, List[str]] = {
-    "vat": ["value added tax", "value-added tax"],
-    "value added tax": ["vat", "value-added tax"],
-
-    "paye": ["pay as you earn", "pay-as-you-earn"],
-    "pay as you earn": ["paye", "pay-as-you-earn"],
-
-    "tin": ["tax identification number"],
-    "tax identification number": ["tin"],
-
-    "firs": ["federal inland revenue service"],
-    "federal inland revenue service": ["firs"],
-
-    "withholding tax": ["wht"],
-    "wht": ["withholding tax"],
-
-    "personal income tax": ["pit"],
-    "pit": ["personal income tax"],
-
-    "company income tax": ["cit"],
-    "cit": ["company income tax"],
-
-    "capital gains tax": ["cgt"],
-    "cgt": ["capital gains tax"],
-}
-
-# ------------------------------------------------------------
-# Multilingual Answers (Library)
-# ------------------------------------------------------------
-SUPPORTED_LANGS = ("en", "pcm", "yo", "ig", "ha")
-ANSWER_COLS = "answer,answer_en,answer_pcm,answer_yo,answer_ig,answer_ha"
-
-LANG_TO_COL = {
-    "en": "answer_en",
-    "pcm": "answer_pcm",
-    "yo": "answer_yo",
-    "ig": "answer_ig",
-    "ha": "answer_ha",
-}
-
-LEGACY_FALLBACK_COLS = {
-    "pcm": ["answer_pidgin"],
-    "ha": ["answer_hausa"],
-    "yo": ["answer_yoruba"],
-    "ig": ["answer_igbo"],
-}
-
-def pick_answer(row: dict, lang: str) -> str:
-    """Pick the best answer text for the requested language with safe fallbacks."""
-    lang = (lang or "en").lower().strip()
-    if lang not in SUPPORTED_LANGS:
-        lang = "en"
-
-    # 1) language-specific
-    col = LANG_TO_COL.get(lang, "answer_en")
-    v = (row.get(col) or "").strip() if isinstance(row, dict) else ""
-    if v:
-        return v
-
-    # 1b) legacy aliases
-    for c in LEGACY_FALLBACK_COLS.get(lang, []):
-        v = (row.get(c) or "").strip()
-        if v:
-            return v
 
     # 2) English
     v = (row.get("answer_en") or "").strip()
@@ -1843,7 +1711,7 @@ def handle_telegram_update(update: Dict[str, Any]) -> None:
             tg_send_message(chat_id, "Please type a question.")
             return
 
-        res = resolve_answer(wa_phone=wa_phone, question=q, mode="text", lang="en", source="telegram")
+        res = resolve_answer(wa_phone=wa_phone, question=q, mode="text", lang="en", voice_provider="none", voice_style="default")
         text_out = res.get("answer") or ""
         meta = res.get("meta") or {}
 
