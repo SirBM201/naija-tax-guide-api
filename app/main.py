@@ -144,6 +144,82 @@ PLAN_RULES = {
 }
 
 # ------------------------------------------------------------
+# Telegram runtime session (lightweight; best-effort)
+# ------------------------------------------------------------
+TELEGRAM_SESSIONS: Dict[str, Dict[str, Any]] = {}  # chat_id -> {"email": str|None, "plan": str|None}
+
+def tg_get_session(chat_id: str) -> Dict[str, Any]:
+    s = TELEGRAM_SESSIONS.get(chat_id)
+    if not s:
+        s = {"email": None, "plan": None}
+        TELEGRAM_SESSIONS[chat_id] = s
+    return s
+
+# ------------------------------------------------------------
+# Paystack helpers (used by Web + Telegram)
+# ------------------------------------------------------------
+def paystack_amount_kobo_for_plan(plan: str) -> int:
+    rule = PLAN_RULES.get(plan)
+    if not rule:
+        raise ValueError("Unknown plan")
+    amount_ngn = int(rule.get("price_ngn") or 0)
+    if amount_ngn <= 0:
+        raise ValueError("Plan price not configured")
+    return amount_ngn * 100  # kobo
+
+def create_paystack_authorization_url(email: str, wa_phone: str, plan: str) -> Tuple[bool, str, Optional[str]]:
+    """
+    Returns: (ok, authorization_url_or_error, reference)
+    """
+    if not PAYSTACK_SECRET_KEY:
+        return False, "PAYSTACK_SECRET_KEY not set", None
+    if not email or "@" not in email:
+        return False, "Valid email is required for payment", None
+    if plan not in PLAN_RULES:
+        return False, "Unknown plan", None
+
+    amount_kobo = paystack_amount_kobo_for_plan(plan)
+
+    # Paystack reference must be unique; embed wa_phone for easy tracing
+    reference = f"NTG-{uuid.uuid4().hex[:10]}"
+
+    callback = PAYSTACK_CALLBACK_URL or (APP_BASE_URL.rstrip("/") + "/paystack/callback" if APP_BASE_URL else "")
+
+    payload = {
+        "email": email,
+        "amount": amount_kobo,
+        "reference": reference,
+        "callback_url": callback if callback else None,
+        "metadata": {
+            "wa_phone": wa_phone,
+            "plan": plan,
+            "source": "telegram" if wa_phone.startswith("tg:") else "web",
+        },
+    }
+    # Remove None callback to avoid Paystack complaints
+    if payload.get("callback_url") is None:
+        payload.pop("callback_url", None)
+
+    headers = {
+        "Authorization": f"Bearer {PAYSTACK_SECRET_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        r = requests.post("https://api.paystack.co/transaction/initialize", headers=headers, json=payload, timeout=25)
+        data = r.json() if r.content else {}
+        if not r.ok or not data.get("status"):
+            return False, (data.get("message") or f"Paystack initialize failed ({r.status_code})"), None
+
+        auth_url = (data.get("data") or {}).get("authorization_url")
+        if not auth_url:
+            return False, "Paystack did not return authorization_url", None
+        return True, auth_url, reference
+    except Exception as e:
+        return False, f"Paystack error: {e}", None
+
+
+# ------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------
 def now_utc() -> datetime:
@@ -1622,19 +1698,190 @@ def telegram_webhook(secret: str):
 
 @app.post("/telegram/webhook")
 def telegram_webhook_no_secret():
-    # Compatibility endpoint: allows webhook URL without /<secret>.
-    # If TELEGRAM_WEBHOOK_SECRET is set, enforce it via Telegram's secret header.
-    expected = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
-    if expected:
-        got = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "").strip()
-        if not got or got != expected:
-            return jsonify({"ok": False, "error": "unauthorized"}), 401
+    """
+    Telegram webhook endpoint.
 
-    # Call the main handler with a placeholder secret (it will pass because we already checked above).
-    return telegram_webhook(secret=expected or "no-secret")
+    If you set `secret_token` on Telegram setWebhook, Telegram will send
+    header: X-Telegram-Bot-Api-Secret-Token. We verify it against TELEGRAM_WEBHOOK_SECRET.
+    """
+    if TELEGRAM_WEBHOOK_SECRET:
+        hdr = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "") or request.headers.get("x-telegram-bot-api-secret-token", "")
+        if not hmac.compare_digest(hdr.strip(), TELEGRAM_WEBHOOK_SECRET.strip()):
+            return "unauthorized", 401
+
+    update = request.get_json(silent=True) or {}
+    try:
+        handle_telegram_update(update)
+    except Exception:
+        logging.exception("Telegram webhook handler error")
+    return "ok", 200
+
+
+@app.post("/telegram/webhook/<secret>")
+def telegram_webhook(secret: str):
+    """
+    Legacy/alternate webhook where secret is part of the URL path.
+    """
+    expected = (TELEGRAM_WEBHOOK_SECRET or "").strip()
+    if expected and not hmac.compare_digest(secret.strip(), expected):
+        return "unauthorized", 401
+
+    update = request.get_json(silent=True) or {}
+    try:
+        handle_telegram_update(update)
+    except Exception:
+        logging.exception("Telegram webhook handler error")
+    return "ok", 200
 
 
 @app.get("/telegram/webhook-info")
+def telegram_webhook_info():
+    """
+    Quick sanity endpoint: tells you whether the server sees TELEGRAM_WEBHOOK_SECRET
+    (masked) and whether TELEGRAM_BOT_TOKEN is set.
+    """
+    return jsonify({
+        "ok": True,
+        "has_bot_token": bool(TELEGRAM_BOT_TOKEN),
+        "has_webhook_secret": bool(TELEGRAM_WEBHOOK_SECRET),
+        "webhook_secret_prefix": (TELEGRAM_WEBHOOK_SECRET or "")[:6] + "…" if TELEGRAM_WEBHOOK_SECRET else None,
+        "telegram_short_mode": TELEGRAM_SHORT_MODE,
+    })
+
+
+def tg_plan_list_text() -> str:
+    items = []
+    for key, rule in PLAN_RULES.items():
+        price = rule.get("price_ngn")
+        if not price:
+            continue
+        items.append(f"- {key}: ₦{int(price):,} / {rule.get('duration_days', DEFAULT_PLAN_DAYS)} days")
+    if not items:
+        return "Plans are not configured yet."
+    return "Available plans:\n" + "\n".join(items)
+
+
+def tg_help_text() -> str:
+    return (
+        "Naija Tax Guide (Telegram)\n\n"
+        "Commands:\n"
+        "/start - welcome\n"
+        "/help - this help\n"
+        "/pricing - show plans\n"
+        "/status - show your subscription expiry\n"
+        "/subscribe <plan> <email> - get a Paystack payment link\n\n"
+        "Or just type your tax question.\n"
+        "Example:\n"
+        "/subscribe basic you@example.com\n"
+    )
+
+
+def tg_parse_intent(text: str) -> Tuple[str, Dict[str, Any]]:
+    t = (text or "").strip()
+    if not t:
+        return "empty", {}
+    tl = t.lower()
+
+    if tl.startswith("/start"):
+        return "start", {}
+    if tl.startswith("/help"):
+        return "help", {}
+    if tl.startswith("/pricing") or tl.startswith("/plans"):
+        return "pricing", {}
+    if tl.startswith("/status"):
+        return "status", {}
+    if tl.startswith("/subscribe"):
+        # /subscribe <plan> <email>
+        parts = t.split()
+        plan = parts[1].strip().lower() if len(parts) >= 2 else ""
+        email = parts[2].strip() if len(parts) >= 3 else ""
+        return "subscribe", {"plan": plan, "email": email}
+
+    return "ask", {"q": t}
+
+
+def handle_telegram_update(update: Dict[str, Any]) -> None:
+    """
+    Main Telegram update handler (intent-based).
+    """
+    msg = update.get("message") or update.get("edited_message") or {}
+    chat = msg.get("chat") or {}
+    chat_id = int(chat.get("id") or 0)
+    if not chat_id:
+        return
+
+    text = (msg.get("text") or "").strip()
+    intent, data = tg_parse_intent(text)
+
+    # Pseudo wa_phone for telegram users (shared with Supabase subscription table)
+    wa_phone = f"tg:{chat_id}"
+
+    if intent in ("start", "help"):
+        tg_send_message(chat_id, tg_help_text())
+        return
+
+    if intent == "pricing":
+        tg_send_message(chat_id, tg_plan_list_text())
+        return
+
+    if intent == "status":
+        sub = get_user_subscription(wa_phone)
+        if sub and sub.get("status") == "active":
+            exp = sub.get("expires_at")
+            tg_send_message(chat_id, f"Your plan is active.\nExpiry: {format_plan_expiry(exp)}")
+        else:
+            tg_send_message(chat_id, "You are not subscribed yet.\n\n" + tg_plan_list_text() + "\n\nUse:\n/subscribe <plan> <email>")
+        return
+
+    if intent == "subscribe":
+        plan = (data.get("plan") or "").strip().lower()
+        email = (data.get("email") or "").strip()
+
+        if not plan or plan not in PLAN_RULES:
+            tg_send_message(chat_id, "Please choose a valid plan.\n\n" + tg_plan_list_text() + "\n\nUse:\n/subscribe <plan> <email>")
+            return
+        if not email or "@" not in email:
+            tg_send_message(chat_id, "Please include a valid email.\nExample:\n/subscribe basic you@example.com")
+            return
+
+        ok, auth_or_err, _ref = create_paystack_authorization_url(email=email, wa_phone=wa_phone, plan=plan)
+        if not ok:
+            tg_send_message(chat_id, f"Payment link error: {auth_or_err}")
+            return
+
+        tg_send_message(
+            chat_id,
+            "Payment link created.\n"
+            "1) Open the link below and complete payment\n"
+            "2) After payment, come back and send /status\n\n"
+            f"{auth_or_err}"
+        )
+        return
+
+    # Default: treat as question
+    if intent == "ask":
+        q = (data.get("q") or "").strip()
+        if not q:
+            tg_send_message(chat_id, "Please type a question.")
+            return
+
+        res = resolve_answer(wa_phone=wa_phone, question=q, mode="text", lang="en", source="telegram")
+        text_out = res.get("answer") or ""
+        meta = res.get("meta") or {}
+
+        # If AI is blocked (not subscribed or quota), add clear payment CTA for Telegram users
+        if meta.get("source") == "ai_blocked":
+            text_out = (
+                text_out.strip()
+                + "\n\n"
+                + "To unlock full answers on Telegram:\n"
+                + tg_plan_list_text()
+                + "\n\nUse:\n/subscribe <plan> <email>"
+            )
+
+        tg_send_message(chat_id, text_out or "Sorry — I could not generate a reply.")
+        return
+
 def telegram_webhook_info():
     # Quick diagnostics endpoint (safe to keep)
     return jsonify({
