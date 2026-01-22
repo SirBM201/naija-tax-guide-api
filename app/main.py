@@ -22,6 +22,12 @@ app = Flask(__name__)
 
 # Ensure logs always go to stdout on Koyeb (Gunicorn captures stdout/stderr)
 logging.basicConfig(
+
+# ------------------------------------------------------------
+# Optional Supabase RPC availability cache
+# ------------------------------------------------------------
+_RPC_AVAILABLE = None  # None=unknown, False=missing, True=available
+_RPC_MISSING_LOGGED = False
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     force=True,
@@ -690,34 +696,61 @@ def expand_queries(nq: str) -> List[str]:
 _RPC_MISSING = set()
 
 def _rpc_best_answer(fn_name: str, norm_query: str, lang: str = "en") -> Optional[str]:
+    """Try pg_trgm RPC if it exists. If not present, fail silently.
+
+    This avoids hard-failing deployments where the function hasn't been created in Supabase.
+    """
+    global _RPC_AVAILABLE, _RPC_MISSING_LOGGED
+
     if not ENABLE_TYPO_TOLERANT:
         return None
     if not norm_query:
         return None
-    if fn_name in _RPC_MISSING:
+
+    if _RPC_AVAILABLE is False:
         return None
+
     try:
         res = supabase.rpc(fn_name, {
             "norm_query": norm_query,
-            "min_sim": SIMILARITY_MIN,
-            "limit_n": 5
+            "limit_n": 1,
+            "min_sim": RPC_MIN_SIM,
         }).execute()
         rows = res.data or []
         if rows:
-            return pick_answer(rows[0], lang)
-        return None
-    except Exception as e:
-        msg = str(e)
-        if "function" in msg and ("does not exist" in msg or "not found" in msg):
-            _RPC_MISSING.add(fn_name)
-            logging.warning("RPC %s not found in Supabase. Falling back to non-similarity search.", fn_name)
-            return None
-        logging.exception("RPC %s failed", fn_name)
+            row = rows[0]
+            _RPC_AVAILABLE = True
+            return pick_answer(row, lang)
+        _RPC_AVAILABLE = True
         return None
 
-# ------------------------------------------------------------
-# QA library + cache
-# ------------------------------------------------------------
+    except Exception as e:
+        payload = None
+        try:
+            payload = e.args[0]
+        except Exception:
+            payload = None
+
+        msg = ""
+        code = ""
+        if isinstance(payload, dict):
+            msg = str(payload.get("message", ""))
+            code = str(payload.get("code", ""))
+        else:
+            msg = str(e)
+
+        missing = ("PGRST202" in msg) or (code == "PGRST202") or ("Could not find the function" in msg) or ("schema cache" in msg)
+
+        if missing:
+            _RPC_AVAILABLE = False
+            if not _RPC_MISSING_LOGGED:
+                _RPC_MISSING_LOGGED = True
+                logging.info("Supabase RPC %s not found; falling back to non-RPC matching.", fn_name)
+            return None
+
+        logging.warning("Supabase RPC %s failed (non-fatal): %s", fn_name, msg)
+        return None
+
 def library_get(question: str, lang: str = "en") -> Optional[str]:
     if not ENABLE_QA_LIBRARY:
         return None
