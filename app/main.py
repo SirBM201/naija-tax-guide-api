@@ -102,6 +102,18 @@ ENABLE_TYPO_TOLERANT = _env_bool("ENABLE_TYPO_TOLERANT", True)
 
 # Similarity threshold used by Supabase RPC search functions (pg_trgm similarity)
 SIMILARITY_MIN = float(os.getenv("SIMILARITY_MIN", "0.25").strip())
+# Query expansion (synonyms / abbreviations)
+# Keep this small and conservative: it is used to broaden exact-match lookups in qa_library/qa_cache.
+SYNONYMS = {
+    # Common Nigerian tax abbreviations
+    "vat": ["value added tax", "value-added tax"],
+    "paye": ["pay as you earn", "pay-as-you-earn"],
+    "wht": ["withholding tax", "with-holding tax", "withholding"],
+    "tin": ["tax identification number"],
+    # Generic
+    "firs": ["federal inland revenue service"],
+    "jtb": ["joint tax board"],
+}
 
 # Credits (locked business rules)
 MONTHLY_AI_CREDITS = 300
