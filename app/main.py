@@ -63,6 +63,10 @@ def _handle_unexpected(err):
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
 
+# RPC search minimum similarity (used by Supabase RPC qa_library_search)
+RPC_MIN_SIM = float(os.getenv("RPC_MIN_SIM", "0.55"))
+
+
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
 
 # Paystack
@@ -517,24 +521,18 @@ def ai_daily_usage_inc(wa_phone: str, total_inc: int = 1, ai_inc: int = 0) -> No
 # Credit ledger
 # ------------------------------------------------------------
 
-def ledger_add(wa_phone: str, credits_delta: int, reason: str) -> None:
-    """
-    Optional: record credit movements. Safe no-op unless ENABLE_AI_LEDGER=1.
-    """
-    if not LEDGER_ENABLED:
-        return
+def ledger_add(wa_phone: str, delta: int, reason: str) -> None:
+    """Add a credit ledger entry if the table exists; otherwise no-op."""
     try:
-        supabase.table(AI_CREDIT_LEDGER_TABLE).insert({
+        supabase.table("ai_credit_ledger").insert({
             "wa_phone": wa_phone,
-            "credits_delta": credits_delta,
+            "credits_delta": int(delta),
             "reason": reason,
             "event_at": iso(now_utc()),
         }).execute()
-    except Exception:
-        # If the table doesn't exist (or schema differs), we do not break the app.
-        logging.warning("ledger_add skipped (table missing or schema mismatch).")
-
-
+    except Exception as e:
+        logging.warning("ledger_add failed (non-fatal): %s", e)
+        return
 def expand_queries(nq: str) -> List[str]:
     out = [nq]
     joined = nq
@@ -891,45 +889,45 @@ def voice_cache_get(nq: str, provider: str, style: str) -> Optional[str]:
 
 
 def voice_cache_set(normalized_question: str, voice_provider: str, voice_style: str, audio_url: str) -> None:
-    """
-    Persist audio cache. Some Supabase setups may not have a UNIQUE constraint on
-    (normalized_question, voice_provider, voice_style), so we cannot rely on ON CONFLICT.
-    We therefore do a simple "select-then-update-else-insert".
+    """Persist voice audio URL without relying on PostgREST upsert conflict targets.
+
+    Supabase/PostgREST upsert with on_conflict requires a UNIQUE constraint. Some DB setups
+    do not yet have that constraint, which causes a 42P10 error. This implementation uses:
+      1) SELECT existing row (if any)
+      2) UPDATE by id, else INSERT
     """
     try:
         existing = (
             supabase.table("voice_cache")
-            .select("id")
+            .select("id,use_count")
             .eq("normalized_question", normalized_question)
             .eq("voice_provider", voice_provider)
             .eq("voice_style", voice_style)
             .limit(1)
             .execute()
-        ).data or []
-        if existing:
-            row_id = existing[0].get("id")
-            if row_id:
-                supabase.table("voice_cache").update({
-                    "audio_url": audio_url,
-                    "use_count": 0,
-                    "updated_at": iso(now_utc()),
-                }).eq("id", row_id).execute()
-                return
+        )
+        rows = getattr(existing, "data", None) or []
+        if rows:
+            vid = rows[0].get("id")
+            uc = int(rows[0].get("use_count") or 0) + 1
+            supabase.table("voice_cache").update({
+                "audio_url": audio_url,
+                "use_count": uc,
+                "last_used_at": iso(now_utc()),
+            }).eq("id", vid).execute()
+            return
 
-        # Fallback insert
         supabase.table("voice_cache").insert({
             "normalized_question": normalized_question,
             "voice_provider": voice_provider,
             "voice_style": voice_style,
             "audio_url": audio_url,
-            "use_count": 0,
-            "created_at": iso(now_utc()),
-            "updated_at": iso(now_utc()),
+            "use_count": 1,
+            "last_used_at": iso(now_utc()),
         }).execute()
     except Exception:
         logging.exception("voice_cache_set failed")
-
-
+        return
 def ensure_voice_for_text(nq: str, md_text: str, provider: str, style: str) -> Tuple[Optional[str], bool]:
     """
     Generate voice for an answer.
@@ -971,21 +969,20 @@ def enforce_daily_total_limit_or_message(wa_phone: str) -> Optional[str]:
         return "You’ve reached today’s free plan limit. Please try again tomorrow or subscribe via /pricing for higher access."
     return None
 
-def can_use_ai(wa_phone: str, credits_needed: int) -> Tuple[bool, str, Dict[str, Any]]:
-    """AI gating without exposing 'AI' wording to end-users."""
-    bal = credit_balance_for_user(wa_phone)
+def can_use_ai(wa_phone: str) -> Tuple[bool, Optional[str]]:
+    """Policy for using AI answers.
 
-    if not bal.get("active"):
-        return False, "You’ve reached today’s free plan limit. Please subscribe via /pricing for higher access.", bal
-
-    if bal.get("remaining", 0) < credits_needed:
-        return False, "You’ve reached your current plan limit for this period. Please top up or renew/upgrade via /pricing.", bal
-
-    return True, "ok", bal
-
-# ------------------------------------------------------------
-# Quality guardrails (deterministic fixes + relevance checks)
-# ------------------------------------------------------------
+    For now, keep this simple and stable:
+    - If subscription is active -> AI allowed
+    - If not subscribed -> blocked with subscribe link
+    """
+    sub = get_user_subscription(wa_phone)
+    status = (sub.get("status") or "").lower()
+    expires_at = sub.get("expires_at")
+    if status == "active" and expires_at:
+        return True, None
+    # free / not subscribed
+    return False, f"To continue, please subscribe here: {PRICING_PATH}"
 def _norm(s: str) -> str:
     s = (s or "").strip().lower()
     s = re.sub(r"[^a-z0-9\s]", " ", s)
