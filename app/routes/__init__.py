@@ -1,1 +1,2 @@
-# Makes app.routes a proper package
+# app/routes/__init__.py
+# Package marker for app.routes
