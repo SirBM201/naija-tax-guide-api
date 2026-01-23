@@ -4,7 +4,7 @@ import logging
 
 from app.core.utils import normalize_phone
 from app.db.subscriptions import get_plan_expiry_iso
-from app.services.engine import resolve_answer  # created below
+from app.services.engine import resolve_answer
 
 bp = Blueprint("ask", __name__)
 
@@ -28,6 +28,7 @@ def ask():
         return jsonify({"ok": False, "error": "question is required"}), 400
 
     logging.info("ASK wa_phone=%s lang=%s mode=%s q=%s", wa_phone, lang, mode, question[:200])
+
     result = resolve_answer(
         wa_phone=wa_phone,
         question=question,
@@ -38,6 +39,7 @@ def ask():
         source="web",
     )
 
+    # You asked previously: user should only see plan expiry (not credits).
     return jsonify({
         "ok": True,
         "answer": result.get("answer_text"),
