@@ -5,4 +5,4 @@ bp = Blueprint("paystack", __name__)
 
 @bp.get("/paystack/health")
 def paystack_health():
-    return jsonify({"ok": True, "module": "paystack_routes"})
+    return jsonify({"ok": True})
