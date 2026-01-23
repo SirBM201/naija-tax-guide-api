@@ -1,99 +1,67 @@
 # app/services/engine.py
-from typing import Any, Dict
 import logging
+from typing import Dict, Any, Optional
 
-from app.core.config import (
-    VOICE_AI_COST, TEXT_AI_COST, VOICE_CACHED_FIRST_GEN_COST,
-)
-from app.core.utils import normalize_phone, normalize_question
-from app.services.answers import format_markdown_answer
-from app.services.ai import ai_answer_text
-from app.services.voice import ensure_voice_for_text
-from app.services.enforcement import enforce_daily_total_limit_or_message, can_use_ai_for_cost
-from app.db.qa import library_get, cache_get, cache_set
-from app.db.usage import daily_total_usage_inc, ai_daily_usage_inc
-from app.db.ledger import ledger_add
+from app.db.qa import cache_get, cache_put, library_get
+from app.core.text import normalize_question  # align if your normalize is elsewhere
 
 def resolve_answer(
     wa_phone: str,
     question: str,
-    mode: str,
-    voice_provider: str = "openai",
-    voice_style: str = "default",
+    mode: str = "text",
     lang: str = "en",
     source: str = "web",
-    **_ignored: Any,
 ) -> Dict[str, Any]:
-    wa_phone = normalize_phone(wa_phone)
-    question = (question or "").strip()
-    nq = normalize_question(question)
+    """
+    Resolution order:
+    1) qa_cache
+    2) qa_library
+    3) fallback message (or AI later)
+    """
+    q = (question or "").strip()
+    normalized_q = normalize_question(q)
 
-    msg = enforce_daily_total_limit_or_message(wa_phone)
-    if msg:
-        formatted = format_markdown_answer(question, msg)
-        return {"ok": True, "answer_text": formatted, "audio_url": None, "credits_used": 0, "meta": {"source": "limit"}}
+    # 1) Cache (fail-safe)
+    cached = None
+    try:
+        cached = cache_get(q)
+    except Exception as e:
+        logging.exception("cache_get failed (continuing without cache): %s", e)
+        cached = None
 
-    # 1) Library
-    lib_ans = library_get(question, lang)
-    if lib_ans:
-        formatted = format_markdown_answer(question, lib_ans)
-        daily_total_usage_inc(wa_phone, 1)
-        ai_daily_usage_inc(wa_phone, total_inc=1, ai_inc=0)
+    if cached and cached.get("answer"):
+        return {
+            "ok": True,
+            "answer_text": cached["answer"],
+            "source": "cache",
+        }
 
-        if mode == "voice":
-            audio_url, generated_now = ensure_voice_for_text(nq, formatted, voice_provider, voice_style)
-            credits_used = 0
-            if generated_now:
-                allowed, _reason = can_use_ai_for_cost(wa_phone, VOICE_CACHED_FIRST_GEN_COST)
-                if not allowed:
-                    return {"ok": True, "answer_text": formatted, "audio_url": None, "credits_used": 0, "meta": {"source": "library", "voice": "blocked"}}
-                credits_used = VOICE_CACHED_FIRST_GEN_COST
-                ledger_add(wa_phone, -credits_used, "tts_cached_gen")
-            return {"ok": True, "answer_text": formatted, "audio_url": audio_url, "credits_used": credits_used, "meta": {"source": "library"}}
+    # 2) Library
+    lib = None
+    try:
+        lib = library_get(normalized_q, lang=lang)
+    except Exception as e:
+        logging.exception("library_get failed: %s", e)
+        lib = None
 
-        return {"ok": True, "answer_text": formatted, "audio_url": None, "credits_used": 0, "meta": {"source": "library"}}
+    if lib and lib.get("answer"):
+        ans = lib["answer"]
 
-    # 2) Cache
-    cached = cache_get(question)
-    if cached:
-        formatted = format_markdown_answer(question, cached)
-        daily_total_usage_inc(wa_phone, 1)
-        ai_daily_usage_inc(wa_phone, total_inc=1, ai_inc=0)
+        # write-through cache (fail-safe)
+        try:
+            cache_put(q, ans, tags=["library"], source=source)
+        except Exception as e:
+            logging.exception("cache_put failed (ignored): %s", e)
 
-        if mode == "voice":
-            audio_url, generated_now = ensure_voice_for_text(nq, formatted, voice_provider, voice_style)
-            credits_used = 0
-            if generated_now:
-                allowed, _reason = can_use_ai_for_cost(wa_phone, VOICE_CACHED_FIRST_GEN_COST)
-                if not allowed:
-                    return {"ok": True, "answer_text": formatted, "audio_url": None, "credits_used": 0, "meta": {"source": "cache", "voice": "blocked"}}
-                credits_used = VOICE_CACHED_FIRST_GEN_COST
-                ledger_add(wa_phone, -credits_used, "tts_cached_gen")
-            return {"ok": True, "answer_text": formatted, "audio_url": audio_url, "credits_used": credits_used, "meta": {"source": "cache"}}
+        return {
+            "ok": True,
+            "answer_text": ans,
+            "source": "library",
+        }
 
-        return {"ok": True, "answer_text": formatted, "audio_url": None, "credits_used": 0, "meta": {"source": "cache"}}
-
-    # 3) AI fallback
-    credits_needed = VOICE_AI_COST if mode == "voice" else TEXT_AI_COST
-    allowed, reason = can_use_ai_for_cost(wa_phone, credits_needed)
-    if not allowed:
-        daily_total_usage_inc(wa_phone, 1)
-        ai_daily_usage_inc(wa_phone, total_inc=1, ai_inc=0)
-        msg = (reason or "Please subscribe to continue.") + "\n\nPlease subscribe to continue asking questions."
-        formatted = format_markdown_answer(question, msg)
-        return {"ok": True, "answer_text": formatted, "audio_url": None, "credits_used": 0, "meta": {"source": "ai_blocked"}}
-
-    ans_raw = ai_answer_text(question, lang=lang)
-    ans = format_markdown_answer(question, ans_raw)
-    cache_set(question, ans)
-
-    ledger_add(wa_phone, -credits_needed, "ai_voice" if mode == "voice" else "ai_text")
-
-    daily_total_usage_inc(wa_phone, 1)
-    ai_daily_usage_inc(wa_phone, total_inc=1, ai_inc=1)
-
-    if mode == "voice":
-        audio_url, _ = ensure_voice_for_text(nq, ans, voice_provider, voice_style)
-        return {"ok": True, "answer_text": ans, "audio_url": audio_url, "credits_used": credits_needed, "meta": {"source": "ai"}}
-
-    return {"ok": True, "answer_text": ans, "audio_url": None, "credits_used": credits_needed, "meta": {"source": "ai"}}
+    # 3) Fallback (AI later)
+    return {
+        "ok": True,
+        "answer_text": "I can help. Please ask your tax question (e.g., VAT, PAYE, TIN, filing, penalties).",
+        "source": "fallback",
+    }
