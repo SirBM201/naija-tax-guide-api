@@ -1,4 +1,3 @@
-# wsgi.py (repo root)
-from app.main import app  # <-- this matches your earlier working command: app.main:app
+from app import create_app
 
-# Gunicorn will load "app" from this file: wsgi:app
+app = create_app()
