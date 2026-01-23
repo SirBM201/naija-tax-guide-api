@@ -2,6 +2,6 @@
 def format_markdown_answer(question: str, answer: str) -> str:
     q = (question or "").strip()
     a = (answer or "").strip()
-    if not q:
-        return a
+    if not a:
+        a = "No answer available."
     return f"**Q:** {q}\n\n**A:** {a}"
