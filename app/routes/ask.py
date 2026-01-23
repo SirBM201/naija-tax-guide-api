@@ -39,7 +39,6 @@ def ask():
         source="web",
     )
 
-    # You asked previously: user should only see plan expiry (not credits).
     return jsonify({
         "ok": True,
         "answer": result.get("answer_text"),
