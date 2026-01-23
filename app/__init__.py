@@ -1,4 +1,3 @@
-# app/__init__.py
 from flask import Flask
 from flask_cors import CORS
 
@@ -22,8 +21,11 @@ def create_app() -> Flask:
     # Register routes (blueprints)
     from app.routes.health import bp as health_bp
     from app.routes.ask import bp as ask_bp
-    from app.routes.paystack_routes import bp as paystack_bp
-    from app.routes.telegram_routes import bp as telegram_bp
+
+    # These two must match your actual file locations:
+    from app.paystack_routes import bp as paystack_bp
+    # If telegram_routes.py is in app/ root, keep this:
+    from app.telegram_routes import bp as telegram_bp
 
     app.register_blueprint(health_bp)
     app.register_blueprint(ask_bp)
@@ -31,4 +33,3 @@ def create_app() -> Flask:
     app.register_blueprint(telegram_bp)
 
     return app
-# empty
