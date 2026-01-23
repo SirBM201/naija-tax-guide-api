@@ -1,14 +1,9 @@
 # app/services/engine.py
-from typing import Any, Dict, Optional, Tuple, List
-import logging
-import hashlib
-
+from typing import Any, Dict
 from app.core.config import (
-    ENABLE_QA_CACHE, ENABLE_QA_LIBRARY, ENABLE_TYPO_TOLERANT,
-    RPC_MIN_SIM,
     VOICE_AI_COST, TEXT_AI_COST, VOICE_CACHED_FIRST_GEN_COST,
 )
-from app.core.utils import normalize_phone, normalize_question, iso, now_utc
+from app.core.utils import normalize_phone, normalize_question
 from app.services.answers import format_markdown_answer
 from app.services.ai import ai_answer_text
 from app.services.voice import ensure_voice_for_text
@@ -16,6 +11,7 @@ from app.services.enforcement import enforce_daily_total_limit_or_message, can_u
 from app.db.qa import library_get, cache_get, cache_set
 from app.db.usage import daily_total_usage_inc, ai_daily_usage_inc
 from app.db.ledger import ledger_add
+
 
 def resolve_answer(
     wa_phone: str,
@@ -47,7 +43,7 @@ def resolve_answer(
             audio_url, generated_now = ensure_voice_for_text(nq, formatted, voice_provider, voice_style)
             credits_used = 0
             if generated_now:
-                allowed, reason = can_use_ai_for_cost(wa_phone, VOICE_CACHED_FIRST_GEN_COST)
+                allowed, _reason = can_use_ai_for_cost(wa_phone, VOICE_CACHED_FIRST_GEN_COST)
                 if not allowed:
                     return {"ok": True, "answer_text": formatted, "audio_url": None, "credits_used": 0, "meta": {"source": "library", "voice": "blocked"}}
                 credits_used = VOICE_CACHED_FIRST_GEN_COST
@@ -67,7 +63,7 @@ def resolve_answer(
             audio_url, generated_now = ensure_voice_for_text(nq, formatted, voice_provider, voice_style)
             credits_used = 0
             if generated_now:
-                allowed, reason = can_use_ai_for_cost(wa_phone, VOICE_CACHED_FIRST_GEN_COST)
+                allowed, _reason = can_use_ai_for_cost(wa_phone, VOICE_CACHED_FIRST_GEN_COST)
                 if not allowed:
                     return {"ok": True, "answer_text": formatted, "audio_url": None, "credits_used": 0, "meta": {"source": "cache", "voice": "blocked"}}
                 credits_used = VOICE_CACHED_FIRST_GEN_COST
@@ -82,7 +78,7 @@ def resolve_answer(
     if not allowed:
         daily_total_usage_inc(wa_phone, 1)
         ai_daily_usage_inc(wa_phone, total_inc=1, ai_inc=0)
-        msg = (reason or "Please subscribe to continue.") + "\n\nPlease subscribe to continue asking questions."
+        msg = (reason or "Please subscribe to continue.")
         formatted = format_markdown_answer(question, msg)
         return {"ok": True, "answer_text": formatted, "audio_url": None, "credits_used": 0, "meta": {"source": "ai_blocked"}}
 
