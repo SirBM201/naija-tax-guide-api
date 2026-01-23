@@ -1,5 +1,5 @@
 # app/__init__.py
-from flask import Flask
+from flask import Flask, jsonify
 from flask_cors import CORS
 
 from app.core.config import allowed_origins
@@ -19,7 +19,7 @@ def create_app() -> Flask:
 
     register_error_handlers(app)
 
-    # Blueprints
+    # Register routes (blueprints)
     from app.routes.health import bp as health_bp
     from app.routes.ask import bp as ask_bp
     from app.routes.paystack_routes import bp as paystack_bp
@@ -29,5 +29,10 @@ def create_app() -> Flask:
     app.register_blueprint(ask_bp)
     app.register_blueprint(paystack_bp)
     app.register_blueprint(telegram_bp)
+
+    # Optional root
+    @app.get("/")
+    def root():
+        return jsonify({"ok": True, "service": "naija-tax-guide-api"})
 
     return app
