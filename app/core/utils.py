@@ -6,12 +6,14 @@ from typing import Any, Optional
 from flask import jsonify, request
 from werkzeug.exceptions import HTTPException
 
+
 def init_logging() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
         force=True,
     )
+
 
 def register_error_handlers(app):
     @app.errorhandler(Exception)
@@ -36,20 +38,29 @@ def register_error_handlers(app):
             pass
         return resp
 
+
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
+
 
 def today_utc() -> date:
     return now_utc().date()
 
+
 def iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat()
+
+
+def iso_date(d: date) -> str:
+    return d.isoformat()
+
 
 def safe_int(x: Any, default: int = 0) -> int:
     try:
         return int(x)
     except Exception:
         return default
+
 
 def parse_iso_dt(s: Any) -> Optional[datetime]:
     if not s:
@@ -59,9 +70,11 @@ def parse_iso_dt(s: Any) -> Optional[datetime]:
     except Exception:
         return None
 
+
 def normalize_phone(raw: str) -> str:
     s = (raw or "").strip()
     return s.replace(" ", "").replace("+", "")
+
 
 def normalize_question(q: str) -> str:
     s = (q or "").strip().lower()
