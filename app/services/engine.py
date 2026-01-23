@@ -1,5 +1,7 @@
 # app/services/engine.py
 from typing import Any, Dict
+import logging
+
 from app.core.config import (
     VOICE_AI_COST, TEXT_AI_COST, VOICE_CACHED_FIRST_GEN_COST,
 )
@@ -11,7 +13,6 @@ from app.services.enforcement import enforce_daily_total_limit_or_message, can_u
 from app.db.qa import library_get, cache_get, cache_set
 from app.db.usage import daily_total_usage_inc, ai_daily_usage_inc
 from app.db.ledger import ledger_add
-
 
 def resolve_answer(
     wa_phone: str,
@@ -78,7 +79,7 @@ def resolve_answer(
     if not allowed:
         daily_total_usage_inc(wa_phone, 1)
         ai_daily_usage_inc(wa_phone, total_inc=1, ai_inc=0)
-        msg = (reason or "Please subscribe to continue.")
+        msg = (reason or "Please subscribe to continue.") + "\n\nPlease subscribe to continue asking questions."
         formatted = format_markdown_answer(question, msg)
         return {"ok": True, "answer_text": formatted, "audio_url": None, "credits_used": 0, "meta": {"source": "ai_blocked"}}
 
