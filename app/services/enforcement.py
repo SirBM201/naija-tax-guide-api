@@ -1,67 +1,41 @@
 # app/services/enforcement.py
-from __future__ import annotations
-
-from typing import Optional, Tuple
-import logging
-from datetime import datetime, timezone
-
-from app.core.config import FREE_DAILY_TOTAL_LIMIT, PAID_DAILY_TOTAL_LIMIT
-from app.core.utils import now_utc
-from app.db.subscriptions import is_subscription_active
-from app.db.usage import daily_total_get
+from app.core.config import FREE_DAILY_TOTAL_LIMIT, PAID_DAILY_TOTAL_LIMIT, MONTHLY_AI_CREDITS
+from app.core.utils import parse_iso_dt, now_utc
+from app.db.subscriptions import get_subscription_row
+from app.db.ledger import ledger_get_balance, ledger_ensure_monthly_topup
+from app.db.usage import get_daily_total_count
 
 
-def enforce_daily_total_limit_or_message(wa_phone: str) -> Optional[str]:
+def enforce_daily_total_limit_or_message(wa_phone: str) -> str | None:
     """
-    Returns a human-readable message if the user has exceeded daily total limit,
-    otherwise None.
+    Returns a message if blocked, else None.
     """
-    try:
-        used = daily_total_get(wa_phone)
-    except Exception as e:
-        logging.warning("daily_total_get failed (non-fatal): %s", e)
-        used = 0
+    sub = get_subscription_row(wa_phone)
+    is_paid = False
+    if sub and (sub.get("status") == "active"):
+        exp = parse_iso_dt(sub.get("expires_at"))
+        if exp and exp > now_utc():
+            is_paid = True
 
-    paid = False
-    try:
-        paid = is_subscription_active(wa_phone)
-    except Exception as e:
-        logging.warning("is_subscription_active failed (non-fatal): %s", e)
-        paid = False
-
-    limit = PAID_DAILY_TOTAL_LIMIT if paid else FREE_DAILY_TOTAL_LIMIT
-
+    limit = PAID_DAILY_TOTAL_LIMIT if is_paid else FREE_DAILY_TOTAL_LIMIT
+    used = get_daily_total_count(wa_phone)
     if used >= limit:
-        if paid:
-            return (
-                f"You have reached your daily usage limit ({limit} answers today). "
-                "Please try again tomorrow."
-            )
-        return (
-            f"You have reached your free daily limit ({limit} answers today). "
-            "Please subscribe to continue."
-        )
-
+        return f"You have reached your daily limit ({limit} questions). Please try again tomorrow."
     return None
 
 
-def can_use_ai_for_cost(wa_phone: str, credits_needed: int) -> Tuple[bool, str]:
+def can_use_ai_for_cost(wa_phone: str, cost: int) -> tuple[bool, str | None]:
     """
-    Returns (allowed, reason).
-    We do NOT enforce monthly credits table yet; we enforce:
-      - daily total limit
-      - subscription required for AI beyond free usage
+    AI usage is controlled by a monthly 'ledger balance'.
+    - Paid users: we auto-topup monthly credits.
+    - Free users: no monthly credits by default (AI blocked unless you manually credit them).
     """
-    msg = enforce_daily_total_limit_or_message(wa_phone)
-    if msg:
-        return False, msg
+    # If paid and active -> ensure monthly topup exists
+    sub = get_subscription_row(wa_phone)
+    if sub and (sub.get("status") == "active"):
+        ledger_ensure_monthly_topup(wa_phone, MONTHLY_AI_CREDITS)
 
-    # If user is subscribed, allow AI (subject to daily total above)
-    try:
-        if is_subscription_active(wa_phone):
-            return True, ""
-    except Exception:
-        pass
-
-    # Not subscribed: block AI usage (library/cache still work)
-    return False, "AI answers are available for subscribed users only."
+    bal = ledger_get_balance(wa_phone)
+    if bal >= cost:
+        return True, None
+    return False, "You have no AI credits remaining. Please subscribe or top up."
