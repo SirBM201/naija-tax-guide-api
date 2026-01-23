@@ -2,6 +2,7 @@
 import os
 from typing import Dict, List
 
+
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
     if raw is None:
@@ -12,6 +13,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if v in ("0", "false", "f", "no", "n", "off", ""):
         return False
     return default
+
 
 # Supabase
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
@@ -31,7 +33,7 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 OPENAI_TTS_MODEL = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts").strip()
 OPENAI_TTS_VOICE = os.getenv("OPENAI_TTS_VOICE", "alloy").strip()
 
-# Storage
+# Storage (optional; safe if unused)
 VOICE_BUCKET = os.getenv("VOICE_BUCKET", "voice-cache").strip()
 SUPABASE_STORAGE_URL = os.getenv("SUPABASE_STORAGE_URL", "").strip()
 VOICE_PUBLIC_BASE = os.getenv("VOICE_PUBLIC_BASE", "").strip()
@@ -51,7 +53,7 @@ RPC_MIN_SIM = float(os.getenv("RPC_MIN_SIM", "0.55"))
 # Answer columns (multi-language)
 ANSWER_COLS = "answer,answer_en,answer_pcm,answer_yo,answer_ig,answer_ha"
 
-# Synonyms
+# Synonyms (simple keyword expansion)
 SYNONYMS: Dict[str, List[str]] = {
     "vat": ["value added tax", "value-added tax"],
     "paye": ["pay as you earn", "pay-as-you-earn"],
@@ -61,11 +63,11 @@ SYNONYMS: Dict[str, List[str]] = {
     "jtb": ["joint tax board"],
 }
 
-# Credits rules
-MONTHLY_AI_CREDITS = 300
-VOICE_AI_COST = 3
-TEXT_AI_COST = 1
-VOICE_CACHED_FIRST_GEN_COST = 1
+# Credits rules (used by enforcement)
+MONTHLY_AI_CREDITS = int(os.getenv("MONTHLY_AI_CREDITS", "300").strip())
+VOICE_AI_COST = int(os.getenv("VOICE_AI_COST", "3").strip())
+TEXT_AI_COST = int(os.getenv("TEXT_AI_COST", "1").strip())
+VOICE_CACHED_FIRST_GEN_COST = int(os.getenv("VOICE_CACHED_FIRST_GEN_COST", "1").strip())
 
 # Pricing path (for messages)
 PRICING_PATH = os.getenv("PRICING_PATH", "/pricing").strip() or "/pricing"
