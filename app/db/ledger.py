@@ -1,45 +1,63 @@
 # app/db/ledger.py
-from __future__ import annotations
-
-import logging
 from typing import Optional
+from datetime import datetime, timezone
 
-from supabase import create_client
-
-from app.core.config import SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
-from app.core.utils import now_utc, iso
+from app.db.supabase_rest import sb_get, sb_post, sb_patch
 
 
-_sb = None
-
-
-def _client():
-    global _sb
-    if _sb is not None:
-        return _sb
-    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-        raise RuntimeError("Supabase ENV not configured (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY).")
-    _sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
-    return _sb
+def ledger_get_balance(wa_phone: str) -> int:
+    rows = sb_get(
+        "ledger",
+        params={
+            "select": "wa_phone,balance,updated_at",
+            "wa_phone": f"eq.{wa_phone}",
+            "limit": "1",
+        },
+    )
+    if not rows:
+        return 0
+    return int(rows[0].get("balance") or 0)
 
 
 def ledger_add(wa_phone: str, delta: int, reason: str) -> None:
     """
-    Write a ledger entry. Non-fatal if table doesn't exist.
+    Updates a single-row ledger per user (wa_phone).
+    Expected table: ledger(wa_phone primary key, balance int, updated_at timestamptz, last_reason text)
     """
-    if not wa_phone:
+    rows = sb_get(
+        "ledger",
+        params={
+            "select": "wa_phone,balance",
+            "wa_phone": f"eq.{wa_phone}",
+            "limit": "1",
+        },
+    )
+    now = datetime.now(timezone.utc).isoformat()
+    if not rows:
+        sb_post("ledger", {"wa_phone": wa_phone, "balance": delta, "updated_at": now, "last_reason": reason})
         return
 
-    sb = _client()
-    payload = {
-        "wa_phone": wa_phone,
-        "delta": int(delta or 0),
-        "reason": (reason or "").strip()[:80],
-        "created_at": iso(now_utc()),
-    }
+    bal = int(rows[0].get("balance") or 0)
+    sb_patch(
+        "ledger",
+        {"balance": bal + delta, "updated_at": now, "last_reason": reason},
+        params={"wa_phone": f"eq.{wa_phone}"},
+    )
 
-    try:
-        sb.table("usage_ledger").insert(payload).execute()
-    except Exception as e:
-        # Don't break the app if ledger table isn't ready
-        logging.warning("ledger_add skipped (non-fatal): %s", e)
+
+def ledger_ensure_monthly_topup(wa_phone: str, monthly_amount: int) -> None:
+    """
+    Simple auto-topup: if user has no ledger row, create with monthly_amount.
+    If row exists and balance is negative/low, do nothing automatically here.
+    You can extend later to reset monthly based on month boundary.
+    """
+    rows = sb_get(
+        "ledger",
+        params={
+            "select": "wa_phone,balance",
+            "wa_phone": f"eq.{wa_phone}",
+            "limit": "1",
+        },
+    )
+    if not rows:
+        ledger_add(wa_phone, monthly_amount, "monthly_topup")
