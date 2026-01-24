@@ -1,5 +1,5 @@
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 from app.db.qa import cache_get, cache_put, library_get
 from app.core.text import normalize_question
@@ -14,18 +14,25 @@ def _db():
     return get_supabase()
 
 
-def _insert_suggestion(q_norm: str, q_raw: str, lang: str, answer: str, source: str, review: Dict[str, Any]) -> None:
+def _insert_suggestion(
+    q_norm: str,
+    q_raw: str,
+    lang: str,
+    answer: str,
+    source: str,
+    review: Dict[str, Any]
+) -> None:
     """
     Table: qa_suggestions exists in your DB.
-    This is best-effort; schema mismatches won't break the app.
+    Best-effort; schema mismatches won't break the app.
     """
     try:
         _db().table("qa_suggestions").insert(
             {
                 "normalized_question": q_norm,
-                "question_raw": q_raw[:500],
+                "question_raw": (q_raw or "")[:500],
                 "lang": lang,
-                "answer": answer[:4000],
+                "answer": (answer or "")[:4000],
                 "source": source,
                 "needs_review": True,
                 "risk": review.get("risk"),
@@ -37,35 +44,85 @@ def _insert_suggestion(q_norm: str, q_raw: str, lang: str, answer: str, source: 
         logging.exception("qa_suggestions insert failed (ignored): %s", e)
 
 
-def _auto_promote_to_library(q_norm: str, lang: str, answer: str) -> bool:
+def _answer_columns_for_lang(lang: str) -> list[str]:
     """
-    Best-effort upsert to qa_library.
-    Assumes qa_library has at least: normalized_question, lang, answer
-    If your unique constraint differs, failure is ignored and returns False.
+    Your qa_library appears to have BOTH naming styles in screenshots:
+      - answer_en, answer_pcm, answer_yo, answer_ig, answer_ha
+      - answer_pidgin, answer_yoruba, answer_igbo, answer_hausa
+    This returns a priority list so we write into the first column that exists.
     """
-    try:
-        _db().table("qa_library").upsert(
-            {
-                "normalized_question": q_norm,
-                "lang": lang,
-                "answer": answer,
-                "status": "active",  # if your table doesn't have this column, it will be ignored only if supabase allows; if not, remove it.
-            },
-            on_conflict="normalized_question,lang",
-        ).execute()
-        return True
-    except Exception as e:
-        logging.exception("qa_library auto-promote failed (ignored): %s", e)
-        # retry without 'status' in case that column doesn't exist
+    l = (lang or "en").lower().strip()
+
+    if l in ("en", "english"):
+        return ["answer_en"]
+
+    if l in ("pcm", "pidgin"):
+        return ["answer_pcm", "answer_pidgin"]
+
+    if l in ("yo", "yoruba"):
+        return ["answer_yo", "answer_yoruba"]
+
+    if l in ("ig", "igbo"):
+        return ["answer_ig", "answer_igbo"]
+
+    if l in ("ha", "hausa"):
+        return ["answer_ha", "answer_hausa"]
+
+    return ["answer_en"]
+
+
+def _upsert_library_payload(q_norm: str, q_raw: str, col: str, answer: str) -> Dict[str, Any]:
+    """
+    Build the payload for qa_library upsert.
+    We keep this minimal to avoid schema mismatch issues.
+    """
+    payload: Dict[str, Any] = {
+        "normalized_question": q_norm,
+        col: (answer or "")[:4000],
+    }
+
+    # If your table has a 'question' column (it does in your screenshots),
+    # write it as well. If it doesn't exist, Supabase will error—so we guard it.
+    # To guard without introspection, we try once with 'question', then retry without.
+    payload_with_question = dict(payload)
+    payload_with_question["question"] = (q_raw or "")[:500]
+    return payload_with_question
+
+
+def _auto_promote_to_library(q_norm: str, q_raw: str, lang: str, answer: str) -> bool:
+    """
+    Best-effort upsert to qa_library for your CURRENT schema:
+      - UNIQUE: normalized_question (confirmed by your index screenshot)
+      - Answers in language columns: answer_en/answer_pcm/answer_yo/answer_ig/answer_ha (and/or *_pidgin, *_yoruba, etc.)
+    """
+    cols = _answer_columns_for_lang(lang)
+
+    # Try each possible column name until one succeeds.
+    for col in cols:
         try:
+            payload = _upsert_library_payload(q_norm, q_raw, col, answer)
+
+            # 1) Try with question + answer_col
             _db().table("qa_library").upsert(
-                {"normalized_question": q_norm, "lang": lang, "answer": answer},
-                on_conflict="normalized_question,lang",
+                payload,
+                on_conflict="normalized_question",
             ).execute()
             return True
-        except Exception as e2:
-            logging.exception("qa_library auto-promote retry failed (ignored): %s", e2)
-            return False
+
+        except Exception as e:
+            logging.exception("qa_library auto-promote failed for col=%s (ignored): %s", col, e)
+
+            # 2) Retry with minimal payload (no 'question')
+            try:
+                _db().table("qa_library").upsert(
+                    {"normalized_question": q_norm, col: (answer or "")[:4000]},
+                    on_conflict="normalized_question",
+                ).execute()
+                return True
+            except Exception as e2:
+                logging.exception("qa_library auto-promote retry failed for col=%s (ignored): %s", col, e2)
+
+    return False
 
 
 def resolve_answer(
@@ -85,7 +142,7 @@ def resolve_answer(
 
     # 1) Cache
     try:
-        cached = cache_get(q_norm)
+        cached = cache_get(q_norm, lang=lang)
     except Exception as e:
         logging.exception("cache_get failed (continuing without cache): %s", e)
         cached = None
@@ -103,7 +160,7 @@ def resolve_answer(
     if lib and lib.get("answer"):
         ans = lib["answer"]
         try:
-            cache_put(q_norm, ans, tags=["library"], source=source)
+            cache_put(q_norm, ans, lang=lang, tags=["library"], source=source)
         except Exception as e:
             logging.exception("cache_put failed (ignored): %s", e)
         return {"ok": True, "answer_text": ans, "source": "library"}
@@ -134,7 +191,7 @@ def resolve_answer(
 
     # cache write-through
     try:
-        cache_put(q_norm, ai_text, tags=["ai"], source=source)
+        cache_put(q_norm, ai_text, lang=lang, tags=["ai"], source=source)
     except Exception as e:
         logging.exception("cache_put(ai) failed (ignored): %s", e)
 
@@ -149,7 +206,7 @@ def resolve_answer(
 
     auto_promoted = False
     if review.get("ok") and review.get("auto_promote_ok"):
-        auto_promoted = _auto_promote_to_library(q_norm, lang, ai_text)
+        auto_promoted = _auto_promote_to_library(q_norm, q_raw, lang, ai_text)
 
     if not auto_promoted:
         _insert_suggestion(q_norm, q_raw, lang, ai_text, source, review)
