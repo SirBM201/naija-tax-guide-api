@@ -3,7 +3,18 @@ from typing import Dict, Any
 
 from app.db.qa import cache_get, cache_put, library_get
 from app.core.text import normalize_question
-from app.services.ai import generate_answer   # ← AI fallback
+from app.services.ai import generate_answer
+
+
+def _is_valid_answer(ans: str) -> bool:
+    if not ans:
+        return False
+    bad = [
+        "please ask your tax question",
+        "i can help",
+    ]
+    a = ans.strip().lower()
+    return not any(b in a for b in bad)
 
 
 def resolve_answer(
@@ -13,91 +24,59 @@ def resolve_answer(
     lang: str = "en",
     source: str = "web",
 ) -> Dict[str, Any]:
-    """
-    Resolution order:
-    1) qa_cache
-    2) qa_library
-    3) AI fallback (auto-save to cache)
-    """
-
     q_raw = (question or "").strip()
     q_norm = normalize_question(q_raw)
 
     logging.info(
-        "ENGINE source=%s wa_phone=%s lang=%s mode=%s raw=%s norm=%s",
-        source, wa_phone, lang, mode, q_raw[:120], q_norm[:120]
+        "ENGINE source=%s wa_phone=%s lang=%s raw=%s norm=%s",
+        source,
+        wa_phone,
+        lang,
+        q_raw[:120],
+        q_norm[:120],
     )
 
-    # --------------------------------------------------
     # 1) CACHE
-    # --------------------------------------------------
     try:
         cached = cache_get(q_norm)
+        if cached and _is_valid_answer(cached.get("answer")):
+            return {
+                "ok": True,
+                "answer_text": cached["answer"],
+                "source": "cache",
+            }
     except Exception as e:
-        logging.exception("cache_get failed (continuing): %s", e)
-        cached = None
+        logging.exception("cache_get failed: %s", e)
 
-    if cached and cached.get("answer"):
-        return {
-            "ok": True,
-            "answer_text": cached["answer"],
-            "source": "cache",
-        }
-
-    # --------------------------------------------------
     # 2) LIBRARY
-    # --------------------------------------------------
     try:
         lib = library_get(q_norm, lang=lang)
+        if lib and _is_valid_answer(lib.get("answer")):
+            ans = lib["answer"]
+
+            try:
+                cache_put(q_norm, ans, tags=["library"], source=source)
+            except Exception:
+                pass
+
+            return {
+                "ok": True,
+                "answer_text": ans,
+                "source": "library",
+            }
     except Exception as e:
         logging.exception("library_get failed: %s", e)
-        lib = None
 
-    if lib and lib.get("answer"):
-        ans = lib["answer"]
+    # 3) AI FALLBACK (FINAL GUARANTEE)
+    logging.info("ENGINE → AI fallback triggered")
 
-        # write-through cache
+    ai_answer = generate_answer(question=q_raw, lang=lang)
+
+    if ai_answer:
         try:
-            cache_put(
-                normalized_question=q_norm,
-                answer=ans,
-                tags=["library"],
-                source=source,
-            )
-        except Exception as e:
-            logging.exception("cache_put (library) failed: %s", e)
-
-        return {
-            "ok": True,
-            "answer_text": ans,
-            "source": "library",
-        }
-
-    # --------------------------------------------------
-    # 3) AI FALLBACK (FINAL FIX)
-    # --------------------------------------------------
-    try:
-        logging.info("AI fallback triggered for: %s", q_norm)
-
-        ai_answer = generate_answer(
-            question=q_raw,
-            lang=lang,
-            context="Nigeria tax guidance",
-        )
-
-        if not ai_answer:
-            raise RuntimeError("AI returned empty response")
-
-        # Auto-save to cache for future use
-        try:
-            cache_put(
-                normalized_question=q_norm,
-                answer=ai_answer,
-                tags=["ai"],
-                source=source,
-            )
-        except Exception as e:
-            logging.exception("cache_put (ai) failed: %s", e)
+            cache_put(q_norm, ai_answer, tags=["ai"], source=source)
+        except Exception:
+            pass
 
         return {
             "ok": True,
@@ -105,10 +84,9 @@ def resolve_answer(
             "source": "ai",
         }
 
-    except Exception as e:
-        logging.exception("AI fallback failed: %s", e)
-
-        return {
-            "ok": False,
-            "error": "Unable to generate an answer at this time.",
-        }
+    # Absolute last fallback (should almost never happen)
+    return {
+        "ok": True,
+        "answer_text": "Unable to generate an answer at the moment. Please try again.",
+        "source": "fallback",
+    }
