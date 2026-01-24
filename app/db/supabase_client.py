@@ -1,4 +1,3 @@
-# app/db/supabase_client.py
 from supabase import create_client
 from app.core.config import SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
 
