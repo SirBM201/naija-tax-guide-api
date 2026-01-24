@@ -1,33 +1,54 @@
 # app/core/config.py
 import os
+from typing import List
 
-def _env(key: str, default: str = "") -> str:
-    return (os.getenv(key, default) or "").strip()
+def _env(name: str, default: str = "") -> str:
+    return (os.getenv(name, default) or "").strip()
 
-# -----------------------------
-# Core / Supabase
-# -----------------------------
+# ------------------------------------------------------------
+# Core ENV
+# ------------------------------------------------------------
+ENV = _env("ENV", "prod")  # dev | prod
+
+APP_BASE_URL = _env("APP_BASE_URL")  # e.g. https://xxxxx.koyeb.app
+
 SUPABASE_URL = _env("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = _env("SUPABASE_SERVICE_ROLE_KEY")
 
-# -----------------------------
+# Paystack (if/when you enable)
+PAYSTACK_SECRET_KEY = _env("PAYSTACK_SECRET_KEY")
+PAYSTACK_WEBHOOK_SECRET = _env("PAYSTACK_WEBHOOK_SECRET", PAYSTACK_SECRET_KEY)
+
+# WhatsApp (if/when you enable)
+WHATSAPP_TOKEN = _env("WHATSAPP_TOKEN")
+WHATSAPP_VERIFY_TOKEN = _env("WHATSAPP_VERIFY_TOKEN")
+WHATSAPP_PHONE_NUMBER_ID = _env("WHATSAPP_PHONE_NUMBER_ID")
+WHATSAPP_BUSINESS_ACCOUNT_ID = _env("WHATSAPP_BUSINESS_ACCOUNT_ID")
+
 # Telegram
-# -----------------------------
 TELEGRAM_BOT_TOKEN = _env("TELEGRAM_BOT_TOKEN")
-
-# If you use "secret in URL", this should match the <secret> part.
-# If you use Telegram's secret_token header, this should match that header value.
 TELEGRAM_WEBHOOK_SECRET = _env("TELEGRAM_WEBHOOK_SECRET")
-
-# Optional: where you want webhook to point. Example:
-# https://your-koyeb-app.koyeb.app/telegram/webhook/<secret>
 TELEGRAM_WEBHOOK_URL = _env("TELEGRAM_WEBHOOK_URL")
+TELEGRAM_SHORT_MODE = _env("TELEGRAM_SHORT_MODE", "true").lower() in ("1", "true", "yes", "on")
 
-# When true, bot replies more compactly (optional feature)
-TELEGRAM_SHORT_MODE = _env("TELEGRAM_SHORT_MODE", "false").lower() in ("1", "true", "yes", "y", "on")
+# Admin
+ADMIN_API_KEY = _env("ADMIN_API_KEY")
 
-# -----------------------------
-# App
-# -----------------------------
-APP_ENV = _env("APP_ENV", "prod")
-LOG_LEVEL = _env("LOG_LEVEL", "INFO").upper()
+# ------------------------------------------------------------
+# CORS
+# ------------------------------------------------------------
+# app/__init__.py expects allowed_origins to exist.
+# Configure via CORS_ALLOWED_ORIGINS:
+#   "*"  (not recommended for prod)
+#   "https://thecre8hub.com,https://www.thecre8hub.com,http://localhost:3000"
+CORS_ALLOWED_ORIGINS = _env("CORS_ALLOWED_ORIGINS", "*")
+
+def _parse_origins(value: str) -> List[str]:
+    v = (value or "").strip()
+    if not v:
+        return ["*"]
+    if v == "*":
+        return ["*"]
+    return [o.strip() for o in v.split(",") if o.strip()]
+
+allowed_origins = _parse_origins(CORS_ALLOWED_ORIGINS)
