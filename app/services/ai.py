@@ -15,7 +15,6 @@ def generate_answer(question: str, lang: str = "en") -> Optional[str]:
     Returns answer text from OpenAI (or None if not configured / failed).
     Uses raw HTTPS requests (no 'openai' python package required).
     """
-
     if not OPENAI_API_KEY:
         logging.warning("AI disabled: OPENAI_API_KEY is not set")
         return None
@@ -30,7 +29,6 @@ def generate_answer(question: str, lang: str = "en") -> Optional[str]:
         "If uncertain, say so and suggest checking FIRS or a tax professional."
     )
 
-    # Minimal, stable payload for Chat Completions
     payload = {
         "model": OPENAI_MODEL,
         "temperature": 0.2,
