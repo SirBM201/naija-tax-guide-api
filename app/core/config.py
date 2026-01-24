@@ -1,45 +1,38 @@
-# app/core/config.py
 import os
-from typing import List
 
-def _getenv(name: str, default: str = "") -> str:
+def _get(name: str, default: str = "") -> str:
     return (os.getenv(name, default) or "").strip()
 
 # -----------------------------
-# Supabase
+# Core
 # -----------------------------
-SUPABASE_URL = _getenv("SUPABASE_URL")
-SUPABASE_SERVICE_ROLE_KEY = _getenv("SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_URL = _get("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = _get("SUPABASE_SERVICE_ROLE_KEY")
+
+ADMIN_API_KEY = _get("ADMIN_API_KEY")
+
+APP_BASE_URL = _get("APP_BASE_URL")  # e.g. https://xxxxx.koyeb.app
 
 # -----------------------------
-# Paystack (keep for later; harmless if unused)
+# Paystack (keep even if unused for now)
 # -----------------------------
-PAYSTACK_SECRET_KEY = _getenv("PAYSTACK_SECRET_KEY")
-PAYSTACK_WEBHOOK_SECRET = _getenv("PAYSTACK_WEBHOOK_SECRET", PAYSTACK_SECRET_KEY)
-
-# -----------------------------
-# App / CORS
-# -----------------------------
-APP_BASE_URL = _getenv("APP_BASE_URL")  # e.g. https://xxxx.koyeb.app
-ALLOWED_ORIGINS_RAW = _getenv("ALLOWED_ORIGINS", "*")
-
-def _parse_origins(raw: str) -> List[str]:
-    raw = (raw or "").strip()
-    if not raw or raw == "*":
-        return ["*"]
-    # comma-separated
-    return [o.strip() for o in raw.split(",") if o.strip()]
-
-allowed_origins = _parse_origins(ALLOWED_ORIGINS_RAW)
+PAYSTACK_SECRET_KEY = _get("PAYSTACK_SECRET_KEY")
+PAYSTACK_WEBHOOK_SECRET = _get("PAYSTACK_WEBHOOK_SECRET") or PAYSTACK_SECRET_KEY
 
 # -----------------------------
 # Telegram
 # -----------------------------
-TELEGRAM_BOT_TOKEN = _getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_BOT_TOKEN = _get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_WEBHOOK_SECRET = _get("TELEGRAM_WEBHOOK_SECRET")  # MUST match the secret in URL path
+TELEGRAM_WEBHOOK_URL = _get("TELEGRAM_WEBHOOK_URL")        # full URL you set in Telegram
+TELEGRAM_SHORT_MODE = (_get("TELEGRAM_SHORT_MODE", "true").lower() in ("1", "true", "yes", "on"))
 
-# This MUST match the <secret> in your webhook URL path:
-# /telegram/webhook/<secret>
-TELEGRAM_WEBHOOK_SECRET = _getenv("TELEGRAM_WEBHOOK_SECRET")
-
-# Optional simple admin key if you want protected admin endpoints later
-ADMIN_API_KEY = _getenv("ADMIN_API_KEY")
+# -----------------------------
+# CORS
+# -----------------------------
+# Comma-separated list in env: "https://thecre8hub.com,http://localhost:3000"
+_allowed = _get("ALLOWED_ORIGINS", "*")
+if _allowed == "*" or _allowed == "":
+    allowed_origins = ["*"]
+else:
+    allowed_origins = [x.strip() for x in _allowed.split(",") if x.strip()]
