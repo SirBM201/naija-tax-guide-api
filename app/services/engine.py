@@ -20,30 +20,18 @@ def resolve_answer(
     3) AI fallback (auto-saved to cache)
     """
 
-    # ---------------------------
-    # Normalize question
-    # ---------------------------
     q_raw = (question or "").strip()
     q_norm = normalize_question(q_raw)
 
     logging.info(
         "ENGINE source=%s wa_phone=%s lang=%s mode=%s raw=%s norm=%s",
-        source,
-        wa_phone,
-        lang,
-        mode,
-        q_raw[:120],
-        q_norm[:120],
+        source, wa_phone, lang, mode, q_raw[:120], q_norm[:120]
     )
 
-    # ---------------------------
-    # Question header (A + B)
-    # ---------------------------
+    # A + B: Bold, uppercase question header + demarcation between questions
     question_header = f"\n\n---\n\n**{q_raw.upper()}**\n\n"
 
-    # ---------------------------
-    # 1) CACHE
-    # ---------------------------
+    # 1) Cache
     try:
         cached = cache_get(q_norm)
     except Exception as e:
@@ -51,15 +39,9 @@ def resolve_answer(
         cached = None
 
     if cached and cached.get("answer"):
-        return {
-            "ok": True,
-            "answer_text": question_header + cached["answer"],
-            "source": "cache",
-        }
+        return {"ok": True, "answer_text": question_header + cached["answer"], "source": "cache"}
 
-    # ---------------------------
-    # 2) LIBRARY
-    # ---------------------------
+    # 2) Library
     try:
         lib = library_get(q_norm, lang=lang)
     except Exception as e:
@@ -69,59 +51,28 @@ def resolve_answer(
     if lib and lib.get("answer"):
         answer = lib["answer"]
 
-        # Write-through cache
+        # write-through cache
         try:
-            cache_put(
-                q_norm,
-                answer,
-                tags=["library"],
-                source=source,
-            )
+            cache_put(q_norm, answer, tags=["library"], source=source)
         except Exception as e:
             logging.exception("cache_put (library) failed: %s", e)
 
-        return {
-            "ok": True,
-            "answer_text": question_header + answer,
-            "source": "library",
-        }
+        return {"ok": True, "answer_text": question_header + answer, "source": "library"}
 
-    # ---------------------------
-    # 3) AI FALLBACK (AUTO-SAVE)
-    # ---------------------------
-    try:
-        ai_answer = generate_answer(
-            question=q_raw,
-            lang=lang,
-        )
+    # 3) AI fallback + auto-save
+    ai_answer = generate_answer(q_raw, lang=lang)
+    if ai_answer:
+        try:
+            cache_put(q_norm, ai_answer, tags=["ai"], source=source)
+        except Exception as e:
+            logging.exception("cache_put (ai) failed: %s", e)
 
-        if ai_answer:
-            try:
-                cache_put(
-                    q_norm,
-                    ai_answer,
-                    tags=["ai"],
-                    source=source,
-                )
-            except Exception as e:
-                logging.exception("cache_put (ai) failed: %s", e)
+        return {"ok": True, "answer_text": question_header + ai_answer, "source": "ai"}
 
-            return {
-                "ok": True,
-                "answer_text": question_header + ai_answer,
-                "source": "ai",
-            }
-
-    except Exception as e:
-        logging.exception("AI generation failed: %s", e)
-
-    # ---------------------------
-    # FINAL SAFE FALLBACK
-    # ---------------------------
+    # Final fallback
     return {
         "ok": True,
         "answer_text": question_header
-        + "I can help. Please ask your tax question "
-          "(e.g., VAT, PAYE, TIN, filing, penalties).",
+        + "I can help. Please ask your tax question (e.g., VAT, PAYE, TIN, filing, penalties).",
         "source": "fallback",
     }
