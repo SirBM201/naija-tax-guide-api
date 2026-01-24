@@ -1,25 +1,17 @@
+# app/core/text.py
 import re
 
-_ACRONYM_EXPAND = {
-    "vat": "what is vat",
-    "tin": "what is tin",
-    "paye": "what is paye",
-    "wht": "what is wht",
-}
+_WS = re.compile(r"\s+")
+_PUNCT = re.compile(r"[^\w\s]", flags=re.UNICODE)
 
 def normalize_question(q: str) -> str:
     """
-    Normalizes user text into a predictable lookup key.
-    Also expands common single-word acronyms so your library can match.
+    Normalizes question text so cache/library lookups are consistent.
+    Example:
+      "What is TIN??" -> "what is tin"
+      "  VAT rate in Nigeria " -> "vat rate in nigeria"
     """
     s = (q or "").strip().lower()
-    s = re.sub(r"\s+", " ", s)
-
-    # remove surrounding punctuation
-    s = s.strip(" \t\r\n.,;:!?\"'()[]{}<>")
-
-    # if user typed only "vat" or "tin", expand it
-    if s in _ACRONYM_EXPAND:
-        return _ACRONYM_EXPAND[s]
-
+    s = _PUNCT.sub(" ", s)          # remove punctuation
+    s = _WS.sub(" ", s).strip()     # collapse whitespace
     return s
