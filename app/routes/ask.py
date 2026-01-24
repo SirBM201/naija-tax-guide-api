@@ -32,5 +32,6 @@ def ask():
         "ok": True,
         "answer": res.get("answer_text"),
         "audio_url": None,
-        "plan_expiry": None,  # if your existing code adds it elsewhere, keep your current logic
-    })
+        "plan_expiry": None,
+        "source": res.get("source"),  # nice for debugging
+    }), 200
