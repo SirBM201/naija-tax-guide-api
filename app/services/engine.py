@@ -20,9 +20,7 @@ AI_ENABLED = os.getenv("AI_ENABLED", "true").lower() in ("1", "true", "yes")
 # Supabase helper (lazy)
 # -----------------------------
 def _sb():
-    """
-    Lazy-load Supabase client so we don't crash on import if env isn't set.
-    """
+    """Lazy-load Supabase client so we don't crash on import if env isn't set."""
     try:
         from supabase import create_client  # type: ignore
     except Exception:
@@ -44,7 +42,6 @@ def _now_utc() -> datetime:
 
 
 def _today_utc() -> str:
-    # store day as ISO date string e.g. 2026-01-24
     return date.today().isoformat()
 
 
@@ -64,22 +61,23 @@ def _get_active_subscription(sb, wa_phone: str) -> Optional[Dict[str, Any]]:
         rows = getattr(res, "data", None) or []
         if not rows:
             return None
+
         row = rows[0]
         if (row.get("status") or "").lower() != "active":
             return None
+
         exp = row.get("expires_at")
         if not exp:
             return None
-        # expires_at may come as string
-        exp_dt = None
+
         try:
             exp_dt = datetime.fromisoformat(exp.replace("Z", "+00:00"))
         except Exception:
-            exp_dt = None
-        if not exp_dt:
             return None
+
         if exp_dt <= _now_utc():
             return None
+
         row["_expires_dt"] = exp_dt
         return row
     except Exception:
@@ -100,16 +98,13 @@ def _paid_quota_for_plan(plan: str) -> int:
         return PAID_AI_PER_MONTH * 3
     if p in ("yearly", "annual", "year"):
         return PAID_AI_PER_MONTH * 12
-    # fallback if unknown plan name
     return PAID_AI_PER_MONTH
 
 
 def _free_ai_allowed(sb, wa_phone: str) -> Tuple[bool, str]:
     """
-    Enforce Free plan: 2 AI/day.
-    Uses ai_daily_usage table best-effort:
-      wa_phone (text), day (text or date), used (int)
-    If table doesn't exist or query fails, we ALLOW (but log warning) to avoid breaking UX.
+    Free plan: 2 AI/day using ai_daily_usage (best-effort).
+    If table/query fails, we ALLOW to avoid outage (but log).
     """
     if not sb:
         return True, "no-db"
@@ -130,7 +125,6 @@ def _free_ai_allowed(sb, wa_phone: str) -> Tuple[bool, str]:
         if used >= FREE_AI_PER_DAY:
             return False, f"free_limit_reached:{used}"
 
-        # increment (upsert)
         new_used = used + 1
         sb.table("ai_daily_usage").upsert(
             {"wa_phone": wa_phone, "day": day, "used": new_used},
@@ -144,11 +138,10 @@ def _free_ai_allowed(sb, wa_phone: str) -> Tuple[bool, str]:
 
 def _paid_ai_allowed(sb, wa_phone: str, plan: str, expires_dt: datetime) -> Tuple[bool, str]:
     """
-    Paid plans: quota is based on plan duration:
-      monthly=300, quarterly=900, yearly=3600.
-    We store remaining balance in ai_credits (best-effort):
+    Paid plans: quota by plan duration (monthly/quarterly/yearly) within plan validity.
+    Uses ai_credits table best-effort:
       wa_phone, balance, expires_at, updated_at
-    If table differs / missing, we ALLOW (but log) so app doesn't break.
+    If missing/fails, we ALLOW (but log) so app doesn't break.
     """
     if not sb:
         return True, "no-db"
@@ -156,7 +149,6 @@ def _paid_ai_allowed(sb, wa_phone: str, plan: str, expires_dt: datetime) -> Tupl
     quota = _paid_quota_for_plan(plan)
 
     try:
-        # read current balance
         res = (
             sb.table("ai_credits")
             .select("wa_phone,balance,expires_at")
@@ -165,8 +157,8 @@ def _paid_ai_allowed(sb, wa_phone: str, plan: str, expires_dt: datetime) -> Tupl
             .execute()
         )
         rows = getattr(res, "data", None) or []
+
         if not rows:
-            # initialize
             sb.table("ai_credits").upsert(
                 {
                     "wa_phone": wa_phone,
@@ -181,7 +173,7 @@ def _paid_ai_allowed(sb, wa_phone: str, plan: str, expires_dt: datetime) -> Tupl
         row = rows[0]
         bal = int(row.get("balance") or 0)
 
-        # if stored expires_at is older than current subscription expiry, reset quota
+        # reset if stored expires_at differs from current subscription expiry
         stored_exp = row.get("expires_at")
         reset = False
         if stored_exp:
@@ -218,9 +210,8 @@ def _paid_ai_allowed(sb, wa_phone: str, plan: str, expires_dt: datetime) -> Tupl
 
 def _log_ai_suggestion(sb, q_norm: str, lang: str, answer: str, wa_phone: str, source: str) -> None:
     """
-    Best-effort admin review queue:
-    qa_suggestions table (you already have it).
-    We try common columns; if your schema differs, it will just fail silently.
+    Best-effort admin review queue insert into qa_suggestions.
+    If schema differs, we skip without crashing.
     """
     if not sb:
         return
@@ -237,24 +228,28 @@ def _log_ai_suggestion(sb, q_norm: str, lang: str, answer: str, wa_phone: str, s
             }
         ).execute()
     except Exception:
-        # don't crash the app due to admin-queue schema mismatch
         logging.info("qa_suggestions insert skipped (schema may differ)")
 
 
-def _ai_generate_answer(question: str, lang: str = "en") -> str:
+def _ai_generate_answer(question: str, lang: str = "en") -> Optional[str]:
     """
     AI call is imported lazily to avoid boot-time crashes.
-    You can implement app/services/ai.py with generate_answer().
+    app/services/ai.py returns Optional[str].
     """
     if not AI_ENABLED:
-        raise RuntimeError("AI disabled")
+        return None
 
     try:
         from app.services.ai import generate_answer  # lazy import
     except Exception as e:
-        raise RuntimeError(f"AI module import failed: {e}") from e
+        logging.warning("AI module import failed: %s", e)
+        return None
 
-    return generate_answer(question=question, lang=lang)
+    try:
+        return generate_answer(question=question, lang=lang)
+    except Exception as e:
+        logging.exception("AI generate_answer failed: %s", e)
+        return None
 
 
 def resolve_answer(
@@ -266,10 +261,10 @@ def resolve_answer(
 ) -> Dict[str, Any]:
     """
     Resolution order:
-    1) qa_cache (by normalized_question)
-    2) qa_library (by normalized_question + lang)
+    1) qa_cache
+    2) qa_library
     3) AI fallback (with plan limits) + autosave (cache + admin suggestion)
-    4) fallback message (if AI unavailable)
+    4) fallback message
     """
     q_raw = (question or "").strip()
     q_norm = normalize_question(q_raw)
@@ -310,7 +305,6 @@ def resolve_answer(
     # 3) AI fallback (with plan usage limits)
     sb = _sb()
 
-    # subscription check
     sub = _get_active_subscription(sb, wa_phone) if sb else None
     is_paid = bool(sub)
     expires_dt = sub.get("_expires_dt") if sub else None
@@ -336,11 +330,9 @@ def resolve_answer(
                 "source": "ai_blocked",
             }
 
-    # generate AI answer
-    try:
-        ai_answer = _ai_generate_answer(question=q_raw, lang=lang)
-    except Exception as e:
-        logging.exception("AI fallback failed: %s", e)
+    ai_answer = _ai_generate_answer(question=q_raw, lang=lang)
+
+    if not ai_answer:
         return {
             "ok": True,
             "answer_text": "I can help. Please ask your tax question (e.g., VAT, PAYE, TIN, filing, penalties).",
