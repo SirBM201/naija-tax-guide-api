@@ -1,5 +1,5 @@
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 
 from app.db.qa import cache_get, cache_put, library_get
 from app.core.text import normalize_question
@@ -20,7 +20,7 @@ def _insert_suggestion(
     lang: str,
     answer: str,
     source: str,
-    review: Dict[str, Any]
+    review: Dict[str, Any],
 ) -> None:
     """
     Table: qa_suggestions exists in your DB.
@@ -46,10 +46,10 @@ def _insert_suggestion(
 
 def _answer_columns_for_lang(lang: str) -> list[str]:
     """
-    Your qa_library appears to have BOTH naming styles in screenshots:
+    Your qa_library shows BOTH naming styles in screenshots:
       - answer_en, answer_pcm, answer_yo, answer_ig, answer_ha
       - answer_pidgin, answer_yoruba, answer_igbo, answer_hausa
-    This returns a priority list so we write into the first column that exists.
+    We try both so promotion works without guessing wrong.
     """
     l = (lang or "en").lower().strip()
 
@@ -71,56 +71,41 @@ def _answer_columns_for_lang(lang: str) -> list[str]:
     return ["answer_en"]
 
 
-def _upsert_library_payload(q_norm: str, q_raw: str, col: str, answer: str) -> Dict[str, Any]:
-    """
-    Build the payload for qa_library upsert.
-    We keep this minimal to avoid schema mismatch issues.
-    """
-    payload: Dict[str, Any] = {
-        "normalized_question": q_norm,
-        col: (answer or "")[:4000],
-    }
-
-    # If your table has a 'question' column (it does in your screenshots),
-    # write it as well. If it doesn't exist, Supabase will error—so we guard it.
-    # To guard without introspection, we try once with 'question', then retry without.
-    payload_with_question = dict(payload)
-    payload_with_question["question"] = (q_raw or "")[:500]
-    return payload_with_question
-
-
 def _auto_promote_to_library(q_norm: str, q_raw: str, lang: str, answer: str) -> bool:
     """
-    Best-effort upsert to qa_library for your CURRENT schema:
-      - UNIQUE: normalized_question (confirmed by your index screenshot)
-      - Answers in language columns: answer_en/answer_pcm/answer_yo/answer_ig/answer_ha (and/or *_pidgin, *_yoruba, etc.)
+    Upsert into qa_library with:
+      - on_conflict = normalized_question   (CONFIRMED UNIQUE INDEX)
+      - write into the correct answer_* column
     """
     cols = _answer_columns_for_lang(lang)
 
-    # Try each possible column name until one succeeds.
     for col in cols:
+        # Try with question + answer column
         try:
-            payload = _upsert_library_payload(q_norm, q_raw, col, answer)
-
-            # 1) Try with question + answer_col
             _db().table("qa_library").upsert(
-                payload,
+                {
+                    "normalized_question": q_norm,
+                    "question": (q_raw or "")[:500],
+                    col: (answer or "")[:4000],
+                },
                 on_conflict="normalized_question",
             ).execute()
             return True
-
         except Exception as e:
-            logging.exception("qa_library auto-promote failed for col=%s (ignored): %s", col, e)
+            logging.exception("qa_library promote failed col=%s (ignored): %s", col, e)
 
-            # 2) Retry with minimal payload (no 'question')
-            try:
-                _db().table("qa_library").upsert(
-                    {"normalized_question": q_norm, col: (answer or "")[:4000]},
-                    on_conflict="normalized_question",
-                ).execute()
-                return True
-            except Exception as e2:
-                logging.exception("qa_library auto-promote retry failed for col=%s (ignored): %s", col, e2)
+        # Retry minimal payload (no question)
+        try:
+            _db().table("qa_library").upsert(
+                {
+                    "normalized_question": q_norm,
+                    col: (answer or "")[:4000],
+                },
+                on_conflict="normalized_question",
+            ).execute()
+            return True
+        except Exception as e2:
+            logging.exception("qa_library promote retry failed col=%s (ignored): %s", col, e2)
 
     return False
 
@@ -173,7 +158,7 @@ def resolve_answer(
             msg = "Your AI credits for this plan are finished. Please top up to continue."
         else:
             msg = "You have used your free AI limit for today (2/day). Please upgrade to continue."
-        return {"ok": False, "message": msg, "reason": quota.get("reason")}
+        return {"ok": False, "message": msg, "reason": quota.get("reason"), "plan_expiry": quota.get("plan_expiry")}
 
     ai_text = generate_answer(q_raw, lang=lang)
     if not ai_text:
@@ -183,19 +168,19 @@ def resolve_answer(
             "source": "fallback",
         }
 
-    # consume usage only after AI success
+    # Consume usage only after AI success
     try:
         consume_ai(wa_phone, quota.get("plan", "free"), quota.get("mode", "free_daily"))
     except Exception as e:
         logging.exception("consume_ai failed (ignored): %s", e)
 
-    # cache write-through
+    # Cache write-through
     try:
         cache_put(q_norm, ai_text, lang=lang, tags=["ai"], source=source)
     except Exception as e:
         logging.exception("cache_put(ai) failed (ignored): %s", e)
 
-    # cost tracking
+    # Cost tracking
     try:
         log_ai_cost(wa_phone, q_raw, ai_text, source="ai")
     except Exception as e:
@@ -215,6 +200,7 @@ def resolve_answer(
         "ok": True,
         "answer_text": ai_text,
         "source": "ai",
+        "plan_expiry": quota.get("plan_expiry"),
         "review": {
             "risk": review.get("risk"),
             "confidence": review.get("confidence"),
