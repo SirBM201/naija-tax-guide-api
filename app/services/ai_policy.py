@@ -3,15 +3,17 @@ import logging
 from datetime import date, datetime, timezone
 from typing import Dict, Any, Optional, Tuple
 
-from app.db.supabase_client import supabase  # IMPORTANT: must exist in your project
+from app.db.supabase_client import supabase as get_supabase
 
 
 FREE_DAILY_LIMIT = int(os.getenv("FREE_DAILY_AI_LIMIT", "2"))
 PAID_MONTHLY_LIMIT = int(os.getenv("PAID_MONTHLY_AI_LIMIT", "300"))
 
-# Estimated token/cost tracking (simple + stable)
-# You can refine later if you want exact token usage.
 DEFAULT_AI_COST_UNITS = float(os.getenv("AI_COST_UNITS_PER_ANSWER", "1.0"))
+
+
+def _db():
+    return get_supabase()
 
 
 def _utc_now() -> datetime:
@@ -23,12 +25,6 @@ def _today_utc() -> date:
 
 
 def _plan_ai_allowance(plan: str) -> int:
-    """
-    300 per month.
-    Quarterly/yearly roll over within validity:
-    - quarterly => 900
-    - yearly    => 3600
-    """
     p = (plan or "").lower().strip()
     if p == "quarterly":
         return PAID_MONTHLY_LIMIT * 3
@@ -40,13 +36,9 @@ def _plan_ai_allowance(plan: str) -> int:
 
 
 def get_user_plan(wa_phone: str) -> Tuple[str, Optional[str]]:
-    """
-    Returns (plan, expires_at_iso or None)
-    Uses table: user_subscriptions (wa_phone, plan, status, expires_at)
-    """
     try:
         r = (
-            supabase.table("user_subscriptions")
+            _db().table("user_subscriptions")
             .select("plan,status,expires_at")
             .eq("wa_phone", wa_phone)
             .limit(1)
@@ -64,7 +56,6 @@ def get_user_plan(wa_phone: str) -> Tuple[str, Optional[str]]:
         if status != "active":
             return ("free", expires_at)
 
-        # If expired, treat as free
         if expires_at:
             try:
                 exp = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
@@ -80,20 +71,11 @@ def get_user_plan(wa_phone: str) -> Tuple[str, Optional[str]]:
 
 
 def _get_or_init_ai_credits(wa_phone: str, plan: str, expires_at: Optional[str]) -> Dict[str, Any]:
-    """
-    Table: ai_credits
-    expected columns (best effort):
-      - wa_phone (pk/unique)
-      - plan
-      - remaining
-      - expires_at
-      - updated_at
-    """
     allowance = _plan_ai_allowance(plan)
 
     try:
         r = (
-            supabase.table("ai_credits")
+            _db().table("ai_credits")
             .select("wa_phone,plan,remaining,expires_at")
             .eq("wa_phone", wa_phone)
             .limit(1)
@@ -105,7 +87,6 @@ def _get_or_init_ai_credits(wa_phone: str, plan: str, expires_at: Optional[str])
     except Exception as e:
         logging.exception("ai_credits select failed: %s", e)
 
-    # init if missing (only for paid plans)
     row = {
         "wa_phone": wa_phone,
         "plan": plan,
@@ -114,27 +95,20 @@ def _get_or_init_ai_credits(wa_phone: str, plan: str, expires_at: Optional[str])
         "updated_at": _utc_now().isoformat(),
     }
     try:
-        supabase.table("ai_credits").upsert(row, on_conflict="wa_phone").execute()
+        _db().table("ai_credits").upsert(row, on_conflict="wa_phone").execute()
     except Exception as e:
         logging.exception("ai_credits upsert(init) failed: %s", e)
     return row
 
 
 def can_use_ai(wa_phone: str) -> Dict[str, Any]:
-    """
-    Returns:
-      { ok: True, plan: ..., mode: "free_daily"|"paid_credits", remaining: int }
-    or:
-      { ok: False, reason: "...", action: "upgrade"|"topup" }
-    """
     plan, expires_at = get_user_plan(wa_phone)
 
-    # FREE
     if plan == "free":
         today = str(_today_utc())
         try:
             r = (
-                supabase.table("ai_daily_usage")
+                _db().table("ai_daily_usage")
                 .select("count")
                 .eq("wa_phone", wa_phone)
                 .eq("day", today)
@@ -153,10 +127,8 @@ def can_use_ai(wa_phone: str) -> Dict[str, Any]:
 
         return {"ok": True, "plan": "free", "mode": "free_daily", "remaining": remaining}
 
-    # PAID
     allowance = _plan_ai_allowance(plan)
     if allowance <= 0:
-        # unknown plan -> treat as free behavior
         return {"ok": False, "reason": "plan_unknown", "action": "upgrade"}
 
     credits = _get_or_init_ai_credits(wa_phone, plan, expires_at)
@@ -169,17 +141,11 @@ def can_use_ai(wa_phone: str) -> Dict[str, Any]:
 
 
 def consume_ai(wa_phone: str, plan: str, mode: str) -> None:
-    """
-    Deduct 1 AI usage from either:
-    - ai_daily_usage (free)
-    - ai_credits (paid)
-    """
     if mode == "free_daily":
         today = str(_today_utc())
         try:
-            # Upsert-increment pattern
             r = (
-                supabase.table("ai_daily_usage")
+                _db().table("ai_daily_usage")
                 .select("count")
                 .eq("wa_phone", wa_phone)
                 .eq("day", today)
@@ -189,19 +155,18 @@ def consume_ai(wa_phone: str, plan: str, mode: str) -> None:
             rows = r.data or []
             if rows:
                 new_count = int(rows[0].get("count") or 0) + 1
-                supabase.table("ai_daily_usage").update({"count": new_count}).eq("wa_phone", wa_phone).eq("day", today).execute()
+                _db().table("ai_daily_usage").update({"count": new_count}).eq("wa_phone", wa_phone).eq("day", today).execute()
             else:
-                supabase.table("ai_daily_usage").insert({"wa_phone": wa_phone, "day": today, "count": 1}).execute()
+                _db().table("ai_daily_usage").insert({"wa_phone": wa_phone, "day": today, "count": 1}).execute()
         except Exception as e:
             logging.exception("consume_ai free_daily failed: %s", e)
         return
 
-    # paid credits
     try:
         credits = _get_or_init_ai_credits(wa_phone, plan, None)
         remaining = int(credits.get("remaining") or 0)
         remaining = max(0, remaining - 1)
-        supabase.table("ai_credits").upsert(
+        _db().table("ai_credits").upsert(
             {
                 "wa_phone": wa_phone,
                 "plan": plan,
@@ -215,13 +180,8 @@ def consume_ai(wa_phone: str, plan: str, mode: str) -> None:
 
 
 def log_ai_cost(wa_phone: str, question: str, answer: str, source: str = "ai") -> None:
-    """
-    Lightweight cost tracking.
-    Table available in your DB: ai_cache (we log a row).
-    If columns differ, failure is ignored (won’t break user responses).
-    """
     try:
-        supabase.table("ai_cache").insert(
+        _db().table("ai_cache").insert(
             {
                 "wa_phone": wa_phone,
                 "question": (question or "")[:500],
