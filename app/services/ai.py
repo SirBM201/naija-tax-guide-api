@@ -1,35 +1,33 @@
 import os
 import logging
 from openai import OpenAI
+from app.core.config import OPENAI_API_KEY, OPENAI_MODEL
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 def generate_answer(question: str, lang: str = "en") -> str:
-    if not question:
-        return ""
-
     try:
-        prompt = f"""
-You are a Nigerian tax assistant.
-Answer clearly and professionally.
-
-Question:
-{question}
-"""
-
-        res = client.chat.completions.create(
-            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
             messages=[
-                {"role": "system", "content": "You are a professional tax assistant."},
-                {"role": "user", "content": prompt},
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a professional Nigerian tax advisor. "
+                        "Give clear, structured, accurate answers."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": question,
+                },
             ],
             temperature=0.3,
-            max_tokens=400,
+            timeout=12,  # <<< HARD STOP (IMPORTANT)
         )
 
-        return res.choices[0].message.content.strip()
+        return resp.choices[0].message.content.strip()
 
     except Exception as e:
-        logging.exception("AI generation failed: %s", e)
+        logging.exception("OpenAI error: %s", e)
         return ""
