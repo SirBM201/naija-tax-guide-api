@@ -37,12 +37,13 @@ def create_app() -> Flask:
     from app.routes.ask import bp as ask_bp
     from app.routes.paystack_routes import bp as paystack_bp
     from app.routes.telegram_routes import bp as telegram_bp
-
+    from app.routes.cron import bp as cron_bp
+    
     app.register_blueprint(health_bp)
     app.register_blueprint(ask_bp)
     app.register_blueprint(paystack_bp)
     app.register_blueprint(telegram_bp)
-
+    app.register_blueprint(cron_bp)
     # -----------------------------
     # Root
     # -----------------------------
