@@ -16,7 +16,7 @@ def _normalize_phone(p: str) -> str:
     return "".join(ch for ch in (p or "").strip() if ch.isdigit())
 
 
-def _now_utc():
+def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
@@ -41,7 +41,7 @@ def _is_active(sub: dict) -> bool:
     if not sub:
         return False
 
-    status = (sub.get("status") or "").lower()
+    status = (sub.get("status") or "").strip().lower()
     if status not in ("active", "paid"):
         return False
 
@@ -63,7 +63,7 @@ def _is_active(sub: dict) -> bool:
 def ask():
     data = request.get_json(silent=True) or {}
 
-    wa_phone = _normalize_phone(data.get("wa_phone"))
+    wa_phone = _normalize_phone(str(data.get("wa_phone") or ""))
     question = str(data.get("question") or "").strip()
     mode = str(data.get("mode") or "text").strip()
     lang = str(data.get("lang") or "en").strip()
@@ -81,6 +81,7 @@ def ask():
         source="web",
     )
 
+    # You said: "users should only see plan expiry" (no credits counters)
     return jsonify({
         "ok": True,
         "answer": res.get("answer_text"),
@@ -91,20 +92,21 @@ def ask():
 
 
 # -----------------------------
-# SUBSCRIPTION STATUS  ✅ NEW
+# SUBSCRIPTION STATUS
 # -----------------------------
 @bp.post("/subscription/status")
 def subscription_status():
     """
     Unified subscription status check.
     Works for WhatsApp / Telegram / Web using ONE identity.
+    Request:
+      { "wa_phone": "2348012345678" }
     """
-
     data = request.get_json(silent=True) or {}
-    wa_phone = _normalize_phone(data.get("wa_phone"))
+    wa_phone = _normalize_phone(str(data.get("wa_phone") or ""))
 
     if not wa_phone:
-        return jsonify({"ok": False, "error": "wa_phone is required"}), 400
+        return jsonify({"ok": False, "message": "wa_phone is required"}), 400
 
     sub = _get_subscription(wa_phone)
 
@@ -114,6 +116,7 @@ def subscription_status():
             "status": "none",
             "plan": None,
             "expires_at": None,
+            "reference": None,
         }), 200
 
     active = _is_active(sub)
