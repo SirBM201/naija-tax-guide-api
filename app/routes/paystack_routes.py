@@ -51,26 +51,70 @@ def _normalize_phone(p: str) -> str:
     return "".join(ch for ch in (p or "").strip() if ch.isdigit())
 
 
+# ------------------------------------------------------------
+# LOCKED TOPUP PACKAGES (EDIT PRICES HERE)
+# ------------------------------------------------------------
+# Amounts are in Kobo (₦1 = 100 kobo)
+# These are example prices — adjust to your final pricing.
+TOPUP_PACKAGES: Dict[str, Dict[str, Any]] = {
+    "TOPUP_100": {
+        "package_code": "TOPUP_100",
+        "title": "100 AI Credits",
+        "credits": 100,
+        "amount_kobo": 200_00,  # ₦200.00
+        "currency": "NGN",
+    },
+    "TOPUP_300": {
+        "package_code": "TOPUP_300",
+        "title": "300 AI Credits",
+        "credits": 300,
+        "amount_kobo": 500_00,  # ₦500.00
+        "currency": "NGN",
+    },
+    "TOPUP_1000": {
+        "package_code": "TOPUP_1000",
+        "title": "1000 AI Credits",
+        "credits": 1000,
+        "amount_kobo": 1500_00,  # ₦1,500.00
+        "currency": "NGN",
+    },
+}
+
+
+def _get_topup_package(code: str) -> Optional[Dict[str, Any]]:
+    if not code:
+        return None
+    return TOPUP_PACKAGES.get(code.strip().upper())
+
+
 @bp.get("/paystack/health")
 def paystack_health():
     return jsonify({"ok": True, "service": "paystack"}), 200
 
 
+# Optional endpoint for frontend to fetch packages
+@bp.get("/paystack/topup/packages")
+def paystack_topup_packages():
+    # Return packages as a list for UI
+    pkgs = list(TOPUP_PACKAGES.values())
+    return jsonify({"ok": True, "packages": pkgs}), 200
+
+
 # -----------------------------
-# TOP-UP: Initialize
+# TOP-UP: Initialize (LOCKED)
 # -----------------------------
 @bp.post("/paystack/topup/initialize")
 def paystack_topup_initialize():
     """
-    Request JSON:
+    Request JSON (LOCKED PACKAGES):
       {
         "wa_phone": "2348012345678",
         "email": "user@example.com",
-        "credits": 100,
-        "amount_kobo": 200000
+        "package_code": "TOPUP_300"
       }
+
     Response:
-      { ok: true, authorization_url, reference }
+      { ok: true, authorization_url, reference, credits, amount_kobo, package_code }
     """
     if not PAYSTACK_SECRET_KEY:
         return jsonify({"ok": False, "message": "PAYSTACK_SECRET_KEY not set"}), 500
@@ -79,19 +123,22 @@ def paystack_topup_initialize():
 
     wa_phone = _normalize_phone(body.get("wa_phone") or "")
     email = (body.get("email") or "").strip()
-    credits = _int(body.get("credits"))
-    amount_kobo = _int(body.get("amount_kobo"))
+    package_code = (body.get("package_code") or "").strip().upper()
 
     if not wa_phone:
         return jsonify({"ok": False, "message": "wa_phone is required"}), 400
     if not email or "@" not in email:
         return jsonify({"ok": False, "message": "Valid email is required"}), 400
-    if credits <= 0:
-        return jsonify({"ok": False, "message": "credits must be > 0"}), 400
-    if amount_kobo <= 0:
-        return jsonify({"ok": False, "message": "amount_kobo must be > 0"}), 400
 
-    reference = f"topup_{wa_phone}_{int(datetime.now(timezone.utc).timestamp())}"
+    pkg = _get_topup_package(package_code)
+    if not pkg:
+        return jsonify({"ok": False, "message": "Invalid package_code"}), 400
+
+    credits = int(pkg["credits"])
+    amount_kobo = int(pkg["amount_kobo"])
+
+    # Create reference
+    reference = f"topup_{wa_phone}_{package_code}_{int(datetime.now(timezone.utc).timestamp())}"
 
     # store pending order first
     try:
@@ -124,6 +171,7 @@ def paystack_topup_initialize():
             "purpose": "ai_topup",
             "wa_phone": wa_phone,
             "credits": credits,
+            "package_code": package_code,
         },
     }
 
@@ -150,6 +198,9 @@ def paystack_topup_initialize():
                 "ok": True,
                 "authorization_url": d.get("authorization_url"),
                 "reference": d.get("reference") or reference,
+                "credits": credits,
+                "amount_kobo": amount_kobo,
+                "package_code": package_code,
             }
         ), 200
 
@@ -213,11 +264,29 @@ def _handle_topup(event_type: str, data: Dict[str, Any], full_event: Dict[str, A
     metadata = data.get("metadata") or {}
     wa_phone = _normalize_phone(metadata.get("wa_phone") or "")
     credits = _int(metadata.get("credits"))
+    package_code = (metadata.get("package_code") or "").strip().upper()
     amount_kobo = _int(data.get("amount"))
-    email = (data.get("customer") or {}).get("email") or (metadata.get("email") or "")
+    email = (data.get("customer") or {}).get("email") or ""
 
-    if not reference or not wa_phone or credits <= 0:
-        logging.warning("Topup missing metadata ref=%r wa_phone=%r credits=%r", reference, wa_phone, credits)
+    if not reference or not wa_phone or credits <= 0 or not package_code:
+        logging.warning(
+            "Topup missing metadata ref=%r wa_phone=%r credits=%r package=%r",
+            reference, wa_phone, credits, package_code
+        )
+        return jsonify({"ok": True}), 200
+
+    # SECURITY: verify the credited values match the LOCKED package mapping
+    pkg = _get_topup_package(package_code)
+    if not pkg:
+        logging.warning("Topup webhook invalid package_code=%r", package_code)
+        return jsonify({"ok": True}), 200
+
+    if int(pkg["credits"]) != int(credits):
+        logging.warning("Topup credits mismatch. pkg=%s got=%s", pkg["credits"], credits)
+        return jsonify({"ok": True}), 200
+
+    if int(pkg["amount_kobo"]) != int(amount_kobo):
+        logging.warning("Topup amount mismatch. pkg=%s got=%s", pkg["amount_kobo"], amount_kobo)
         return jsonify({"ok": True}), 200
 
     # Idempotency: if already paid, skip
@@ -262,11 +331,6 @@ def _handle_topup(event_type: str, data: Dict[str, Any], full_event: Dict[str, A
 
 
 def _credit_ledger(wa_phone: str, credits: int) -> None:
-    """
-    Credits are applied to the CURRENT subscription period:
-    - If user has active subscription: period_end = user_subscriptions.expires_at
-    - If subscription missing: still store a ledger row using now as period_end (fallback)
-    """
     sub = None
     try:
         r = _db().table("user_subscriptions").select("*").eq("wa_phone", wa_phone).limit(1).execute()
