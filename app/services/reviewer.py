@@ -1,125 +1,87 @@
-import os
+# app/services/reviewer.py
 import json
 import logging
-from typing import Dict, Any, Optional
-import requests
+from typing import Dict, Any
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_REVIEW_MODEL = os.getenv("OPENAI_REVIEW_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini")).strip()
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip()
-
-# If you want to fully disable auto-promotion even when risk is low:
-AUTO_PROMOTE_LOW_RISK = os.getenv("AUTO_PROMOTE_LOW_RISK", "true").lower().strip() in ("1", "true", "yes")
+from app.services.ai import generate_answer
 
 
 def review_answer(question: str, answer: str, lang: str = "en") -> Dict[str, Any]:
     """
-    Returns:
-      {
-        "ok": True/False,
-        "risk": "low"|"medium"|"high",
-        "confidence": 0-100,
-        "reasons": [...],
-        "auto_promote_ok": True/False
-      }
-    """
-    if not OPENAI_API_KEY:
-        return {
-            "ok": False,
-            "risk": "medium",
-            "confidence": 0,
-            "reasons": ["AI review disabled (OPENAI_API_KEY missing)"],
-            "auto_promote_ok": False,
-        }
+    Risk reviewer:
+      - returns risk: low/medium/high
+      - confidence: 0-100
+      - auto_promote_ok: bool
 
+    Uses the same OpenAI channel via generate_answer (raw HTTP behind the scenes).
+    If anything fails, we default to medium risk (no auto-promotion).
+    """
     q = (question or "").strip()
     a = (answer or "").strip()
+
     if not q or not a:
-        return {
-            "ok": False,
-            "risk": "medium",
-            "confidence": 0,
-            "reasons": ["Empty question/answer"],
-            "auto_promote_ok": False,
-        }
+        return {"ok": True, "risk": "high", "confidence": 0, "auto_promote_ok": False, "reasons": ["empty_input"]}
 
-    system = (
-        "You are a strict compliance reviewer for a Nigeria-focused tax assistant.\n"
-        "Your job: classify whether an answer is safe to store in a public knowledge library.\n\n"
-        "Mark HIGH risk if the answer:\n"
-        "- gives exact legal conclusions, litigation strategy, or aggressive tax planning\n"
-        "- contains unclear/uncertain statements without disclaimers\n"
-        "- may be wrong due to changing rates/dates or missing official references\n"
-        "- advises evasion, fraud, or non-compliance\n\n"
-        "Mark MEDIUM if:\n"
-        "- mostly correct but needs checking for dates, forms, portals, or exceptions\n"
-        "- contains specifics you are not fully sure about\n\n"
-        "Mark LOW if:\n"
-        "- it is general educational guidance (definitions, high-level steps)\n"
-        "- it includes safe disclaimers and does not overclaim\n\n"
-        "Output ONLY valid JSON with keys: risk, confidence, reasons, auto_promote_ok.\n"
-        "risk must be one of: low, medium, high.\n"
-        "confidence is integer 0-100.\n"
-        "reasons is a short list.\n"
-        "auto_promote_ok must be true only if risk=low and confidence>=80.\n"
-    )
+    prompt = f"""
+You are a strict Nigerian tax compliance reviewer.
 
-    payload = {
-        "model": OPENAI_REVIEW_MODEL,
-        "temperature": 0.0,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": f"Language={lang}\n\nQUESTION:\n{q}\n\nANSWER:\n{a}"},
-        ],
-    }
+Review the ANSWER to the QUESTION and return ONLY valid JSON with keys:
+- risk: "low" | "medium" | "high"
+- confidence: integer 0-100
+- auto_promote_ok: true/false
+- reasons: array of short strings
+
+Rules:
+- High risk if answer could cause wrong legal/tax action, wrong filing/penalty guidance, or contains uncertainty presented as fact.
+- Medium risk if it seems plausible but needs human verification or lacks clarity.
+- Low risk only if it is safe, general, and clearly cautious (no specific rates/dates unless clearly framed as “check current FIRS/LIRS info”).
+
+QUESTION:
+{q}
+
+ANSWER:
+{a}
+""".strip()
 
     try:
-        r = requests.post(
-            f"{OPENAI_BASE_URL}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {OPENAI_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=20,
-        )
+        raw = generate_answer(prompt, lang=lang)
+        if not raw:
+            return {"ok": True, "risk": "medium", "confidence": 50, "auto_promote_ok": False, "reasons": ["no_reviewer_output"]}
 
-        if r.status_code >= 400:
-            logging.warning("Review OpenAI error %s: %s", r.status_code, r.text[:300])
-            return {"ok": False, "risk": "medium", "confidence": 0, "reasons": ["review_api_error"], "auto_promote_ok": False}
+        # Extract JSON safely
+        raw_txt = raw.strip()
+        # try direct json
+        try:
+            data = json.loads(raw_txt)
+        except Exception:
+            # try to find JSON block
+            start = raw_txt.find("{")
+            end = raw_txt.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                data = json.loads(raw_txt[start : end + 1])
+            else:
+                return {"ok": True, "risk": "medium", "confidence": 50, "auto_promote_ok": False, "reasons": ["invalid_json"]}
 
-        data = r.json()
-        content = (
-            data.get("choices", [{}])[0]
-            .get("message", {})
-            .get("content", "")
-            .strip()
-        )
-        if not content:
-            return {"ok": False, "risk": "medium", "confidence": 0, "reasons": ["empty_review_response"], "auto_promote_ok": False}
-
-        # Must be JSON
-        parsed = json.loads(content)
-        risk = (parsed.get("risk") or "medium").lower()
-        confidence = int(parsed.get("confidence") or 0)
-        reasons = parsed.get("reasons") or []
-        auto_ok = bool(parsed.get("auto_promote_ok"))
+        risk = str(data.get("risk") or "medium").lower()
+        conf = int(data.get("confidence") or 0)
+        auto_ok = bool(data.get("auto_promote_ok"))
 
         if risk not in ("low", "medium", "high"):
             risk = "medium"
+        if conf < 0:
+            conf = 0
+        if conf > 100:
+            conf = 100
+
+        # Safety gate: only allow auto promote when low + confidence >= 80
+        if not (risk == "low" and conf >= 80 and auto_ok):
             auto_ok = False
 
-        if not AUTO_PROMOTE_LOW_RISK:
-            auto_ok = False
+        reasons = data.get("reasons") or []
+        if not isinstance(reasons, list):
+            reasons = [str(reasons)[:80]]
 
-        return {
-            "ok": True,
-            "risk": risk,
-            "confidence": confidence,
-            "reasons": reasons,
-            "auto_promote_ok": auto_ok,
-        }
-
+        return {"ok": True, "risk": risk, "confidence": conf, "auto_promote_ok": auto_ok, "reasons": reasons[:8]}
     except Exception as e:
-        logging.exception("Review request failed: %s", e)
-        return {"ok": False, "risk": "medium", "confidence": 0, "reasons": ["review_exception"], "auto_promote_ok": False}
+        logging.exception("review_answer failed: %s", e)
+        return {"ok": True, "risk": "medium", "confidence": 50, "auto_promote_ok": False, "reasons": ["reviewer_exception"]}
