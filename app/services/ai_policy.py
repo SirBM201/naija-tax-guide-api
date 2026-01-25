@@ -5,7 +5,6 @@ from typing import Dict, Any, Optional
 
 FREE_DAILY_LIMIT = 2
 
-# Paid plan quotas (agreed)
 PAID_MONTHLY_CREDITS = 300
 PAID_QUARTERLY_CREDITS = 900
 PAID_YEARLY_CREDITS = 3600
@@ -24,19 +23,13 @@ def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _normalize_phone(p: str) -> str:
+    return "".join(ch for ch in (p or "").strip() if ch.isdigit())
+
+
 def _get_subscription(identity: str) -> Optional[Dict[str, Any]]:
-    """
-    user_subscriptions table uses wa_phone as key (from your screenshots).
-    """
     try:
-        r = (
-            _db()
-            .table("user_subscriptions")
-            .select("*")
-            .eq("wa_phone", identity)
-            .limit(1)
-            .execute()
-        )
+        r = _db().table("user_subscriptions").select("*").eq("wa_phone", identity).limit(1).execute()
         rows = getattr(r, "data", None) or []
         return rows[0] if rows else None
     except Exception as e:
@@ -57,7 +50,6 @@ def _is_active_paid(sub: Dict[str, Any]) -> bool:
         return False
 
     try:
-        # expires_at is timestamptz; compare in UTC
         exp_dt = datetime.fromisoformat(str(exp).replace("Z", "+00:00"))
         return exp_dt > datetime.now(timezone.utc)
     except Exception:
@@ -72,15 +64,10 @@ def _paid_quota_for_plan(plan: str) -> int:
         return PAID_QUARTERLY_CREDITS
     if p in ("yearly", "annual", "year"):
         return PAID_YEARLY_CREDITS
-    # default paid quota if unknown paid plan
     return PAID_MONTHLY_CREDITS
 
 
 def _get_daily_usage(identity: str) -> Dict[str, Any]:
-    """
-    ai_daily_usage: wa_phone (text), day (date), count (int), last_used_at (timestamptz)
-    Screenshot also shows ai_count, but we won't rely on it unless you confirm.
-    """
     today = _utc_today().isoformat()
     try:
         r = (
@@ -99,21 +86,83 @@ def _get_daily_usage(identity: str) -> Dict[str, Any]:
         return {"wa_phone": identity, "day": today, "count": 0}
 
 
+def _ensure_paid_ledger(identity: str, sub: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Ensure ai_credit_ledger exists for this subscription period_end=expires_at
+    with base credits for plan (rollover valid for plan period).
+    """
+    period_end = str(sub.get("expires_at"))
+    plan = sub.get("plan") or "paid"
+    base = _paid_quota_for_plan(plan)
+
+    try:
+        r = (
+            _db()
+            .table("ai_credit_ledger")
+            .select("*")
+            .eq("wa_phone", identity)
+            .eq("period_end", period_end)
+            .limit(1)
+            .execute()
+        )
+        rows = getattr(r, "data", None) or []
+        if rows:
+            return rows[0]
+    except Exception:
+        pass
+
+    # Create ledger row if missing
+    try:
+        _db().table("ai_credit_ledger").upsert(
+            {
+                "wa_phone": identity,
+                "period_end": period_end,
+                "plan": plan,
+                "credits_total": base,
+                "credits_used": 0,
+                "updated_at": _iso_now(),
+            },
+            on_conflict="wa_phone,period_end",
+        ).execute()
+
+        r2 = (
+            _db()
+            .table("ai_credit_ledger")
+            .select("*")
+            .eq("wa_phone", identity)
+            .eq("period_end", period_end)
+            .limit(1)
+            .execute()
+        )
+        rows2 = getattr(r2, "data", None) or []
+        return rows2[0] if rows2 else {"credits_total": base, "credits_used": 0, "period_end": period_end}
+    except Exception as e:
+        logging.exception("ensure paid ledger failed: %s", e)
+        return {"credits_total": base, "credits_used": 0, "period_end": period_end}
+
+
 def can_use_ai(identity: str) -> Dict[str, Any]:
-    """
-    Returns:
-      { ok: True, plan: "free"|..., mode: "free_daily"|"paid_credits" }
-      OR { ok: False, reason: "...", action: "upgrade"|"topup" }
-    """
-    identity = (identity or "").strip()
+    identity = _normalize_phone(identity)
     if not identity:
         return {"ok": False, "reason": "missing_identity", "action": "upgrade"}
 
     sub = _get_subscription(identity)
     if sub and _is_active_paid(sub):
-        # Paid users: allow AI; credit exhaustion enforcement will be added at top-up stage.
-        # For now, allow and let consume_ai maintain counters if you add them later.
-        return {"ok": True, "plan": sub.get("plan") or "paid", "mode": "paid_credits"}
+        ledger = _ensure_paid_ledger(identity, sub)
+        total = int(ledger.get("credits_total") or 0)
+        used = int(ledger.get("credits_used") or 0)
+        remaining = total - used
+
+        if remaining <= 0:
+            return {"ok": False, "reason": "paid_credits_exhausted", "action": "topup"}
+
+        return {
+            "ok": True,
+            "plan": sub.get("plan") or "paid",
+            "mode": "paid_credits",
+            "period_end": str(sub.get("expires_at")),
+            "remaining": remaining,
+        }
 
     # Free daily limit
     row = _get_daily_usage(identity)
@@ -124,13 +173,8 @@ def can_use_ai(identity: str) -> Dict[str, Any]:
     return {"ok": True, "plan": "free", "mode": "free_daily"}
 
 
-def consume_ai(identity: str, plan: str, mode: str) -> None:
-    """
-    Free users: increment ai_daily_usage.count
-    Paid users: currently no hard monthly decrement table enforced in this file
-              (we will implement paid credit decrement in the Top-up stage).
-    """
-    identity = (identity or "").strip()
+def consume_ai(identity: str, plan: str, mode: str, period_end: Optional[str] = None) -> None:
+    identity = _normalize_phone(identity)
     if not identity:
         return
 
@@ -153,15 +197,48 @@ def consume_ai(identity: str, plan: str, mode: str) -> None:
             logging.exception("ai_daily_usage upsert failed: %s", e)
         return
 
-    # paid_credits mode (placeholder now; full credit ledger will be implemented in Top-up step)
-    return
+    if mode == "paid_credits":
+        # Need period_end from subscription to increment correct ledger row
+        if not period_end:
+            sub = _get_subscription(identity) or {}
+            period_end = str(sub.get("expires_at") or "")
+
+        if not period_end:
+            return
+
+        try:
+            r = (
+                _db()
+                .table("ai_credit_ledger")
+                .select("credits_total,credits_used")
+                .eq("wa_phone", identity)
+                .eq("period_end", period_end)
+                .limit(1)
+                .execute()
+            )
+            rows = getattr(r, "data", None) or []
+            row = rows[0] if rows else {"credits_total": _paid_quota_for_plan(plan), "credits_used": 0}
+            used = int(row.get("credits_used") or 0) + 1
+            total = int(row.get("credits_total") or 0)
+
+            _db().table("ai_credit_ledger").upsert(
+                {
+                    "wa_phone": identity,
+                    "period_end": period_end,
+                    "plan": plan or "paid",
+                    "credits_total": total,
+                    "credits_used": used,
+                    "updated_at": _iso_now(),
+                },
+                on_conflict="wa_phone,period_end",
+            ).execute()
+        except Exception as e:
+            logging.exception("paid credit consume failed: %s", e)
+        return
 
 
 def log_ai_cost(identity: str, question: str, answer: str, source: str = "ai") -> None:
-    """
-    Optional analytics. Best-effort.
-    If your ai_cost table differs, this will not break the app.
-    """
+    # Best-effort analytics (doesn't break flow)
     try:
         _db().table("ai_cache").insert(
             {
@@ -173,5 +250,4 @@ def log_ai_cost(identity: str, question: str, answer: str, source: str = "ai") -
             }
         ).execute()
     except Exception:
-        # ignore: analytics shouldn't break user flow
         return
