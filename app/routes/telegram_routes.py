@@ -4,8 +4,16 @@ from flask import Blueprint, request, jsonify
 
 from app.core.config import TELEGRAM_WEBHOOK_SECRET
 from app.services.engine import resolve_answer
+from app.services.telegram import (
+    telegram_send_message_ex,
+    telegram_request_phone_keyboard,
+    extract_telegram_phone,
+    extract_telegram_chat_id,
+    extract_telegram_text,
+)
 
 bp = Blueprint("telegram", __name__)
+
 
 @bp.get("/telegram/health")
 def telegram_health():
@@ -27,41 +35,48 @@ def telegram_webhook():
 
     update = request.get_json(silent=True) or {}
 
-    msg = (update.get("message") or {})
-    chat = (msg.get("chat") or {})
-    chat_id = chat.get("id")
+    chat_id = extract_telegram_chat_id(update)
+    text = extract_telegram_text(update)
 
-    text = (msg.get("text") or "").strip()
-    if not chat_id or not text:
-        # Nothing to do (could be sticker/photo/etc.)
+    if not chat_id:
+        return jsonify({"ok": True}), 200
+
+    # ignore non-text updates
+    if not text:
         return jsonify({"ok": True}), 200
 
     logging.info("TG inbound chat_id=%s text=%s", chat_id, text[:200])
 
-    # For now, reuse engine without requiring wa_phone
-    # We'll pass chat_id as identity so you still get caching/library lookup.
+    # IMPORTANT: Use phone identity for unified quota across WhatsApp/Telegram/Web.
+    # Telegram does not always provide phone; we request it if missing.
+    phone = extract_telegram_phone(update)
+
+    if not phone:
+        telegram_send_message_ex(
+            chat_id=chat_id,
+            text=(
+                "To use Naija Tax Guide on Telegram, please share your phone number once.\n\n"
+                "This helps us link your plan and AI credits across WhatsApp, Telegram, and Web."
+            ),
+            reply_markup=telegram_request_phone_keyboard(),
+        )
+        return jsonify({"ok": True}), 200
+
+    # Now phone is our unified identity key (same as WhatsApp wa_phone)
     res = resolve_answer(
-        wa_phone=str(chat_id),
+        wa_phone=str(phone),
         question=text,
         mode="text",
         lang="en",
         source="telegram",
     )
 
-    # IMPORTANT:
-    # This route should just return 200 quickly.
-    # Your actual "sendMessage" call to Telegram can be elsewhere in your code.
-    # If you already have a Telegram send function, call it here.
-    #
-    # Example placeholder: you must replace with your existing send logic.
-    answer = res.get("answer_text") or "OK"
+    if not res.get("ok"):
+        msg = res.get("message") or "Unable to process. Please try again."
+        telegram_send_message_ex(chat_id=chat_id, text=msg)
+        return jsonify({"ok": True}), 200
 
-    # If you already have a working Telegram sender, call it now.
-    # Otherwise keep returning 200 so webhook doesn't fail.
-    try:
-        from app.services.telegram_send import send_telegram_message  # if you have it
-        send_telegram_message(chat_id=str(chat_id), text=answer)
-    except Exception:
-        logging.exception("Telegram send failed or telegram_send not present (webhook still OK).")
+    answer = res.get("answer_text") or "OK"
+    telegram_send_message_ex(chat_id=chat_id, text=answer)
 
     return jsonify({"ok": True}), 200
