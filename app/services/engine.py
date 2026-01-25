@@ -1,6 +1,6 @@
 # app/services/engine.py
 import logging
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Any, Optional, List
 
 from app.db.qa import cache_get, cache_put, library_get
 from app.core.text import normalize_question
@@ -16,15 +16,7 @@ def _db():
 
 
 def _pick_answer_columns(lang: str) -> List[str]:
-    """
-    Your qa_library schema appears to have multiple answer columns.
-    Screenshots show variants like:
-      - answer_en, answer_pcm, answer_yo, answer_ig, answer_ha
-      - answer_pidgin, answer_yoruba, answer_igbo, answer_hausa
-    We'll try multiple candidates safely (best-effort).
-    """
     l = (lang or "en").strip().lower()
-
     mapping = {
         "en": ["answer_en", "answer"],
         "pcm": ["answer_pcm", "answer_pidgin", "answer_pigdin", "answer"],
@@ -35,18 +27,7 @@ def _pick_answer_columns(lang: str) -> List[str]:
     return mapping.get(l, ["answer_en", "answer"])
 
 
-def _insert_suggestion(
-    q_norm: str,
-    q_raw: str,
-    lang: str,
-    answer: str,
-    source: str,
-    review: Dict[str, Any],
-) -> None:
-    """
-    Table: qa_suggestions exists.
-    Best-effort: schema mismatches won't break the app.
-    """
+def _insert_suggestion(q_norm: str, q_raw: str, lang: str, answer: str, source: str, review: Dict[str, Any]) -> None:
     try:
         _db().table("qa_suggestions").insert(
             {
@@ -66,23 +47,10 @@ def _insert_suggestion(
 
 
 def _auto_promote_to_library(q_norm: str, q_raw: str, lang: str, answer: str) -> bool:
-    """
-    Your qa_library has UNIQUE index on normalized_question only.
-    So: on_conflict="normalized_question"
-
-    We will:
-    - set normalized_question
-    - (optionally) set question text if column exists
-    - set the correct language answer column (answer_en/answer_pcm/...)
-    - set enabled/priority/source if those columns exist (best-effort)
-
-    Because schema differs across setups, we try a few payload variants.
-    """
     cols_to_try = _pick_answer_columns(lang)
 
     base_payload = {
         "normalized_question": q_norm,
-        # many schemas also store the readable question:
         "question": (q_raw or "")[:500],
         "enabled": True,
         "source": "auto_ai",
@@ -99,7 +67,6 @@ def _auto_promote_to_library(q_norm: str, q_raw: str, lang: str, answer: str) ->
         except Exception as e:
             logging.exception("qa_library auto-promote failed using %s (ignored): %s", ans_col, e)
 
-            # retry with minimum payload (in case columns not present)
             try:
                 minimal = {"normalized_question": q_norm, ans_col: answer}
                 _db().table("qa_library").upsert(minimal, on_conflict="normalized_question").execute()
@@ -117,11 +84,6 @@ def resolve_answer(
     lang: str = "en",
     source: str = "web",
 ) -> Dict[str, Any]:
-    """
-    Unified engine for Web / WhatsApp / Telegram.
-    IMPORTANT: 'wa_phone' here is your unified identity key (phone digits).
-    Telegram must pass the user's phone (not chat_id) so quotas unify.
-    """
     identity = (wa_phone or "").strip()
     q_raw = (question or "").strip()
     q_norm = normalize_question(q_raw)
@@ -141,7 +103,7 @@ def resolve_answer(
     if cached and cached.get("answer"):
         return {"ok": True, "answer_text": cached["answer"], "source": "cache"}
 
-    # 2) Library (your existing library_get should handle lang mapping)
+    # 2) Library
     lib = None
     try:
         lib = library_get(q_norm, lang=lang)
@@ -156,12 +118,12 @@ def resolve_answer(
             logging.exception("cache_put failed (ignored): %s", e)
         return {"ok": True, "answer_text": ans, "source": "library"}
 
-    # 3) AI fallback (enforce plan limits)
+    # 3) AI fallback (quota enforced)
     quota = can_use_ai(identity)
     if not quota.get("ok"):
         action = quota.get("action")
         if action == "topup":
-            msg = "Your AI credits for this plan are finished. Please top up to continue."
+            msg = "Your AI credits are finished. Please top up to continue."
         else:
             msg = "You have used your free AI limit for today (2/day). Please upgrade to continue."
         return {"ok": False, "message": msg, "reason": quota.get("reason"), "action": action}
@@ -176,7 +138,12 @@ def resolve_answer(
 
     # consume usage only after AI success
     try:
-        consume_ai(identity, quota.get("plan", "free"), quota.get("mode", "free_daily"))
+        consume_ai(
+            identity,
+            quota.get("plan", "free"),
+            quota.get("mode", "free_daily"),
+            period_end=quota.get("period_end"),
+        )
     except Exception as e:
         logging.exception("consume_ai failed (ignored): %s", e)
 
@@ -192,7 +159,7 @@ def resolve_answer(
     except Exception as e:
         logging.exception("log_ai_cost failed (ignored): %s", e)
 
-    # 4) Risk scorer review (reduces admin work)
+    # 4) Risk review
     review = review_answer(q_raw, ai_text, lang=lang)
 
     auto_promoted = False
