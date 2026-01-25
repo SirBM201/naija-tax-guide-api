@@ -51,31 +51,59 @@ def _normalize_phone(p: str) -> str:
     return "".join(ch for ch in (p or "").strip() if ch.isdigit())
 
 
+def _is_active_paid_subscription(sub: Optional[Dict[str, Any]]) -> bool:
+    if not sub:
+        return False
+
+    status = (sub.get("status") or "").strip().lower()
+    if status and status not in ("active", "paid"):
+        return False
+
+    exp = sub.get("expires_at")
+    if not exp:
+        return False
+
+    try:
+        exp_dt = datetime.fromisoformat(str(exp).replace("Z", "+00:00"))
+        return exp_dt > datetime.now(timezone.utc)
+    except Exception:
+        return False
+
+
+def _get_subscription(wa_phone: str) -> Optional[Dict[str, Any]]:
+    try:
+        r = _db().table("user_subscriptions").select("*").eq("wa_phone", wa_phone).limit(1).execute()
+        rows = getattr(r, "data", None) or []
+        return rows[0] if rows else None
+    except Exception as e:
+        logging.exception("subscription lookup failed: %s", e)
+        return None
+
+
 # ------------------------------------------------------------
 # LOCKED TOPUP PACKAGES (EDIT PRICES HERE)
 # ------------------------------------------------------------
 # Amounts are in Kobo (₦1 = 100 kobo)
-# These are example prices — adjust to your final pricing.
 TOPUP_PACKAGES: Dict[str, Dict[str, Any]] = {
     "TOPUP_100": {
         "package_code": "TOPUP_100",
         "title": "100 AI Credits",
         "credits": 100,
-        "amount_kobo": 200_00,  # ₦200.00
+        "amount_kobo": 200_00,  # ₦200.00 (example)
         "currency": "NGN",
     },
     "TOPUP_300": {
         "package_code": "TOPUP_300",
         "title": "300 AI Credits",
         "credits": 300,
-        "amount_kobo": 500_00,  # ₦500.00
+        "amount_kobo": 500_00,  # ₦500.00 (example)
         "currency": "NGN",
     },
     "TOPUP_1000": {
         "package_code": "TOPUP_1000",
         "title": "1000 AI Credits",
         "credits": 1000,
-        "amount_kobo": 1500_00,  # ₦1,500.00
+        "amount_kobo": 1500_00,  # ₦1,500.00 (example)
         "currency": "NGN",
     },
 }
@@ -92,16 +120,13 @@ def paystack_health():
     return jsonify({"ok": True, "service": "paystack"}), 200
 
 
-# Optional endpoint for frontend to fetch packages
 @bp.get("/paystack/topup/packages")
 def paystack_topup_packages():
-    # Return packages as a list for UI
-    pkgs = list(TOPUP_PACKAGES.values())
-    return jsonify({"ok": True, "packages": pkgs}), 200
+    return jsonify({"ok": True, "packages": list(TOPUP_PACKAGES.values())}), 200
 
 
 # -----------------------------
-# TOP-UP: Initialize (LOCKED)
+# TOP-UP: Initialize (LOCKED + PAID-ONLY)
 # -----------------------------
 @bp.post("/paystack/topup/initialize")
 def paystack_topup_initialize():
@@ -112,6 +137,10 @@ def paystack_topup_initialize():
         "email": "user@example.com",
         "package_code": "TOPUP_300"
       }
+
+    Rules:
+      - Only active paid subscribers can top up.
+      - Free users must upgrade (no top-up).
 
     Response:
       { ok: true, authorization_url, reference, credits, amount_kobo, package_code }
@@ -130,6 +159,18 @@ def paystack_topup_initialize():
     if not email or "@" not in email:
         return jsonify({"ok": False, "message": "Valid email is required"}), 400
 
+    # PAID-ONLY GUARD
+    sub = _get_subscription(wa_phone)
+    if not _is_active_paid_subscription(sub):
+        return jsonify(
+            {
+                "ok": False,
+                "message": "Top-up is only available to active subscribers. Please upgrade first.",
+                "action": "upgrade",
+                "reason": "not_subscribed_or_expired",
+            }
+        ), 403
+
     pkg = _get_topup_package(package_code)
     if not pkg:
         return jsonify({"ok": False, "message": "Invalid package_code"}), 400
@@ -137,7 +178,6 @@ def paystack_topup_initialize():
     credits = int(pkg["credits"])
     amount_kobo = int(pkg["amount_kobo"])
 
-    # Create reference
     reference = f"topup_{wa_phone}_{package_code}_{int(datetime.now(timezone.utc).timestamp())}"
 
     # store pending order first
@@ -238,11 +278,10 @@ def paystack_webhook():
     reference = (data.get("reference") or "").strip()
     logging.info("Paystack webhook event=%s purpose=%s ref=%s", event_type, purpose, reference)
 
-    # TOP-UP events
     if purpose == "ai_topup":
         return _handle_topup(event_type, data, event)
 
-    # Subscription events (optional handler)
+    # Subscription events (optional handler you may already have)
     try:
         from app.services.subscriptions import handle_subscription_paystack_event  # optional
         handle_subscription_paystack_event(event_type, data, event)
@@ -262,6 +301,7 @@ def _handle_topup(event_type: str, data: Dict[str, Any], full_event: Dict[str, A
 
     reference = (data.get("reference") or "").strip()
     metadata = data.get("metadata") or {}
+
     wa_phone = _normalize_phone(metadata.get("wa_phone") or "")
     credits = _int(metadata.get("credits"))
     package_code = (metadata.get("package_code") or "").strip().upper()
@@ -324,20 +364,14 @@ def _handle_topup(event_type: str, data: Dict[str, Any], full_event: Dict[str, A
     except Exception as e:
         logging.exception("ai_topup_orders upsert paid failed: %s", e)
 
-    # Credit ledger
+    # Credit ledger (current subscription period)
     _credit_ledger(wa_phone, credits)
 
     return jsonify({"ok": True}), 200
 
 
 def _credit_ledger(wa_phone: str, credits: int) -> None:
-    sub = None
-    try:
-        r = _db().table("user_subscriptions").select("*").eq("wa_phone", wa_phone).limit(1).execute()
-        rows = getattr(r, "data", None) or []
-        sub = rows[0] if rows else None
-    except Exception:
-        sub = None
+    sub = _get_subscription(wa_phone)
 
     if sub and sub.get("expires_at"):
         period_end = str(sub.get("expires_at"))
