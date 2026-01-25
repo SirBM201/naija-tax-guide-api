@@ -22,10 +22,6 @@ def _insert_suggestion(
     source: str,
     review: Dict[str, Any],
 ) -> None:
-    """
-    Table: qa_suggestions exists in your DB.
-    Best-effort; schema mismatches won't break the app.
-    """
     try:
         _db().table("qa_suggestions").insert(
             {
@@ -45,12 +41,6 @@ def _insert_suggestion(
 
 
 def _answer_columns_for_lang(lang: str) -> list[str]:
-    """
-    Your qa_library shows BOTH naming styles in screenshots:
-      - answer_en, answer_pcm, answer_yo, answer_ig, answer_ha
-      - answer_pidgin, answer_yoruba, answer_igbo, answer_hausa
-    We try both to avoid guessing wrong.
-    """
     l = (lang or "en").lower().strip()
 
     if l in ("en", "english"):
@@ -72,15 +62,9 @@ def _answer_columns_for_lang(lang: str) -> list[str]:
 
 
 def _auto_promote_to_library(q_norm: str, q_raw: str, lang: str, answer: str) -> bool:
-    """
-    Upsert into qa_library with:
-      - UNIQUE normalized_question (confirmed)
-      - write into the correct answer_* column
-    """
     cols = _answer_columns_for_lang(lang)
 
     for col in cols:
-        # Try with question + answer col
         try:
             _db().table("qa_library").upsert(
                 {
@@ -94,7 +78,6 @@ def _auto_promote_to_library(q_norm: str, q_raw: str, lang: str, answer: str) ->
         except Exception as e:
             logging.exception("qa_library promote failed col=%s (ignored): %s", col, e)
 
-        # Retry minimal payload
         try:
             _db().table("qa_library").upsert(
                 {"normalized_question": q_norm, col: (answer or "")[:4000]},
@@ -108,7 +91,7 @@ def _auto_promote_to_library(q_norm: str, q_raw: str, lang: str, answer: str) ->
 
 
 def resolve_answer(
-    wa_phone: str,
+    user_phone: str,         # <-- ANY channel phone (WA or TG or Web)
     question: str,
     mode: str = "text",
     lang: str = "en",
@@ -118,8 +101,8 @@ def resolve_answer(
     q_norm = normalize_question(q_raw)
 
     logging.info(
-        "ENGINE source=%s wa_phone=%s lang=%s mode=%s raw=%s norm=%s",
-        source, wa_phone, lang, mode, q_raw[:120], q_norm[:120]
+        "ENGINE source=%s phone=%s lang=%s mode=%s raw=%s norm=%s",
+        source, user_phone, lang, mode, q_raw[:120], q_norm[:120]
     )
 
     # 1) Cache
@@ -148,7 +131,7 @@ def resolve_answer(
         return {"ok": True, "answer_text": ans, "source": "library"}
 
     # 3) AI fallback (enforce plan limits)
-    quota = can_use_ai(wa_phone)
+    quota = can_use_ai(user_phone)
     if not quota.get("ok"):
         action = quota.get("action")
         if action == "topup":
@@ -173,9 +156,10 @@ def resolve_answer(
     # consume usage only after AI success
     try:
         consume_ai(
-            wa_phone,
+            user_phone,
             quota.get("plan", "free"),
             quota.get("mode", "free_daily"),
+            user_key=quota.get("user_key"),
             user_id=quota.get("user_id"),
         )
     except Exception as e:
@@ -189,7 +173,7 @@ def resolve_answer(
 
     # cost tracking
     try:
-        log_ai_cost(wa_phone, q_raw, ai_text, source="ai")
+        log_ai_cost(user_phone, q_raw, ai_text, source="ai")
     except Exception as e:
         logging.exception("log_ai_cost failed (ignored): %s", e)
 
