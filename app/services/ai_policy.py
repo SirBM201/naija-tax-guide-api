@@ -1,34 +1,41 @@
 import logging
-from datetime import datetime, timezone, date, timedelta
-from typing import Any, Dict, Optional, Tuple
+from datetime import datetime, timezone, date
+from typing import Any, Dict, Optional
 
-# ------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------
 
+# -----------------------------
+# Time helpers
+# -----------------------------
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
+
 
 def iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat()
 
+
 def today_utc() -> date:
     return now_utc().date()
 
-def _db():
-    from app.db.supabase_client import supabase as get_supabase
-    return get_supabase()
 
-def _safe_get_first(res: Any) -> Optional[Dict[str, Any]]:
-    rows = getattr(res, "data", None) or []
-    return rows[0] if rows else None
+def first_day_of_month(d: date) -> date:
+    return date(d.year, d.month, 1)
+
+
+def first_day_of_quarter(d: date) -> date:
+    q = (d.month - 1) // 3  # 0..3
+    month = q * 3 + 1
+    return date(d.year, month, 1)
+
+
+def first_day_of_year(d: date) -> date:
+    return date(d.year, 1, 1)
+
 
 def _parse_dt(value: Any) -> Optional[datetime]:
     if not value:
         return None
     try:
-        # Supabase returns ISO strings; Python can parse many ISO forms
-        # If it lacks timezone, assume UTC.
         s = str(value)
         dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
         if dt.tzinfo is None:
@@ -38,14 +45,28 @@ def _parse_dt(value: Any) -> Optional[datetime]:
         return None
 
 
-# ------------------------------------------------------------
-# Plan configuration (FINAL & AGREED)
-# ------------------------------------------------------------
+# -----------------------------
+# DB
+# -----------------------------
+def _db():
+    from app.db.supabase_client import supabase as get_supabase
+    return get_supabase()
 
+
+def _safe_first(res: Any) -> Optional[Dict[str, Any]]:
+    rows = getattr(res, "data", None) or []
+    return rows[0] if rows else None
+
+
+# -----------------------------
+# Policy (FINAL & AGREED)
+# -----------------------------
 PLAN_FREE = "free"
 PLAN_MONTHLY = "monthly"
 PLAN_QUARTERLY = "quarterly"
 PLAN_YEARLY = "yearly"
+
+FREE_DAILY_LIMIT = 2
 
 CREDITS_BY_PLAN = {
     PLAN_MONTHLY: 300,
@@ -53,293 +74,335 @@ CREDITS_BY_PLAN = {
     PLAN_YEARLY: 3600,
 }
 
-FREE_DAILY_LIMIT = 2
+
+def _normalize_plan(plan: str) -> str:
+    p = (plan or "").lower().strip()
+    if p in (PLAN_MONTHLY, PLAN_QUARTERLY, PLAN_YEARLY):
+        return p
+    return PLAN_FREE
 
 
-# ------------------------------------------------------------
-# Subscription + Credits logic
-# ------------------------------------------------------------
+def _plan_period_start(plan: str, d: date) -> date:
+    """
+    Your ai_credits table has a 'month' date column.
+    We'll store the plan period "anchor" in this column.
 
+    - monthly: first day of this month
+    - quarterly: first day of this quarter
+    - yearly: Jan 1
+    """
+    p = _normalize_plan(plan)
+    if p == PLAN_MONTHLY:
+        return first_day_of_month(d)
+    if p == PLAN_QUARTERLY:
+        return first_day_of_quarter(d)
+    if p == PLAN_YEARLY:
+        return first_day_of_year(d)
+    return first_day_of_month(d)
+
+
+# -----------------------------
+# Subscription reader
+# -----------------------------
 def _get_active_subscription(wa_phone: str) -> Dict[str, Any]:
     """
-    Reads user_subscriptions for wa_phone.
-    Expected columns (best effort):
+    Best-effort read from user_subscriptions.
+
+    Expected (common) columns:
       - wa_phone
-      - plan (free/monthly/quarterly/yearly)
-      - status (active)
-      - expires_at (timestamptz)
+      - plan
+      - status
+      - expires_at
+      - user_id (uuid)  <-- IMPORTANT for ai_credits
+      - created_at / updated_at (optional)
+
     Returns:
-      { "plan": str, "active": bool, "expires_at": datetime|None }
+      {
+        "active": bool,
+        "plan": "free|monthly|quarterly|yearly",
+        "expires_at": datetime|None,
+        "plan_expiry": str|None,
+        "user_id": str|None
+      }
     """
     wa = (wa_phone or "").strip()
     if not wa:
-        return {"plan": PLAN_FREE, "active": False, "expires_at": None}
+        return {"active": False, "plan": PLAN_FREE, "expires_at": None, "plan_expiry": None, "user_id": None}
 
     try:
         res = (
             _db()
             .table("user_subscriptions")
-            .select("plan,status,expires_at")
+            .select("plan,status,expires_at,user_id,created_at,updated_at")
             .eq("wa_phone", wa)
             .limit(1)
             .execute()
         )
-        row = _safe_get_first(res)
+        row = _safe_first(res)
         if not row:
-            return {"plan": PLAN_FREE, "active": False, "expires_at": None}
+            return {"active": False, "plan": PLAN_FREE, "expires_at": None, "plan_expiry": None, "user_id": None}
 
-        plan = (row.get("plan") or PLAN_FREE).lower().strip()
+        plan = _normalize_plan(row.get("plan") or PLAN_FREE)
         status = (row.get("status") or "").lower().strip()
-        exp = _parse_dt(row.get("expires_at"))
+        exp_dt = _parse_dt(row.get("expires_at"))
+        user_id = row.get("user_id")
 
-        # determine active
-        active = False
-        if status == "active" and exp and exp > now_utc():
-            active = True
+        active = bool(status == "active" and exp_dt and exp_dt > now_utc() and plan != PLAN_FREE)
+        plan_expiry = iso(exp_dt) if exp_dt else None
 
-        if not active:
-            return {"plan": PLAN_FREE, "active": False, "expires_at": exp}
-
-        # normalize plan
-        if plan not in (PLAN_MONTHLY, PLAN_QUARTERLY, PLAN_YEARLY):
-            # Any unknown paid plan name falls back to monthly credits logic only if active
-            # but safest is treat as monthly
-            plan = PLAN_MONTHLY
-
-        return {"plan": plan, "active": True, "expires_at": exp}
+        return {
+            "active": active,
+            "plan": plan if active else PLAN_FREE,
+            "expires_at": exp_dt,
+            "plan_expiry": plan_expiry,
+            "user_id": str(user_id) if user_id else None,
+        }
 
     except Exception as e:
-        logging.exception("Failed to read user_subscriptions (fallback to free): %s", e)
-        return {"plan": PLAN_FREE, "active": False, "expires_at": None}
+        logging.exception("user_subscriptions read failed (fallback free): %s", e)
+        return {"active": False, "plan": PLAN_FREE, "expires_at": None, "plan_expiry": None, "user_id": None}
 
 
-def _ensure_credit_bucket(wa_phone: str, plan: str, plan_expires_at: datetime) -> Dict[str, Any]:
-    """
-    Ensures ai_credits has a row for this wa_phone for the current plan period.
-    Best effort schema assumptions:
-      ai_credits columns (typical):
-        - wa_phone (unique)
-        - plan
-        - credits_remaining
-        - expires_at
-        - updated_at
-        - created_at
-    Returns:
-      { "ok": True, "remaining": int, "expires_at": datetime }
-    """
-    wa = (wa_phone or "").strip()
-    if not wa:
-        return {"ok": False, "remaining": 0, "expires_at": None}
-
-    default_credits = int(CREDITS_BY_PLAN.get(plan, 300))
-
-    # 1) Read current credit record
-    try:
-        res = (
-            _db()
-            .table("ai_credits")
-            .select("*")
-            .eq("wa_phone", wa)
-            .limit(1)
-            .execute()
-        )
-        row = _safe_get_first(res)
-    except Exception as e:
-        logging.exception("ai_credits read failed: %s", e)
-        row = None
-
-    now = now_utc()
-
-    if row:
-        # Evaluate whether this bucket matches current plan period
-        row_plan = (row.get("plan") or "").lower().strip()
-        row_exp = _parse_dt(row.get("expires_at"))
-        remaining = row.get("credits_remaining")
-
-        try:
-            remaining_int = int(remaining) if remaining is not None else 0
-        except Exception:
-            remaining_int = 0
-
-        # If bucket is still valid for this plan period, return it
-        if row_exp and row_exp > now and row_plan == plan:
-            return {"ok": True, "remaining": max(0, remaining_int), "expires_at": row_exp}
-
-        # Otherwise, reset bucket to match the active plan period
-        try:
-            _db().table("ai_credits").upsert(
-                {
-                    "wa_phone": wa,
-                    "plan": plan,
-                    "credits_remaining": default_credits,
-                    "expires_at": iso(plan_expires_at),
-                    "updated_at": iso(now),
-                },
-                on_conflict="wa_phone",
-            ).execute()
-            return {"ok": True, "remaining": default_credits, "expires_at": plan_expires_at}
-        except Exception as e:
-            logging.exception("ai_credits reset failed: %s", e)
-            return {"ok": False, "remaining": 0, "expires_at": None}
-
-    # No row exists: create it
-    try:
-        _db().table("ai_credits").upsert(
-            {
-                "wa_phone": wa,
-                "plan": plan,
-                "credits_remaining": default_credits,
-                "expires_at": iso(plan_expires_at),
-                "created_at": iso(now),
-                "updated_at": iso(now),
-            },
-            on_conflict="wa_phone",
-        ).execute()
-        return {"ok": True, "remaining": default_credits, "expires_at": plan_expires_at}
-    except Exception as e:
-        logging.exception("ai_credits create failed: %s", e)
-        return {"ok": False, "remaining": 0, "expires_at": None}
-
-
-def _get_free_daily_usage(wa_phone: str) -> int:
-    """
-    Reads ai_daily_usage for today's usage for this wa_phone.
-    Assumed columns:
-      - wa_phone
-      - day (date) OR used_on (date) OR created_at (timestamp)
-      - used_count (int) or count (int)
-    We'll implement a best-effort pattern:
-      - prefer columns: wa_phone + day
-      - used_count
-    """
+# -----------------------------
+# Free daily usage (ai_daily_usage)
+# -----------------------------
+def _get_free_daily_count(wa_phone: str) -> int:
     wa = (wa_phone or "").strip()
     if not wa:
         return 0
-
     d = str(today_utc())
+
     try:
         res = (
             _db()
             .table("ai_daily_usage")
-            .select("*")
+            .select("count")
             .eq("wa_phone", wa)
             .eq("day", d)
             .limit(1)
             .execute()
         )
-        row = _safe_get_first(res)
-        if row:
-            v = row.get("used_count")
-            try:
-                return int(v) if v is not None else 0
-            except Exception:
-                return 0
-    except Exception:
-        # fallback below
-        pass
-
-    # Fallback: try used_on
-    try:
-        res = (
-            _db()
-            .table("ai_daily_usage")
-            .select("*")
-            .eq("wa_phone", wa)
-            .eq("used_on", d)
-            .limit(1)
-            .execute()
-        )
-        row = _safe_get_first(res)
-        if row:
-            v = row.get("used_count") or row.get("count")
-            try:
-                return int(v) if v is not None else 0
-            except Exception:
-                return 0
+        row = _safe_first(res)
+        if not row:
+            return 0
+        try:
+            return int(row.get("count") or 0)
+        except Exception:
+            return 0
     except Exception as e:
         logging.exception("ai_daily_usage read failed: %s", e)
+        return 0
 
-    return 0
 
-
-def _inc_free_daily_usage(wa_phone: str) -> None:
-    """
-    Increments today's free usage count (best effort).
-    """
+def _inc_free_daily_count(wa_phone: str) -> None:
     wa = (wa_phone or "").strip()
     if not wa:
         return
 
     d = str(today_utc())
-    current = _get_free_daily_usage(wa)
+    current = _get_free_daily_count(wa)
+    new_val = current + 1
 
-    # try update via upsert on (wa_phone,day)
-    payload = {
-        "wa_phone": wa,
-        "day": d,
-        "used_count": current + 1,
-        "updated_at": iso(now_utc()),
-    }
-
+    # Best-effort upsert on (wa_phone, day). If no unique constraint exists,
+    # fallback to update then insert.
     try:
-        _db().table("ai_daily_usage").upsert(payload, on_conflict="wa_phone,day").execute()
+        _db().table("ai_daily_usage").upsert(
+            {
+                "wa_phone": wa,
+                "day": d,
+                "count": new_val,
+                "last_used_at": iso(now_utc()),
+            },
+            on_conflict="wa_phone,day",
+        ).execute()
         return
     except Exception:
         pass
 
-    # try upsert on (wa_phone,used_on)
-    payload2 = {
-        "wa_phone": wa,
-        "used_on": d,
-        "used_count": current + 1,
-        "updated_at": iso(now_utc()),
-    }
+    # Update then insert fallback
     try:
-        _db().table("ai_daily_usage").upsert(payload2, on_conflict="wa_phone,used_on").execute()
+        _db().table("ai_daily_usage").update(
+            {"count": new_val, "last_used_at": iso(now_utc())}
+        ).eq("wa_phone", wa).eq("day", d).execute()
         return
     except Exception:
         pass
 
-    # fallback insert
     try:
-        _db().table("ai_daily_usage").insert(payload).execute()
+        _db().table("ai_daily_usage").insert(
+            {"wa_phone": wa, "day": d, "count": new_val, "last_used_at": iso(now_utc())}
+        ).execute()
     except Exception as e:
         logging.exception("ai_daily_usage increment failed (ignored): %s", e)
 
 
-# ------------------------------------------------------------
-# Public API used by engine.py
-# ------------------------------------------------------------
+# -----------------------------
+# Paid credits (ai_credits)
+# -----------------------------
+def _get_or_create_credit_row(user_id: str, plan: str) -> Dict[str, Any]:
+    """
+    ai_credits schema (from your screenshot):
+      user_id (uuid), plan (text), month (date),
+      credits_total, credits_used, credits_available
 
+    We store one row per user per plan period anchor (month field).
+
+    Returns:
+      { ok: bool, credits_available: int, credits_used: int, credits_total: int, month: str }
+    """
+    uid = (user_id or "").strip()
+    if not uid:
+        return {"ok": False, "credits_available": 0, "credits_used": 0, "credits_total": 0, "month": None}
+
+    p = _normalize_plan(plan)
+    if p == PLAN_FREE:
+        return {"ok": False, "credits_available": 0, "credits_used": 0, "credits_total": 0, "month": None}
+
+    anchor = _plan_period_start(p, today_utc())
+    anchor_s = str(anchor)
+
+    # Try read current period
+    try:
+        res = (
+            _db()
+            .table("ai_credits")
+            .select("user_id,plan,month,credits_total,credits_used,credits_available")
+            .eq("user_id", uid)
+            .eq("month", anchor_s)
+            .limit(1)
+            .execute()
+        )
+        row = _safe_first(res)
+        if row:
+            total = int(row.get("credits_total") or 0)
+            used = int(row.get("credits_used") or 0)
+            avail = row.get("credits_available")
+            avail_int = int(avail) if avail is not None else max(0, total - used)
+            return {"ok": True, "credits_total": total, "credits_used": used, "credits_available": avail_int, "month": anchor_s}
+    except Exception as e:
+        logging.exception("ai_credits read failed: %s", e)
+
+    # Create new period row
+    total = int(CREDITS_BY_PLAN.get(p, 300))
+    used = 0
+    avail = total
+
+    payload = {
+        "user_id": uid,
+        "plan": p,
+        "month": anchor_s,
+        "credits_total": total,
+        "credits_used": used,
+        "credits_available": avail,
+    }
+
+    # Best-effort upsert; if unique constraint differs, fallback insert.
+    try:
+        _db().table("ai_credits").upsert(payload, on_conflict="user_id,month").execute()
+        return {"ok": True, "credits_total": total, "credits_used": used, "credits_available": avail, "month": anchor_s}
+    except Exception:
+        pass
+
+    try:
+        _db().table("ai_credits").insert(payload).execute()
+        return {"ok": True, "credits_total": total, "credits_used": used, "credits_available": avail, "month": anchor_s}
+    except Exception as e:
+        logging.exception("ai_credits create failed: %s", e)
+        return {"ok": False, "credits_total": 0, "credits_used": 0, "credits_available": 0, "month": None}
+
+
+def _consume_paid_credit(user_id: str, plan: str) -> None:
+    uid = (user_id or "").strip()
+    if not uid:
+        return
+
+    p = _normalize_plan(plan)
+    if p == PLAN_FREE:
+        return
+
+    anchor = _plan_period_start(p, today_utc())
+    anchor_s = str(anchor)
+
+    row = _get_or_create_credit_row(uid, p)
+    if not row.get("ok"):
+        return
+
+    total = int(row.get("credits_total") or 0)
+    used = int(row.get("credits_used") or 0)
+    new_used = used + 1
+    new_avail = max(0, total - new_used)
+
+    # Update (prefer update over upsert to avoid overwriting totals unexpectedly)
+    try:
+        _db().table("ai_credits").update(
+            {
+                "credits_used": new_used,
+                "credits_available": new_avail,
+                "plan": p,
+            }
+        ).eq("user_id", uid).eq("month", anchor_s).execute()
+        return
+    except Exception as e:
+        logging.exception("ai_credits update failed (ignored): %s", e)
+
+    # Fallback upsert
+    try:
+        _db().table("ai_credits").upsert(
+            {
+                "user_id": uid,
+                "plan": p,
+                "month": anchor_s,
+                "credits_total": total,
+                "credits_used": new_used,
+                "credits_available": new_avail,
+            },
+            on_conflict="user_id,month",
+        ).execute()
+    except Exception as e2:
+        logging.exception("ai_credits upsert fallback failed (ignored): %s", e2)
+
+
+# -----------------------------
+# Public API for engine.py
+# -----------------------------
 def can_use_ai(wa_phone: str) -> Dict[str, Any]:
     """
     Returns a decision dict consumed by engine.py.
 
-    If allowed:
-      { ok: True, plan: "free|monthly|quarterly|yearly", mode: "free_daily|credits", plan_expiry: str|None }
+    Allowed:
+      { ok: True, plan, mode: "free_daily|credits", plan_expiry, user_id }
 
-    If blocked:
-      { ok: False, action: "upgrade|topup", reason: "...", plan_expiry: str|None }
+    Blocked:
+      { ok: False, action: "upgrade|topup", reason, plan_expiry }
     """
     sub = _get_active_subscription(wa_phone)
 
-    # Paid plan
+    # Paid
     if sub.get("active"):
-        plan = sub.get("plan", PLAN_MONTHLY)
-        exp_dt = sub.get("expires_at")
-        plan_expiry = iso(exp_dt) if exp_dt else None
+        plan = sub.get("plan")
+        plan_expiry = sub.get("plan_expiry")
+        user_id = sub.get("user_id")
 
-        bucket = _ensure_credit_bucket(wa_phone, plan, exp_dt) if exp_dt else {"ok": False, "remaining": 0}
-        if not bucket.get("ok"):
+        if not user_id:
+            # Paid subscription exists but cannot locate user_id for credits table
             return {
                 "ok": False,
                 "action": "topup",
-                "reason": "Unable to verify your AI credit balance. Please try again.",
+                "reason": "paid_user_id_missing",
                 "plan_expiry": plan_expiry,
             }
 
-        remaining = int(bucket.get("remaining") or 0)
-        if remaining <= 0:
+        credit_row = _get_or_create_credit_row(user_id, plan)
+        if not credit_row.get("ok"):
+            return {
+                "ok": False,
+                "action": "topup",
+                "reason": "credits_unavailable",
+                "plan_expiry": plan_expiry,
+            }
+
+        avail = int(credit_row.get("credits_available") or 0)
+        if avail <= 0:
             return {
                 "ok": False,
                 "action": "topup",
@@ -347,76 +410,52 @@ def can_use_ai(wa_phone: str) -> Dict[str, Any]:
                 "plan_expiry": plan_expiry,
             }
 
-        return {"ok": True, "plan": plan, "mode": "credits", "plan_expiry": plan_expiry}
+        return {
+            "ok": True,
+            "plan": plan,
+            "mode": "credits",
+            "plan_expiry": plan_expiry,
+            "user_id": user_id,
+        }
 
-    # Free plan
-    used = _get_free_daily_usage(wa_phone)
-    if used >= FREE_DAILY_LIMIT:
+    # Free
+    used_today = _get_free_daily_count(wa_phone)
+    if used_today >= FREE_DAILY_LIMIT:
         return {"ok": False, "action": "upgrade", "reason": "free_daily_exhausted", "plan_expiry": None}
 
-    return {"ok": True, "plan": PLAN_FREE, "mode": "free_daily", "plan_expiry": None}
+    return {"ok": True, "plan": PLAN_FREE, "mode": "free_daily", "plan_expiry": None, "user_id": None}
 
 
-def consume_ai(wa_phone: str, plan: str, mode: str) -> None:
+def consume_ai(wa_phone: str, plan: str, mode: str, user_id: Optional[str] = None) -> None:
     """
     Consumes one unit:
-      - free_daily -> increments ai_daily_usage for today
-      - credits -> decrements ai_credits.credits_remaining
-    Best-effort: failures are logged but shouldn't crash app.
+      - free_daily -> increments ai_daily_usage.count
+      - credits -> increments ai_credits.credits_used and updates credits_available
     """
-    wa = (wa_phone or "").strip()
-    if not wa:
+    m = (mode or "").lower().strip()
+
+    if m == "free_daily":
+        _inc_free_daily_count(wa_phone)
         return
 
-    mode = (mode or "").lower().strip()
+    if m == "credits":
+        uid = (user_id or "").strip()
+        if not uid:
+            # best-effort: try fetch from subscription
+            sub = _get_active_subscription(wa_phone)
+            uid = (sub.get("user_id") or "").strip()
 
-    if mode == "free_daily":
-        _inc_free_daily_usage(wa)
+        if uid:
+            _consume_paid_credit(uid, plan)
+        else:
+            logging.error("consume_ai credits: missing user_id for wa_phone=%s", wa_phone)
         return
-
-    if mode == "credits":
-        # decrement credits_remaining
-        try:
-            res = (
-                _db()
-                .table("ai_credits")
-                .select("credits_remaining")
-                .eq("wa_phone", wa)
-                .limit(1)
-                .execute()
-            )
-            row = _safe_get_first(res)
-            remaining = 0
-            if row and row.get("credits_remaining") is not None:
-                try:
-                    remaining = int(row.get("credits_remaining"))
-                except Exception:
-                    remaining = 0
-
-            new_val = max(0, remaining - 1)
-
-            _db().table("ai_credits").upsert(
-                {
-                    "wa_phone": wa,
-                    "credits_remaining": new_val,
-                    "updated_at": iso(now_utc()),
-                },
-                on_conflict="wa_phone",
-            ).execute()
-            return
-
-        except Exception as e:
-            logging.exception("consume_ai credits decrement failed (ignored): %s", e)
-            return
 
 
 def log_ai_cost(wa_phone: str, question: str, answer: str, source: str = "ai") -> None:
     """
-    Best-effort logging to your cost table.
-
-    You previously referenced 'ai_cache' for cost tracking, so we attempt:
-      - ai_cache insert
-    If schema mismatch, it is ignored.
+    Best-effort: your project previously logged to ai_cache or similar.
+    We'll try ai_cache then ai_costs. If neither exists, ignore.
     """
     wa = (wa_phone or "").strip()
     if not wa:
@@ -430,14 +469,12 @@ def log_ai_cost(wa_phone: str, question: str, answer: str, source: str = "ai") -
         "created_at": iso(now_utc()),
     }
 
-    # try ai_cache
     try:
         _db().table("ai_cache").insert(payload).execute()
         return
     except Exception:
         pass
 
-    # fallback: try ai_costs (if you use another table name)
     try:
         _db().table("ai_costs").insert(payload).execute()
     except Exception as e:
