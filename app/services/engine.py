@@ -49,7 +49,7 @@ def _answer_columns_for_lang(lang: str) -> list[str]:
     Your qa_library shows BOTH naming styles in screenshots:
       - answer_en, answer_pcm, answer_yo, answer_ig, answer_ha
       - answer_pidgin, answer_yoruba, answer_igbo, answer_hausa
-    We try both so promotion works without guessing wrong.
+    We try both to avoid guessing wrong.
     """
     l = (lang or "en").lower().strip()
 
@@ -74,13 +74,13 @@ def _answer_columns_for_lang(lang: str) -> list[str]:
 def _auto_promote_to_library(q_norm: str, q_raw: str, lang: str, answer: str) -> bool:
     """
     Upsert into qa_library with:
-      - on_conflict = normalized_question   (CONFIRMED UNIQUE INDEX)
+      - UNIQUE normalized_question (confirmed)
       - write into the correct answer_* column
     """
     cols = _answer_columns_for_lang(lang)
 
     for col in cols:
-        # Try with question + answer column
+        # Try with question + answer col
         try:
             _db().table("qa_library").upsert(
                 {
@@ -94,13 +94,10 @@ def _auto_promote_to_library(q_norm: str, q_raw: str, lang: str, answer: str) ->
         except Exception as e:
             logging.exception("qa_library promote failed col=%s (ignored): %s", col, e)
 
-        # Retry minimal payload (no question)
+        # Retry minimal payload
         try:
             _db().table("qa_library").upsert(
-                {
-                    "normalized_question": q_norm,
-                    col: (answer or "")[:4000],
-                },
+                {"normalized_question": q_norm, col: (answer or "")[:4000]},
                 on_conflict="normalized_question",
             ).execute()
             return True
@@ -158,7 +155,12 @@ def resolve_answer(
             msg = "Your AI credits for this plan are finished. Please top up to continue."
         else:
             msg = "You have used your free AI limit for today (2/day). Please upgrade to continue."
-        return {"ok": False, "message": msg, "reason": quota.get("reason"), "plan_expiry": quota.get("plan_expiry")}
+        return {
+            "ok": False,
+            "message": msg,
+            "reason": quota.get("reason"),
+            "plan_expiry": quota.get("plan_expiry"),
+        }
 
     ai_text = generate_answer(q_raw, lang=lang)
     if not ai_text:
@@ -168,19 +170,24 @@ def resolve_answer(
             "source": "fallback",
         }
 
-    # Consume usage only after AI success
+    # consume usage only after AI success
     try:
-        consume_ai(wa_phone, quota.get("plan", "free"), quota.get("mode", "free_daily"))
+        consume_ai(
+            wa_phone,
+            quota.get("plan", "free"),
+            quota.get("mode", "free_daily"),
+            user_id=quota.get("user_id"),
+        )
     except Exception as e:
         logging.exception("consume_ai failed (ignored): %s", e)
 
-    # Cache write-through
+    # cache write-through
     try:
         cache_put(q_norm, ai_text, lang=lang, tags=["ai"], source=source)
     except Exception as e:
         logging.exception("cache_put(ai) failed (ignored): %s", e)
 
-    # Cost tracking
+    # cost tracking
     try:
         log_ai_cost(wa_phone, q_raw, ai_text, source="ai")
     except Exception as e:
