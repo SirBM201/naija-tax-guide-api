@@ -1,5 +1,6 @@
+# app/services/engine.py
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, Optional, List, Tuple
 
 from app.db.qa import cache_get, cache_put, library_get
 from app.core.text import normalize_question
@@ -14,6 +15,26 @@ def _db():
     return get_supabase()
 
 
+def _pick_answer_columns(lang: str) -> List[str]:
+    """
+    Your qa_library schema appears to have multiple answer columns.
+    Screenshots show variants like:
+      - answer_en, answer_pcm, answer_yo, answer_ig, answer_ha
+      - answer_pidgin, answer_yoruba, answer_igbo, answer_hausa
+    We'll try multiple candidates safely (best-effort).
+    """
+    l = (lang or "en").strip().lower()
+
+    mapping = {
+        "en": ["answer_en", "answer"],
+        "pcm": ["answer_pcm", "answer_pidgin", "answer_pigdin", "answer"],
+        "yo": ["answer_yo", "answer_yoruba", "answer"],
+        "ig": ["answer_ig", "answer_igbo", "answer"],
+        "ha": ["answer_ha", "answer_hausa", "answer"],
+    }
+    return mapping.get(l, ["answer_en", "answer"])
+
+
 def _insert_suggestion(
     q_norm: str,
     q_raw: str,
@@ -22,14 +43,18 @@ def _insert_suggestion(
     source: str,
     review: Dict[str, Any],
 ) -> None:
+    """
+    Table: qa_suggestions exists.
+    Best-effort: schema mismatches won't break the app.
+    """
     try:
         _db().table("qa_suggestions").insert(
             {
                 "normalized_question": q_norm,
                 "question_raw": (q_raw or "")[:500],
-                "lang": lang,
+                "lang": (lang or "en")[:10],
                 "answer": (answer or "")[:4000],
-                "source": source,
+                "source": (source or "")[:30],
                 "needs_review": True,
                 "risk": review.get("risk"),
                 "confidence": review.get("confidence"),
@@ -40,110 +65,106 @@ def _insert_suggestion(
         logging.exception("qa_suggestions insert failed (ignored): %s", e)
 
 
-def _answer_columns_for_lang(lang: str) -> list[str]:
-    l = (lang or "en").lower().strip()
-
-    if l in ("en", "english"):
-        return ["answer_en"]
-
-    if l in ("pcm", "pidgin"):
-        return ["answer_pcm", "answer_pidgin"]
-
-    if l in ("yo", "yoruba"):
-        return ["answer_yo", "answer_yoruba"]
-
-    if l in ("ig", "igbo"):
-        return ["answer_ig", "answer_igbo"]
-
-    if l in ("ha", "hausa"):
-        return ["answer_ha", "answer_hausa"]
-
-    return ["answer_en"]
-
-
 def _auto_promote_to_library(q_norm: str, q_raw: str, lang: str, answer: str) -> bool:
-    cols = _answer_columns_for_lang(lang)
+    """
+    Your qa_library has UNIQUE index on normalized_question only.
+    So: on_conflict="normalized_question"
 
-    for col in cols:
+    We will:
+    - set normalized_question
+    - (optionally) set question text if column exists
+    - set the correct language answer column (answer_en/answer_pcm/...)
+    - set enabled/priority/source if those columns exist (best-effort)
+
+    Because schema differs across setups, we try a few payload variants.
+    """
+    cols_to_try = _pick_answer_columns(lang)
+
+    base_payload = {
+        "normalized_question": q_norm,
+        # many schemas also store the readable question:
+        "question": (q_raw or "")[:500],
+        "enabled": True,
+        "source": "auto_ai",
+        "priority": 50,
+    }
+
+    for ans_col in cols_to_try:
+        payload = dict(base_payload)
+        payload[ans_col] = answer
+
         try:
-            _db().table("qa_library").upsert(
-                {
-                    "normalized_question": q_norm,
-                    "question": (q_raw or "")[:500],
-                    col: (answer or "")[:4000],
-                },
-                on_conflict="normalized_question",
-            ).execute()
+            _db().table("qa_library").upsert(payload, on_conflict="normalized_question").execute()
             return True
         except Exception as e:
-            logging.exception("qa_library promote failed col=%s (ignored): %s", col, e)
+            logging.exception("qa_library auto-promote failed using %s (ignored): %s", ans_col, e)
 
-        try:
-            _db().table("qa_library").upsert(
-                {"normalized_question": q_norm, col: (answer or "")[:4000]},
-                on_conflict="normalized_question",
-            ).execute()
-            return True
-        except Exception as e2:
-            logging.exception("qa_library promote retry failed col=%s (ignored): %s", col, e2)
+            # retry with minimum payload (in case columns not present)
+            try:
+                minimal = {"normalized_question": q_norm, ans_col: answer}
+                _db().table("qa_library").upsert(minimal, on_conflict="normalized_question").execute()
+                return True
+            except Exception as e2:
+                logging.exception("qa_library auto-promote retry failed using %s (ignored): %s", ans_col, e2)
 
     return False
 
 
 def resolve_answer(
-    user_phone: str,         # <-- ANY channel phone (WA or TG or Web)
+    wa_phone: str,
     question: str,
     mode: str = "text",
     lang: str = "en",
     source: str = "web",
 ) -> Dict[str, Any]:
+    """
+    Unified engine for Web / WhatsApp / Telegram.
+    IMPORTANT: 'wa_phone' here is your unified identity key (phone digits).
+    Telegram must pass the user's phone (not chat_id) so quotas unify.
+    """
+    identity = (wa_phone or "").strip()
     q_raw = (question or "").strip()
     q_norm = normalize_question(q_raw)
 
     logging.info(
-        "ENGINE source=%s phone=%s lang=%s mode=%s raw=%s norm=%s",
-        source, user_phone, lang, mode, q_raw[:120], q_norm[:120]
+        "ENGINE source=%s identity=%s lang=%s mode=%s raw=%s norm=%s",
+        source, identity, lang, mode, q_raw[:120], q_norm[:120]
     )
 
     # 1) Cache
+    cached = None
     try:
-        cached = cache_get(q_norm, lang=lang)
+        cached = cache_get(q_norm)
     except Exception as e:
         logging.exception("cache_get failed (continuing without cache): %s", e)
-        cached = None
 
     if cached and cached.get("answer"):
         return {"ok": True, "answer_text": cached["answer"], "source": "cache"}
 
-    # 2) Library
+    # 2) Library (your existing library_get should handle lang mapping)
+    lib = None
     try:
         lib = library_get(q_norm, lang=lang)
     except Exception as e:
         logging.exception("library_get failed: %s", e)
-        lib = None
 
     if lib and lib.get("answer"):
         ans = lib["answer"]
         try:
-            cache_put(q_norm, ans, lang=lang, tags=["library"], source=source)
+            cache_put(q_norm, ans, tags=["library"], source=source)
         except Exception as e:
             logging.exception("cache_put failed (ignored): %s", e)
         return {"ok": True, "answer_text": ans, "source": "library"}
 
     # 3) AI fallback (enforce plan limits)
-    quota = can_use_ai(user_phone)
+    quota = can_use_ai(identity)
     if not quota.get("ok"):
         action = quota.get("action")
         if action == "topup":
             msg = "Your AI credits for this plan are finished. Please top up to continue."
         else:
             msg = "You have used your free AI limit for today (2/day). Please upgrade to continue."
-        return {
-            "ok": False,
-            "message": msg,
-            "reason": quota.get("reason"),
-            "plan_expiry": quota.get("plan_expiry"),
-        }
+        return {"ok": False, "message": msg, "reason": quota.get("reason"), "action": action}
 
     ai_text = generate_answer(q_raw, lang=lang)
     if not ai_text:
@@ -155,25 +176,19 @@ def resolve_answer(
 
     # consume usage only after AI success
     try:
-        consume_ai(
-            user_phone,
-            quota.get("plan", "free"),
-            quota.get("mode", "free_daily"),
-            user_key=quota.get("user_key"),
-            user_id=quota.get("user_id"),
-        )
+        consume_ai(identity, quota.get("plan", "free"), quota.get("mode", "free_daily"))
     except Exception as e:
         logging.exception("consume_ai failed (ignored): %s", e)
 
     # cache write-through
     try:
-        cache_put(q_norm, ai_text, lang=lang, tags=["ai"], source=source)
+        cache_put(q_norm, ai_text, tags=["ai"], source=source)
     except Exception as e:
         logging.exception("cache_put(ai) failed (ignored): %s", e)
 
     # cost tracking
     try:
-        log_ai_cost(user_phone, q_raw, ai_text, source="ai")
+        log_ai_cost(identity, q_raw, ai_text, source="ai")
     except Exception as e:
         logging.exception("log_ai_cost failed (ignored): %s", e)
 
@@ -191,7 +206,6 @@ def resolve_answer(
         "ok": True,
         "answer_text": ai_text,
         "source": "ai",
-        "plan_expiry": quota.get("plan_expiry"),
         "review": {
             "risk": review.get("risk"),
             "confidence": review.get("confidence"),
