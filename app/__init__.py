@@ -29,13 +29,15 @@ def create_app() -> Flask:
     from app.routes.paystack_routes import bp as paystack_bp
     from app.routes.telegram_routes import bp as telegram_bp
     from app.routes.cron import bp as cron_bp
-
+    from app.routes.subscription_routes import bp as subscription_bp
+    
     app.register_blueprint(health_bp)
     app.register_blueprint(ask_bp)
     app.register_blueprint(paystack_bp)
     app.register_blueprint(telegram_bp)
     app.register_blueprint(cron_bp)
-
+    app.register_blueprint(subscription_bp)
+    
     @app.get("/")
     def root():
         return jsonify({"ok": True, "service": "naija-tax-guide-api"})
