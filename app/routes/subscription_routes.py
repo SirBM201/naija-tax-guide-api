@@ -4,11 +4,9 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from flask import Blueprint, request, jsonify
-
 from app.db.supabase_client import supabase
 
 bp = Blueprint("subscription", __name__)
-
 
 # -----------------------------
 # Helpers
@@ -23,14 +21,14 @@ def _now_utc() -> datetime:
 
 def _get_subscription(user_key: str) -> Optional[Dict[str, Any]]:
     """
-    user_key is the ONE identity you use across Web/WhatsApp/Telegram.
-    For now you are storing it in user_subscriptions.wa_phone.
+    user_key is the ONE identity across Web/WhatsApp/Telegram.
+    Stored in user_subscriptions.wa_phone for now.
     """
     try:
         r = (
             supabase
             .table("user_subscriptions")
-            .select("*")
+            .select("wa_phone, plan, status, expires_at, reference, paystack_reference")
             .eq("wa_phone", user_key)
             .limit(1)
             .execute()
@@ -47,8 +45,7 @@ def _is_active(sub: Optional[Dict[str, Any]]) -> bool:
         return False
 
     status = (sub.get("status") or "").strip().lower()
-    # accept both "active" and "paid"
-    if status and status not in ("active", "paid"):
+    if status not in ("active", "paid"):
         return False
 
     exp = sub.get("expires_at")
@@ -69,7 +66,7 @@ def _is_active(sub: Optional[Dict[str, Any]]) -> bool:
 def subscription_status():
     """
     Request JSON:
-      { "wa_phone": "2348012345678" }
+      { "wa_phone": "2348012345678" }  (or user_key)
 
     Response:
       {
@@ -82,8 +79,7 @@ def subscription_status():
     """
     data = request.get_json(silent=True) or {}
 
-    # Accept either wa_phone or user_key to avoid frontend mismatch
-    raw_key = str(data.get("wa_phone") or data.get("user_key") or "").strip()
+    raw_key = str(data.get("wa_phone") or data.get("user_key") or data.get("phone") or "").strip()
     user_key = _normalize_phone(raw_key)
 
     if not user_key:
@@ -103,6 +99,7 @@ def subscription_status():
         ), 200
 
     active = _is_active(sub)
+    reference = sub.get("reference") or sub.get("paystack_reference") or None
 
     return jsonify(
         {
@@ -110,6 +107,6 @@ def subscription_status():
             "status": "active" if active else "expired",
             "plan": sub.get("plan"),
             "expires_at": sub.get("expires_at"),
-            "reference": sub.get("reference") or sub.get("paystack_reference") or None,
+            "reference": reference,
         }
     ), 200
