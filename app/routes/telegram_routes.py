@@ -35,7 +35,7 @@ def telegram_webhook(secret: str):
         return "ok", 200
 
     if text.lower().startswith("/start"):
-        tg_send_message(chat_id, "✅ Naija Hustle Tax Guide is connected.\n\nSend your Nigeria tax question here.")
+        tg_send_message(chat_id, "✅ Naija Hustle Tax Guide is connected.\n\nSend your tax question here.")
         return "ok", 200
 
     if not text:
@@ -43,8 +43,8 @@ def telegram_webhook(secret: str):
         return "ok", 200
 
     try:
-        sender_key = f"tg:{_safe_str(chat_id)}"
-        reply = route_message(sender_key, text)
+        identity = f"tg:{_safe_str(chat_id)}"
+        reply = route_message(identity, text, lang="en")
         tg_send_message(chat_id, reply)
     except Exception as e:
         logging.exception("Telegram inbound handling failed: %s", e)
