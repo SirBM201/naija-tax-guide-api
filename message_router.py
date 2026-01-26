@@ -1,8 +1,8 @@
-# message_router.py (repo root)
+# message_router.py
 
 from typing import Optional
 
-from services.session_service import (
+from app.services.session_service import (
     get_active_session,
     create_session,
     update_session,
@@ -11,30 +11,33 @@ from services.session_service import (
 
 from flows import paye_flow
 
+
 # -----------------------------
-# Flow selection (extend later)
+# Flow detection
 # -----------------------------
 def detect_flow_key(text: str) -> Optional[str]:
     t = (text or "").strip().lower()
 
-    # PAYE intent
     if any(k in t for k in ["paye", "pay as you earn", "salary tax", "employee tax"]):
         return "paye"
 
-    # Extend later:
+    # Future flows:
     # if "vat" in t: return "vat"
     # if "withholding" in t or "wht" in t: return "wht"
 
     return None
 
 
+# -----------------------------
+# Central router
+# -----------------------------
 def route_message(sender_key: str, text: str) -> str:
     """
-    Central router used by WhatsApp/web/Telegram entrypoints.
+    sender_key examples:
+      - wa:234xxxxxxxxxx
+      - tg:123456789
 
-    sender_key:
-      - WhatsApp: use normalized phone e.g. "234xxxxxxxxxx"
-      - Telegram: use "tg:<chat_id>" (until you implement phone linking)
+    This keeps WhatsApp, Telegram, Web unified.
     """
 
     clean_text = (text or "").strip()
@@ -42,9 +45,7 @@ def route_message(sender_key: str, text: str) -> str:
         return "Please type your question."
 
     # 1) Continue active session if exists
-    # NOTE: current implementation checks PAYE session only.
-    existing_flow_key = "paye"
-    session = get_active_session(sender_key, existing_flow_key)
+    session = get_active_session(sender_key)
 
     if session:
         result = paye_flow.handle(session["state"], clean_text, session)
@@ -61,14 +62,14 @@ def route_message(sender_key: str, text: str) -> str:
 
         return result["reply"]
 
-    # 2) No session: detect flow
+    # 2) Detect new flow
     flow_key = detect_flow_key(clean_text)
+
     if flow_key == "paye":
         create_session(sender_key, "paye", "ASK_INCOME")
         return paye_flow.start()
 
-    # 3) No flow matched -> general engine
-    # Import lazily to avoid circular imports.
-    from services.engine import answer_engine_reply
+    # 3) Fallback → AI / tax engine
+    from app.services.engine import answer_engine_reply
 
     return answer_engine_reply(sender_key, clean_text)
