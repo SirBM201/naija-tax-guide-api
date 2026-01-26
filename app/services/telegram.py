@@ -1,4 +1,4 @@
-# services/telegram.py
+# app/services/telegram.py
 
 import os
 import logging
@@ -7,7 +7,7 @@ import requests
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 
 
-def tg_send_message(chat_id: int, text: str) -> bool:
+def tg_send_message(chat_id, text: str) -> bool:
     if not TELEGRAM_BOT_TOKEN:
         logging.error("TELEGRAM_BOT_TOKEN not set")
         return False
