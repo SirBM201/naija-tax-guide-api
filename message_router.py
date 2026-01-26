@@ -1,19 +1,14 @@
 # message_router.py
-
-from typing import Optional
-
-# Your real engine is here (based on your folder structure screenshot)
 from app.services.engine import answer_engine_reply
 
 
 def route_message(sender_key: str, text: str) -> str:
     """
+    Unified router for Telegram/WhatsApp/Web.
+    Option 1: NO sessions, just respond using the engine.
     sender_key examples:
-      - wa:234xxxxxxxxxx
       - tg:123456789
-
-    For now: no sessions, just respond using the AI/tax engine.
-    We will re-add sessions after Telegram is stable.
+      - wa:234xxxxxxxxxx
     """
     clean_text = (text or "").strip()
     if not clean_text:
