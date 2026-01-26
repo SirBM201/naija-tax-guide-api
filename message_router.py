@@ -1,6 +1,5 @@
 # message_router.py (repo root)
 
-import re
 from typing import Optional
 
 from services.session_service import (
@@ -29,22 +28,23 @@ def detect_flow_key(text: str) -> Optional[str]:
     return None
 
 
-def route_message(phone: str, text: str) -> str:
+def route_message(sender_key: str, text: str) -> str:
     """
-    Central router used by WhatsApp/web entrypoints.
-    - If a session exists -> continue that flow
-    - Else detect which flow should start
-    - Else fallback to general Q&A (ask endpoint / tax engine)
+    Central router used by WhatsApp/web/Telegram entrypoints.
+
+    sender_key:
+      - WhatsApp: use normalized phone e.g. "234xxxxxxxxxx"
+      - Telegram: use "tg:<chat_id>" (until you implement phone linking)
     """
 
     clean_text = (text or "").strip()
     if not clean_text:
         return "Please type your question."
 
-    # 1) If user already has an active session, continue it
-    #    (session has flow_key stored; if not, default to paye)
+    # 1) Continue active session if exists
+    # NOTE: current implementation checks PAYE session only.
     existing_flow_key = "paye"
-    session = get_active_session(phone, existing_flow_key)
+    session = get_active_session(sender_key, existing_flow_key)
 
     if session:
         result = paye_flow.handle(session["state"], clean_text, session)
@@ -61,14 +61,14 @@ def route_message(phone: str, text: str) -> str:
 
         return result["reply"]
 
-    # 2) No session: detect flow based on message
+    # 2) No session: detect flow
     flow_key = detect_flow_key(clean_text)
     if flow_key == "paye":
-        create_session(phone, "paye", "ASK_INCOME")
+        create_session(sender_key, "paye", "ASK_INCOME")
         return paye_flow.start()
 
-    # 3) No flow matched -> fallback to general tax answer engine
-    #    We import lazily to avoid circular imports.
-    from app.main import answer_engine_reply
+    # 3) No flow matched -> general engine
+    # Import lazily to avoid circular imports.
+    from services.engine import answer_engine_reply
 
-    return answer_engine_reply(phone, clean_text)
+    return answer_engine_reply(sender_key, clean_text)
