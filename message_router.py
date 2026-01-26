@@ -1,30 +1,31 @@
-# message_router.py
+# message_router.py (repo root)
+from typing import Optional
+
 from app.services.engine import resolve_answer
 
 
-def route_message(sender_key: str, text: str) -> str:
+def route_message(identity: str, text: str, lang: str = "en") -> str:
     """
-    Central router used by Telegram/WhatsApp/Web.
-    Option 1: no sessions, always resolve via the engine.
+    Central router for Telegram/WhatsApp/Web.
 
-    sender_key examples:
-      - tg:123456789
-      - wa:234xxxxxxxxxx
+    For now:
+      - Route everything to the AI/cache/library engine.
+    Later:
+      - You can re-introduce sessions/flows when session_service exists.
     """
     clean_text = (text or "").strip()
     if not clean_text:
         return "Please type your question."
 
     result = resolve_answer(
-        wa_phone=sender_key,          # engine uses this as identity key
+        wa_phone=(identity or "").strip(),
         question=clean_text,
-        mode="text",
-        lang="en",
-        source="telegram",            # good for logging/analytics
+        lang=lang,
+        source="telegram",
     )
 
-    # Engine can return ok=False when quota is blocked
-    if not result.get("ok"):
-        return result.get("message") or "Sorry — you cannot use AI right now."
+    if result.get("ok"):
+        return (result.get("answer_text") or "").strip() or "OK"
 
-    return result.get("answer_text") or "OK"
+    # blocked by quota / requires upgrade
+    return (result.get("message") or "Sorry — you cannot use AI right now. Please try again.").strip()
