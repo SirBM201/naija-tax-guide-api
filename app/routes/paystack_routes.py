@@ -8,7 +8,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, Optional
 
 import requests
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, redirect
 
 bp = Blueprint("paystack", __name__)
 
@@ -18,16 +18,16 @@ bp = Blueprint("paystack", __name__)
 PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY", "").strip()
 PAYSTACK_WEBHOOK_SECRET = os.getenv("PAYSTACK_WEBHOOK_SECRET", PAYSTACK_SECRET_KEY).strip()
 
-# IMPORTANT:
-# - FRONTEND_BASE_URL should be your web app domain (Vercel/custom domain) or localhost:3000
-#   e.g. http://localhost:3000  or  https://thecre8hub.com
-FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "").strip()
+# Your backend base URL (optional; used only for informational redirects)
+# Example: https://your-koyeb-app.koyeb.app
+APP_BASE_URL = os.getenv("APP_BASE_URL", "").strip()
 
-# (Optional) API base url (only used for informational responses; not required)
-APP_BASE_URL = os.getenv("APP_BASE_URL", "").strip()  # e.g. https://xxxx.koyeb.app
+# ✅ IMPORTANT: Your frontend base URL (Vercel / domain)
+# Example: https://thecre8hub.com
+FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "").strip().rstrip("/")
 
 # ------------------------------------------------------------
-# Plans (NEW PRICES) - amounts in Kobo
+# Plans (Amounts are in Kobo)
 # ------------------------------------------------------------
 PLANS: Dict[str, Dict[str, Any]] = {
     "monthly": {"plan": "monthly", "amount_kobo": 3300_00, "duration_days": 30, "currency": "NGN"},
@@ -39,38 +39,19 @@ PLANS: Dict[str, Dict[str, Any]] = {
 # LOCKED TOPUP PACKAGES (EDIT PRICES HERE)
 # ------------------------------------------------------------
 TOPUP_PACKAGES: Dict[str, Dict[str, Any]] = {
-    "TOPUP_100": {
-        "package_code": "TOPUP_100",
-        "title": "100 AI Credits",
-        "credits": 100,
-        "amount_kobo": 200_00,
-        "currency": "NGN",
-    },
-    "TOPUP_300": {
-        "package_code": "TOPUP_300",
-        "title": "300 AI Credits",
-        "credits": 300,
-        "amount_kobo": 500_00,
-        "currency": "NGN",
-    },
-    "TOPUP_1000": {
-        "package_code": "TOPUP_1000",
-        "title": "1000 AI Credits",
-        "credits": 1000,
-        "amount_kobo": 1500_00,
-        "currency": "NGN",
-    },
+    "TOPUP_100": {"package_code": "TOPUP_100", "title": "100 AI Credits", "credits": 100, "amount_kobo": 200_00, "currency": "NGN"},
+    "TOPUP_300": {"package_code": "TOPUP_300", "title": "300 AI Credits", "credits": 300, "amount_kobo": 500_00, "currency": "NGN"},
+    "TOPUP_1000": {"package_code": "TOPUP_1000", "title": "1000 AI Credits", "credits": 1000, "amount_kobo": 1500_00, "currency": "NGN"},
 }
 
 
 # ------------------------------------------------------------
-# DB helpers
+# Helpers
 # ------------------------------------------------------------
 def _db():
-    # IMPORTANT: your supabase_client.py exports a *client object* named "supabase"
-    # This avoids the "'function' object has no attribute 'table'" error.
-    from app.db.supabase_client import supabase as sb
-    return sb
+    # ✅ IMPORTANT: This returns the actual Supabase client object (not a function)
+    from app.db.supabase_client import supabase
+    return supabase
 
 
 def _now() -> datetime:
@@ -103,18 +84,6 @@ def _normalize_phone(p: str) -> str:
     return "".join(ch for ch in (p or "").strip() if ch.isdigit())
 
 
-def _get_plan(plan: str) -> Optional[Dict[str, Any]]:
-    if not plan:
-        return None
-    return PLANS.get(plan.strip().lower())
-
-
-def _get_topup_package(code: str) -> Optional[Dict[str, Any]]:
-    if not code:
-        return None
-    return TOPUP_PACKAGES.get(code.strip().upper())
-
-
 def _get_subscription(phone: str) -> Optional[Dict[str, Any]]:
     try:
         r = _db().table("user_subscriptions").select("*").eq("wa_phone", phone).limit(1).execute()
@@ -144,40 +113,32 @@ def _is_active_paid_subscription(sub: Optional[Dict[str, Any]]) -> bool:
         return False
 
 
-def _frontend_url(path: str, query: Optional[Dict[str, str]] = None) -> str:
+def _get_plan(plan: str) -> Optional[Dict[str, Any]]:
+    if not plan:
+        return None
+    return PLANS.get(plan.strip().lower())
+
+
+def _get_topup_package(code: str) -> Optional[Dict[str, Any]]:
+    if not code:
+        return None
+    return TOPUP_PACKAGES.get(code.strip().upper())
+
+
+def _frontend_url(path: str) -> str:
     """
-    Builds a FRONTEND redirect URL safely.
-    Example:
-      _frontend_url("/subscription", {"reference": "abc"})
-      -> https://thecre8hub.com/subscription?reference=abc
+    Safe builder for frontend URLs.
     """
-    base = (FRONTEND_BASE_URL or "").strip().rstrip("/")
-    if not base:
+    if not FRONTEND_BASE_URL:
         return ""
-    p = (path or "").strip()
-    if not p.startswith("/"):
-        p = "/" + p
-    url = base + p
-
-    if query:
-        # simple query builder (no external deps)
-        parts = []
-        for k, v in query.items():
-            if v is None:
-                continue
-            k2 = str(k).strip()
-            v2 = str(v).strip()
-            if not k2 or not v2:
-                continue
-            # minimal encoding
-            k2 = k2.replace(" ", "%20")
-            v2 = v2.replace(" ", "%20")
-            parts.append(f"{k2}={v2}")
-        if parts:
-            url = url + ("?" + "&".join(parts))
-    return url
+    if not path.startswith("/"):
+        path = "/" + path
+    return FRONTEND_BASE_URL + path
 
 
+# ------------------------------------------------------------
+# Health
+# ------------------------------------------------------------
 @bp.get("/paystack/health")
 def paystack_health():
     return jsonify({"ok": True, "service": "paystack"}), 200
@@ -189,44 +150,40 @@ def paystack_health():
 @bp.post("/paystack/subscription/initialize")
 def paystack_subscription_initialize():
     """
-    Request JSON (frontend may send either phone/wa_phone/user_key):
+    Request JSON:
       {
-        "phone": "2348012345678" OR "wa_phone": "..." OR "user_key": "...",
+        "phone" or "wa_phone" or "user_key": "2348012345678",
         "email": "user@example.com",
         "plan": "monthly" | "quarterly" | "yearly"
       }
 
     Response:
-      { ok: true, authorization_url, reference, plan, amount_kobo, label }
+      { ok: true, authorization_url, reference }
     """
     if not PAYSTACK_SECRET_KEY:
-        return jsonify({"ok": False, "error": "PAYSTACK_SECRET_KEY not set"}), 500
+        return jsonify({"ok": False, "message": "PAYSTACK_SECRET_KEY not set"}), 500
 
     body = request.get_json(silent=True) or {}
 
-    phone_raw = body.get("phone") or body.get("wa_phone") or body.get("user_key") or ""
-    phone = _normalize_phone(str(phone_raw))
-
+    phone = _normalize_phone(body.get("phone") or body.get("wa_phone") or body.get("user_key") or "")
     email = (body.get("email") or "").strip()
     plan = (body.get("plan") or "").strip().lower()
 
     if not phone:
-        return jsonify({"ok": False, "error": "phone (wa_phone/user_key) is required"}), 400
-
-    # Paystack requires an email for initialize
+        return jsonify({"ok": False, "message": "phone is required"}), 400
     if not email or "@" not in email:
-        return jsonify({"ok": False, "error": "Valid email is required"}), 400
+        return jsonify({"ok": False, "message": "Valid email is required"}), 400
 
     p = _get_plan(plan)
     if not p:
-        return jsonify({"ok": False, "error": "Invalid plan"}), 400
+        return jsonify({"ok": False, "message": "Invalid plan"}), 400
 
     amount_kobo = int(p["amount_kobo"])
     duration_days = int(p["duration_days"])
 
     reference = f"sub_{plan}_{int(_now().timestamp())}_{phone[-6:]}"
 
-    # Save pending subscription BEFORE redirect
+    # ✅ Save pending subscription before redirect
     try:
         _db().table("user_subscriptions").upsert(
             {
@@ -246,18 +203,13 @@ def paystack_subscription_initialize():
         ).execute()
     except Exception as e:
         logging.exception("user_subscriptions upsert pending failed: %s", e)
-        return jsonify({"ok": False, "error": "Unable to create subscription"}), 500
+        return jsonify({"ok": False, "message": "Unable to create subscription"}), 500
 
-    # Redirect user BACK TO FRONTEND after payment
-    # IMPORTANT: do NOT point Paystack to localhost:5000 (API).
-    callback_url = _frontend_url(
-        "/subscription",
-        {
-            "reference": reference,
-            "user_key": phone,
-            "plan": plan,
-        },
-    )
+    # ✅ FIX: Always redirect users back to FRONTEND after payment
+    # We point to your existing /subscription page, including reference & trxref
+    callback_url = ""
+    if FRONTEND_BASE_URL:
+        callback_url = _frontend_url(f"/subscription?reference={reference}&trxref={reference}")
 
     payload = {
         "email": email,
@@ -267,7 +219,6 @@ def paystack_subscription_initialize():
         "metadata": {
             "purpose": "subscription",
             "phone": phone,
-            "user_key": phone,
             "plan": plan,
             "duration_days": duration_days,
         },
@@ -280,14 +231,15 @@ def paystack_subscription_initialize():
             data=json.dumps(payload),
             timeout=30,
         )
+
         if r.status_code not in (200, 201):
             logging.error("Paystack initialize failed: %s %s", r.status_code, r.text[:300])
-            return jsonify({"ok": False, "error": "Paystack initialize failed"}), 502
+            return jsonify({"ok": False, "message": "Paystack initialize failed"}), 502
 
         resp = r.json() or {}
         if not resp.get("status"):
             logging.error("Paystack initialize status=false: %s", str(resp)[:300])
-            return jsonify({"ok": False, "error": "Paystack initialize failed"}), 502
+            return jsonify({"ok": False, "message": "Paystack initialize failed"}), 502
 
         d = resp.get("data") or {}
         return jsonify(
@@ -297,38 +249,36 @@ def paystack_subscription_initialize():
                 "reference": d.get("reference") or reference,
                 "plan": plan,
                 "amount_kobo": amount_kobo,
-                "label": f"{plan} subscription",
+                "label": plan,
             }
         ), 200
 
     except Exception as e:
         logging.exception("Paystack initialize exception: %s", e)
-        return jsonify({"ok": False, "error": "Paystack initialize exception"}), 500
+        return jsonify({"ok": False, "message": "Paystack initialize exception"}), 500
 
 
 # ------------------------------------------------------------
-# SUBSCRIPTION: Verify (manual / fallback)
+# SUBSCRIPTION: Verify (optional manual verify endpoint)
 # ------------------------------------------------------------
 @bp.post("/paystack/subscription/verify")
 def paystack_subscription_verify():
     """
     Request JSON:
-      { "reference": "sub_...", "wa_phone": "234..." optional }
+      { "reference": "sub_monthly_...", "phone": "234..." optional }
 
     Response:
       { ok: true, status, plan, expires_at, reference }
     """
     if not PAYSTACK_SECRET_KEY:
-        return jsonify({"ok": False, "error": "PAYSTACK_SECRET_KEY not set"}), 500
+        return jsonify({"ok": False, "message": "PAYSTACK_SECRET_KEY not set"}), 500
 
     body = request.get_json(silent=True) or {}
     reference = (body.get("reference") or body.get("paystack_reference") or "").strip()
-
-    phone_raw = body.get("phone") or body.get("wa_phone") or body.get("user_key") or ""
-    phone = _normalize_phone(str(phone_raw))
+    phone = _normalize_phone(body.get("phone") or body.get("wa_phone") or body.get("user_key") or "")
 
     if not reference:
-        return jsonify({"ok": False, "error": "reference is required"}), 400
+        return jsonify({"ok": False, "message": "reference is required"}), 400
 
     try:
         vr = requests.get(
@@ -338,25 +288,25 @@ def paystack_subscription_verify():
         )
         if vr.status_code != 200:
             logging.error("Paystack verify failed: %s %s", vr.status_code, vr.text[:300])
-            return jsonify({"ok": False, "error": "Paystack verify failed"}), 502
+            return jsonify({"ok": False, "message": "Paystack verify failed"}), 502
 
         payload = vr.json() or {}
         if not payload.get("status"):
-            return jsonify({"ok": False, "error": "Paystack verify returned status=false"}), 502
+            return jsonify({"ok": False, "message": "Paystack verify returned status=false"}), 502
 
         data = payload.get("data") or {}
         paid_status = (data.get("status") or "").lower()
         if paid_status not in ("success", "successful"):
-            return jsonify({"ok": False, "error": f"Payment not successful (status={paid_status})"}), 400
+            return jsonify({"ok": False, "message": f"Payment not successful (status={paid_status})"}), 400
 
         md = data.get("metadata") or {}
-        md_phone = _normalize_phone(md.get("phone") or md.get("user_key") or "")
+        md_phone = _normalize_phone(md.get("phone") or "")
         md_plan = (md.get("plan") or "").strip().lower()
         md_days = _int(md.get("duration_days"), 0)
 
         final_phone = md_phone or phone
         if not final_phone:
-            return jsonify({"ok": False, "error": "Missing phone (metadata or request)"}), 400
+            return jsonify({"ok": False, "message": "Missing phone (metadata or request)"}), 400
 
         p = _get_plan(md_plan) if md_plan else None
         if not p:
@@ -381,19 +331,11 @@ def paystack_subscription_verify():
             on_conflict="wa_phone",
         ).execute()
 
-        return jsonify(
-            {
-                "ok": True,
-                "status": "active",
-                "plan": md_plan,
-                "expires_at": expires_at,
-                "reference": reference,
-            }
-        ), 200
+        return jsonify({"ok": True, "status": "active", "plan": md_plan, "expires_at": expires_at, "reference": reference}), 200
 
     except Exception as e:
         logging.exception("verify exception: %s", e)
-        return jsonify({"ok": False, "error": "Verify exception"}), 500
+        return jsonify({"ok": False, "message": "Verify exception"}), 500
 
 
 # ------------------------------------------------------------
@@ -410,20 +352,18 @@ def paystack_topup_packages():
 @bp.post("/paystack/topup/initialize")
 def paystack_topup_initialize():
     if not PAYSTACK_SECRET_KEY:
-        return jsonify({"ok": False, "error": "PAYSTACK_SECRET_KEY not set"}), 500
+        return jsonify({"ok": False, "message": "PAYSTACK_SECRET_KEY not set"}), 500
 
     body = request.get_json(silent=True) or {}
 
-    phone_raw = body.get("phone") or body.get("wa_phone") or body.get("user_key") or ""
-    phone = _normalize_phone(str(phone_raw))
-
+    phone = _normalize_phone(body.get("phone") or body.get("wa_phone") or body.get("user_key") or "")
     email = (body.get("email") or "").strip()
     package_code = (body.get("package_code") or "").strip().upper()
 
     if not phone:
-        return jsonify({"ok": False, "error": "phone is required"}), 400
+        return jsonify({"ok": False, "message": "phone is required"}), 400
     if not email or "@" not in email:
-        return jsonify({"ok": False, "error": "Valid email is required"}), 400
+        return jsonify({"ok": False, "message": "Valid email is required"}), 400
 
     # PAID-ONLY GUARD
     sub = _get_subscription(phone)
@@ -431,7 +371,7 @@ def paystack_topup_initialize():
         return jsonify(
             {
                 "ok": False,
-                "error": "Top-up is only available to active subscribers. Please upgrade first.",
+                "message": "Top-up is only available to active subscribers. Please upgrade first.",
                 "action": "upgrade",
                 "reason": "not_subscribed_or_expired",
             }
@@ -439,7 +379,7 @@ def paystack_topup_initialize():
 
     pkg = _get_topup_package(package_code)
     if not pkg:
-        return jsonify({"ok": False, "error": "Invalid package_code"}), 400
+        return jsonify({"ok": False, "message": "Invalid package_code"}), 400
 
     credits = int(pkg["credits"])
     amount_kobo = int(pkg["amount_kobo"])
@@ -461,29 +401,19 @@ def paystack_topup_initialize():
         ).execute()
     except Exception as e:
         logging.exception("ai_topup_orders upsert failed: %s", e)
-        return jsonify({"ok": False, "error": "Unable to create top-up order"}), 500
+        return jsonify({"ok": False, "message": "Unable to create top-up order"}), 500
 
-    callback_url = _frontend_url(
-        "/subscription",
-        {
-            "reference": reference,
-            "user_key": phone,
-            "purpose": "ai_topup",
-        },
-    )
+    # ✅ Return to frontend subscription page after topup too
+    callback_url = ""
+    if FRONTEND_BASE_URL:
+        callback_url = _frontend_url(f"/subscription?reference={reference}&trxref={reference}")
 
     payload = {
         "email": email,
         "amount": amount_kobo,
         "reference": reference,
         "callback_url": callback_url or None,
-        "metadata": {
-            "purpose": "ai_topup",
-            "phone": phone,
-            "user_key": phone,
-            "credits": credits,
-            "package_code": package_code,
-        },
+        "metadata": {"purpose": "ai_topup", "phone": phone, "credits": credits, "package_code": package_code},
     }
 
     try:
@@ -495,12 +425,12 @@ def paystack_topup_initialize():
         )
         if r.status_code not in (200, 201):
             logging.error("Paystack initialize failed: %s %s", r.status_code, r.text[:300])
-            return jsonify({"ok": False, "error": "Paystack initialize failed"}), 502
+            return jsonify({"ok": False, "message": "Paystack initialize failed"}), 502
 
         resp = r.json() or {}
         if not resp.get("status"):
-            logging.error("Paystack initialize status false: %s", str(resp)[:300])
-            return jsonify({"ok": False, "error": "Paystack initialize failed"}), 502
+            logging.error("Paystack initialize status=false: %s", str(resp)[:300])
+            return jsonify({"ok": False, "message": "Paystack initialize failed"}), 502
 
         d = resp.get("data") or {}
         return jsonify(
@@ -516,13 +446,29 @@ def paystack_topup_initialize():
 
     except Exception as e:
         logging.exception("Paystack initialize exception: %s", e)
-        return jsonify({"ok": False, "error": "Paystack initialize exception"}), 500
+        return jsonify({"ok": False, "message": "Paystack initialize exception"}), 500
+
+
+# ------------------------------------------------------------
+# CALLBACK ENDPOINT (BACKEND) - OPTIONAL SAFETY NET
+# Paystack will redirect to FRONTEND_BASE_URL now, but we keep this
+# in case you ever switch callback_url back to the backend.
+# ------------------------------------------------------------
+@bp.get("/paystack/callback")
+def paystack_generic_callback():
+    ref = (request.args.get("reference") or request.args.get("trxref") or "").strip()
+    if FRONTEND_BASE_URL:
+        url = _frontend_url(f"/subscription?reference={ref}&trxref={ref}") if ref else _frontend_url("/subscription")
+        return redirect(url, code=302)
+    return jsonify({"ok": True, "message": "Payment received. Return to the app to refresh status."}), 200
 
 
 # ------------------------------------------------------------
 # PAYSTACK WEBHOOK (TOPUP + SUBSCRIPTIONS)
+# ✅ FIX: support BOTH webhook URLs to stop 404s
 # ------------------------------------------------------------
 @bp.post("/paystack/webhook")
+@bp.post("/webhooks/paystack")
 def paystack_webhook():
     raw = request.get_data() or b""
     sig = request.headers.get("x-paystack-signature", "")
@@ -546,21 +492,13 @@ def paystack_webhook():
     try:
         if purpose == "ai_topup":
             return _handle_topup(event_type, data, event)
-
         if purpose == "subscription":
             return _handle_subscription_webhook(event_type, data, event)
-
         return jsonify({"ok": True}), 200
     except Exception as e:
         logging.exception("Webhook handler error: %s", e)
-        # Always return 200 to Paystack to avoid repeated retries storms (optional choice)
+        # Return 200 so Paystack doesn't keep retrying forever
         return jsonify({"ok": True}), 200
-
-
-# OPTIONAL ALIAS: if Paystack is currently configured to POST to /webhooks/paystack
-@bp.post("/webhooks/paystack")
-def paystack_webhook_alias():
-    return paystack_webhook()
 
 
 def _handle_subscription_webhook(event_type: str, data: Dict[str, Any], full_event: Dict[str, Any]):
@@ -573,8 +511,7 @@ def _handle_subscription_webhook(event_type: str, data: Dict[str, Any], full_eve
 
     reference = (data.get("reference") or "").strip()
     md = data.get("metadata") or {}
-
-    phone = _normalize_phone(md.get("phone") or md.get("user_key") or "")
+    phone = _normalize_phone(md.get("phone") or "")
     plan = (md.get("plan") or "").strip().lower()
     duration_days = _int(md.get("duration_days"), 0)
 
@@ -614,20 +551,14 @@ def _handle_topup(event_type: str, data: Dict[str, Any], full_event: Dict[str, A
     reference = (data.get("reference") or "").strip()
     metadata = data.get("metadata") or {}
 
-    phone = _normalize_phone(metadata.get("phone") or metadata.get("user_key") or "")
+    phone = _normalize_phone(metadata.get("phone") or "")
     credits = _int(metadata.get("credits"))
     package_code = (metadata.get("package_code") or "").strip().upper()
     amount_kobo = _int(data.get("amount"))
     email = (data.get("customer") or {}).get("email") or ""
 
     if not reference or not phone or credits <= 0 or not package_code:
-        logging.warning(
-            "Topup missing metadata ref=%r phone=%r credits=%r package=%r",
-            reference,
-            phone,
-            credits,
-            package_code,
-        )
+        logging.warning("Topup missing metadata ref=%r phone=%r credits=%r package=%r", reference, phone, credits, package_code)
         return jsonify({"ok": True}), 200
 
     pkg = _get_topup_package(package_code)
@@ -665,15 +596,9 @@ def _handle_topup(event_type: str, data: Dict[str, Any], full_event: Dict[str, A
     # credit ledger table (optional)
     try:
         _db().table("ai_credit_ledger").insert(
-            {
-                "wa_phone": phone,
-                "reference": reference,
-                "credits": credits,
-                "created_at": _now_iso(),
-            }
+            {"wa_phone": phone, "reference": reference, "credits": credits, "created_at": _now_iso()}
         ).execute()
     except Exception:
-        # not fatal if table doesn't exist
         pass
 
     return jsonify({"ok": True}), 200
