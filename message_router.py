@@ -1,11 +1,12 @@
 # message_router.py
-from app.services.engine import answer_engine_reply
+from app.services.engine import resolve_answer
 
 
 def route_message(sender_key: str, text: str) -> str:
     """
-    Unified router for Telegram/WhatsApp/Web.
-    Option 1: NO sessions, just respond using the engine.
+    Central router used by Telegram/WhatsApp/Web.
+    Option 1: no sessions, always resolve via the engine.
+
     sender_key examples:
       - tg:123456789
       - wa:234xxxxxxxxxx
@@ -14,4 +15,16 @@ def route_message(sender_key: str, text: str) -> str:
     if not clean_text:
         return "Please type your question."
 
-    return answer_engine_reply(sender_key, clean_text)
+    result = resolve_answer(
+        wa_phone=sender_key,          # engine uses this as identity key
+        question=clean_text,
+        mode="text",
+        lang="en",
+        source="telegram",            # good for logging/analytics
+    )
+
+    # Engine can return ok=False when quota is blocked
+    if not result.get("ok"):
+        return result.get("message") or "Sorry — you cannot use AI right now."
+
+    return result.get("answer_text") or "OK"
