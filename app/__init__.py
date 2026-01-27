@@ -19,6 +19,7 @@ def create_app() -> Flask:
             "Content-Type",
             "x-admin-key",
             "X-Telegram-Bot-Api-Secret-Token",
+            "X-Webhook-Secret",  # ✅ for WhatsApp optional extra guard
         ],
         methods=["GET", "POST", "OPTIONS"],
     )
@@ -32,6 +33,7 @@ def create_app() -> Flask:
     from app.routes.telegram_routes import bp as telegram_bp
     from app.routes.cron import bp as cron_bp
     from app.routes.subscription_routes import bp as subscription_bp
+    from app.routes.whatsapp_routes import bp as whatsapp_bp  # ✅ NEW
 
     app.register_blueprint(health_bp)
     app.register_blueprint(ask_bp)
@@ -39,6 +41,7 @@ def create_app() -> Flask:
     app.register_blueprint(telegram_bp)
     app.register_blueprint(cron_bp)
     app.register_blueprint(subscription_bp)
+    app.register_blueprint(whatsapp_bp)  # ✅ NEW
 
     @app.get("/")
     def root():
