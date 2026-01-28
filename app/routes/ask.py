@@ -5,40 +5,37 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from app.services.engine import resolve_answer
+from app.core.identity import resolve_acct_id
 from app.db.supabase_client import supabase
 
 bp = Blueprint("ask", __name__)
+log = logging.getLogger(__name__)
 
 
-# -----------------------------
+# ------------------------------------------------------------
 # Helpers
-# -----------------------------
-def _normalize_phone(p: str) -> str:
-    return "".join(ch for ch in (p or "").strip() if ch.isdigit())
-
-
+# ------------------------------------------------------------
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _get_subscription(user_key: str) -> Optional[Dict[str, Any]]:
+def _get_subscription(acct_id: str) -> Optional[Dict[str, Any]]:
     """
-    user_key = ONE identity used across Web / WhatsApp / Telegram.
-    You are currently storing it inside user_subscriptions.wa_phone
+    Account-based subscription lookup.
     """
     try:
         r = (
-            supabase
-            .table("user_subscriptions")
+            supabase()
+            .table("subscriptions")
             .select("*")
-            .eq("wa_phone", user_key)
+            .eq("acct_id", acct_id)
             .limit(1)
             .execute()
         )
         rows = getattr(r, "data", None) or []
         return rows[0] if rows else None
     except Exception as e:
-        logging.exception("subscription lookup failed: %s", e)
+        log.exception("subscription lookup failed: %s", e)
         return None
 
 
@@ -47,8 +44,7 @@ def _is_active(sub: Optional[Dict[str, Any]]) -> bool:
         return False
 
     status = (sub.get("status") or "").strip().lower()
-    # Accept both "active" and "paid"
-    if status and status not in ("active", "paid"):
+    if status != "active":
         return False
 
     exp = sub.get("expires_at")
@@ -62,16 +58,17 @@ def _is_active(sub: Optional[Dict[str, Any]]) -> bool:
         return False
 
 
-# -----------------------------
-# ASK (AI)
-# -----------------------------
+# ------------------------------------------------------------
+# ASK (AI) — CANONICAL ENTRYPOINT
+# ------------------------------------------------------------
 @bp.post("/ask")
 def ask():
     """
-    Request JSON:
+    Request JSON (canonical):
       {
-        "wa_phone": "2348012345678",   # OR "user_key": "2348012345678"
-        "question": "....",
+        "provider": "wa" | "tg" | "web",
+        "provider_user_id": "<phone | chat_id | session_id>",
+        "question": "...",
         "mode": "text" | "voice",
         "lang": "en" | "pcm" | "yo" | "ig" | "ha"
       }
@@ -80,51 +77,59 @@ def ask():
       {
         "ok": true,
         "answer": "...",
-        "audio_url": null,
-        "plan_expiry": "...iso..." | null,
-        "source": "cache|fresh|...",
+        "source": "cache|library|ai|fallback"
       }
     """
     data = request.get_json(silent=True) or {}
 
-    raw_key = str(data.get("wa_phone") or data.get("user_key") or "").strip()
-    user_key = _normalize_phone(raw_key)
-
+    provider = str(data.get("provider") or "").strip()
+    provider_user_id = str(data.get("provider_user_id") or "").strip()
     question = str(data.get("question") or "").strip()
     mode = str(data.get("mode") or "text").strip()
     lang = str(data.get("lang") or "en").strip()
 
-    if not user_key or not question:
-        return jsonify({"ok": False, "message": "wa_phone (or user_key) and question are required"}), 400
+    if not provider or not provider_user_id or not question:
+        return jsonify({
+            "ok": False,
+            "message": "provider, provider_user_id and question are required"
+        }), 400
 
-    # Optional: quick subscription lookup (does not block here; engine can still enforce if needed)
-    sub = _get_subscription(user_key)
+    # Resolve or create canonical account
+    acct_id = resolve_acct_id(provider, provider_user_id)
+
+    # Optional subscription check (engine still enforces limits)
+    sub = _get_subscription(acct_id)
     active = _is_active(sub)
 
-    logging.info(
-        "ASK user_key=%s active=%s lang=%s mode=%s q=%s",
-        user_key,
+    log.info(
+        "ASK acct_id=%s provider=%s active=%s lang=%s mode=%s q=%s",
+        acct_id,
+        provider,
         active,
         lang,
         mode,
         question[:200],
     )
 
-    # Engine decides whether to serve/deny/limit based on subscription
+    # Call the unified engine
     res = resolve_answer(
-        wa_phone=user_key,   # keep parameter name, but value is now the unified identity
+        wa_phone=acct_id,   # IMPORTANT: engine identity = acct_id
         question=question,
         mode=mode,
         lang=lang,
-        source="web",
+        source=provider,
+    )
+
+    answer_text = (
+        res.get("answer_text")
+        or res.get("message")
+        or "Sorry, I couldn’t answer that right now."
     )
 
     return jsonify(
         {
             "ok": True,
-            "answer": res.get("answer_text"),
-            "audio_url": res.get("audio_url"),
-            "plan_expiry": res.get("plan_expiry"),
+            "answer": answer_text,
             "source": res.get("source"),
         }
     ), 200
