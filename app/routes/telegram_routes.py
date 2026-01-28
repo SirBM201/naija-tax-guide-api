@@ -1,58 +1,39 @@
-# app/routes/telegram_routes.py
-import os
-import logging
 from flask import Blueprint, request, jsonify
-
-from app.services.telegram import tg_send_message
-from message_router import route_message
+import logging
+import requests
+import os
 
 bp = Blueprint("telegram", __name__)
+log = logging.getLogger(__name__)
 
-TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
-
-
-def _safe_str(x) -> str:
-    return "" if x is None else str(x)
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 
-@bp.post("/telegram/webhook/<secret>")
-def telegram_webhook(secret: str):
-    """
-    Telegram will POST updates here.
-    Must respond FAST with 200 or Telegram will retry.
-    """
-    if not TELEGRAM_WEBHOOK_SECRET or secret != TELEGRAM_WEBHOOK_SECRET:
-        return "forbidden", 403
+@bp.post("/telegram/webhook")
+def telegram_webhook():
+    data = request.get_json(silent=True) or {}
+    msg = data.get("message") or {}
 
-    update = request.get_json(silent=True) or {}
-
-    msg = (update.get("message") or update.get("edited_message") or {}) or {}
-    chat = (msg.get("chat") or {}) or {}
-    chat_id = chat.get("id")
+    chat = msg.get("chat") or {}
+    chat_id = str(chat.get("id"))
     text = (msg.get("text") or "").strip()
-
-    if not chat_id:
-        return "ok", 200
-
-    if text.lower().startswith("/start"):
-        tg_send_message(chat_id, "✅ Naija Hustle Tax Guide is connected.\n\nSend your tax question here.")
-        return "ok", 200
-
     if not text:
-        tg_send_message(chat_id, "Please type your question.")
-        return "ok", 200
+        return jsonify(ok=True)
 
-    try:
-        identity = f"tg:{_safe_str(chat_id)}"
-        reply = route_message(identity, text, lang="en")
-        tg_send_message(chat_id, reply)
-    except Exception as e:
-        logging.exception("Telegram inbound handling failed: %s", e)
-        tg_send_message(chat_id, "Sorry — an error occurred. Please try again.")
+    # internal ask call
+    from flask import current_app
+    client = current_app.test_client()
+    r = client.post("/ask", json={
+        "provider": "tg",
+        "provider_user_id": chat_id,
+        "question": text,
+    })
+    answer = (r.get_json() or {}).get("answer") or "Sorry, try again."
 
-    return "ok", 200
+    requests.post(f"{API}/sendMessage", json={
+        "chat_id": chat_id,
+        "text": answer,
+    })
 
-
-@bp.get("/telegram/ping")
-def telegram_ping():
-    return jsonify({"ok": True, "telegram": True}), 200
+    return jsonify(ok=True)
