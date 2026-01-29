@@ -2,17 +2,15 @@
 import os
 from supabase import create_client
 
-SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").strip()
-SUPABASE_SERVICE_ROLE_KEY = (os.getenv("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
 
 _client = None
 
 def supabase():
     """
     Returns a singleton Supabase client.
-    Usage:
-        from app.db.supabase_client import supabase
-        supabase().table("...").select("*").execute()
+    IMPORTANT: This is a FUNCTION, so callers must do supabase().table(...)
     """
     global _client
     if _client is None:
