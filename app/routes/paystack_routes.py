@@ -11,7 +11,7 @@ from urllib.parse import urlencode
 import requests
 from flask import Blueprint, request, jsonify, redirect
 
-from app.db.supabase_client import supabase  # NOTE: this is a FUNCTION: supabase()
+from app.db.supabase_client import supabase  # IMPORTANT: this is a FUNCTION -> use supabase().table(...)
 
 bp = Blueprint("paystack", __name__)
 
