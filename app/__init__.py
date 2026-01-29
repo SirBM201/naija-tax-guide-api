@@ -1,10 +1,8 @@
 # app/__init__.py
 from flask import Flask, jsonify
 from flask_cors import CORS
-
 from app.core.utils import init_logging, register_error_handlers
 from app.core.config import allowed_origins
-
 
 def create_app():
     init_logging()
@@ -16,13 +14,18 @@ def create_app():
     from app.routes.ask import bp as ask_bp
     from app.routes.telegram_routes import bp as telegram_bp
     from app.routes.whatsapp_routes import bp as whatsapp_bp
-    from app.routes.paystack_routes import bp as paystack_bp
 
     app.register_blueprint(health_bp)
     app.register_blueprint(ask_bp)
     app.register_blueprint(telegram_bp)
     app.register_blueprint(whatsapp_bp)
-    app.register_blueprint(paystack_bp)
+
+    # Paystack blueprint (don't crash the whole app if this has an error during dev)
+    try:
+        from app.routes.paystack_routes import bp as paystack_bp
+        app.register_blueprint(paystack_bp)
+    except Exception as e:
+        app.logger.exception("Paystack routes not loaded: %s", e)
 
     @app.get("/")
     def root():
