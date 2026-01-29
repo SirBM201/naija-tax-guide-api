@@ -27,15 +27,11 @@ def _tg_send(chat_id: str, text: str) -> None:
         log.exception("Telegram send exception")
 
 
-def _ask_engine_tg(chat_id: str, question: str) -> str:
-    """
-    Calls internal /ask using the new identity format.
-    """
+def _ask_internal(chat_id: str, question: str) -> str:
     try:
         client = current_app.test_client()
         resp = client.post("/ask", json={
-            "provider": "tg",
-            "provider_user_id": str(chat_id),
+            "wa_phone": chat_id,          # temporary identity = tg chat_id (digits)
             "question": question,
             "mode": "text",
             "lang": "en",
@@ -45,7 +41,7 @@ def _ask_engine_tg(chat_id: str, question: str) -> str:
             return str(data["answer"])
         return str(data.get("message") or "Sorry, I couldn't process that right now.")
     except Exception:
-        log.exception("Telegram engine call failed")
+        log.exception("Telegram internal /ask failed")
         return "Sorry — something went wrong. Please try again."
 
 
@@ -54,10 +50,9 @@ def telegram_ping():
     return jsonify(ok=True, telegram=True, token_ok=bool(BOT_TOKEN))
 
 
-# --- IMPORTANT ---
-# Support BOTH webhook paths:
-# 1) /telegram/webhook
-# 2) /telegram/webhook/<anything>   (matches the old URL that includes a token)
+# Support BOTH:
+# /telegram/webhook
+# /telegram/webhook/<anything>
 @bp.post("/telegram/webhook")
 @bp.post("/telegram/webhook/<path:_rest>")
 def telegram_webhook(_rest: str = ""):
@@ -66,15 +61,15 @@ def telegram_webhook(_rest: str = ""):
     msg = data.get("message") or data.get("edited_message") or {}
     chat = msg.get("chat") or {}
     chat_id = chat.get("id")
-
     text = (msg.get("text") or "").strip()
+
     if not chat_id or not text:
         return jsonify(ok=True, ignored=True)
 
     chat_id = str(chat_id)
     log.info("Telegram inbound chat_id=%s text=%s", chat_id, text[:200])
 
-    answer = _ask_engine_tg(chat_id=chat_id, question=text)
+    answer = _ask_internal(chat_id=chat_id, question=text)
     _tg_send(chat_id=chat_id, text=answer)
 
     return jsonify(ok=True)
