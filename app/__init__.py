@@ -5,6 +5,7 @@ from flask_cors import CORS
 from app.core.utils import init_logging, register_error_handlers
 from app.core.config import allowed_origins
 
+
 def create_app():
     init_logging()
     app = Flask(__name__)
