@@ -1,75 +1,66 @@
 # app/routes/telegram_routes.py
-from flask import Blueprint, request, jsonify, current_app
+import os
 import logging
 import requests
-import os
+from flask import Blueprint, request, jsonify, current_app
 
 bp = Blueprint("telegram", __name__)
 log = logging.getLogger(__name__)
 
 BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+WEBHOOK_TOKEN = (os.getenv("TELEGRAM_WEBHOOK_TOKEN") or "").strip()  # set this to match the token in your webhook URL
+
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 
-def _tg_send(chat_id: str, text: str) -> None:
+def _send(chat_id: str, text: str) -> None:
     if not BOT_TOKEN:
-        log.error("TELEGRAM_BOT_TOKEN missing")
+        log.warning("TELEGRAM_BOT_TOKEN not set")
         return
     try:
-        r = requests.post(
-            f"{API}/sendMessage",
-            json={"chat_id": chat_id, "text": text},
-            timeout=20
-        )
-        if r.status_code >= 300:
-            log.error("Telegram send failed: %s %s", r.status_code, r.text[:500])
+        requests.post(f"{API}/sendMessage", json={"chat_id": chat_id, "text": text}, timeout=20)
     except Exception:
-        log.exception("Telegram send exception")
+        log.exception("Telegram send failed")
 
 
-def _ask_internal(chat_id: str, question: str) -> str:
-    try:
-        client = current_app.test_client()
-        resp = client.post("/ask", json={
-            "wa_phone": chat_id,          # temporary identity = tg chat_id (digits)
-            "question": question,
-            "mode": "text",
-            "lang": "en",
-        })
-        data = resp.get_json(silent=True) or {}
-        if data.get("ok") is True and data.get("answer"):
-            return str(data["answer"])
-        return str(data.get("message") or "Sorry, I couldn't process that right now.")
-    except Exception:
-        log.exception("Telegram internal /ask failed")
-        return "Sorry — something went wrong. Please try again."
-
-
-@bp.get("/telegram/ping")
-def telegram_ping():
-    return jsonify(ok=True, telegram=True, token_ok=bool(BOT_TOKEN))
-
-
-# Support BOTH:
-# /telegram/webhook
-# /telegram/webhook/<anything>
-@bp.post("/telegram/webhook")
-@bp.post("/telegram/webhook/<path:_rest>")
-def telegram_webhook(_rest: str = ""):
-    data = request.get_json(silent=True) or {}
-
+def _handle_update(data: dict) -> dict:
     msg = data.get("message") or data.get("edited_message") or {}
     chat = msg.get("chat") or {}
-    chat_id = chat.get("id")
+    chat_id = str(chat.get("id") or "")
     text = (msg.get("text") or "").strip()
 
     if not chat_id or not text:
-        return jsonify(ok=True, ignored=True)
+        return {"ok": True, "ignored": True}
 
-    chat_id = str(chat_id)
-    log.info("Telegram inbound chat_id=%s text=%s", chat_id, text[:200])
+    # Call /ask internally using NEW format
+    client = current_app.test_client()
+    r = client.post(
+        "/ask",
+        json={
+            "provider": "tg",
+            "provider_user_id": chat_id,
+            "question": text,
+            "mode": "text",
+            "lang": "en",
+        },
+    )
+    j = r.get_json(silent=True) or {}
+    answer = j.get("answer") or j.get("message") or "Sorry, I couldn't process that."
 
-    answer = _ask_internal(chat_id=chat_id, question=text)
-    _tg_send(chat_id=chat_id, text=answer)
+    _send(chat_id, answer)
+    return {"ok": True}
 
-    return jsonify(ok=True)
+
+@bp.post("/telegram/webhook")
+def telegram_webhook_plain():
+    data = request.get_json(silent=True) or {}
+    return jsonify(_handle_update(data))
+
+
+@bp.post("/telegram/webhook/<token>")
+def telegram_webhook_token(token: str):
+    # If you configured Telegram webhook URL with a token, validate it here
+    if WEBHOOK_TOKEN and token != WEBHOOK_TOKEN:
+        return jsonify({"ok": False, "message": "forbidden"}), 403
+    data = request.get_json(silent=True) or {}
+    return jsonify(_handle_update(data))
