@@ -11,7 +11,7 @@ from urllib.parse import urlencode
 import requests
 from flask import Blueprint, request, jsonify, redirect
 
-from app.db.supabase_client import supabase  # FUNCTION -> use supabase().table(...)
+from app.db.supabase_client import supabase  # FUNCTION -> supabase().table(...)
 
 bp = Blueprint("paystack", __name__)
 
@@ -20,8 +20,9 @@ bp = Blueprint("paystack", __name__)
 # -----------------------------
 PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY", "").strip()
 PAYSTACK_WEBHOOK_SECRET = os.getenv("PAYSTACK_WEBHOOK_SECRET", PAYSTACK_SECRET_KEY).strip()
+
 FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "").strip()
-APP_BASE_URL = os.getenv("APP_BASE_URL", "").strip()  # optional
+APP_BASE_URL = os.getenv("APP_BASE_URL", "").strip()
 
 # -----------------------------
 # Plans (NEW PRICES)
@@ -67,30 +68,75 @@ def _int(value: Any, default: int = 0) -> int:
     except Exception:
         return default
 
+def _digits(x: str) -> str:
+    return "".join(ch for ch in (x or "").strip() if ch.isdigit())
+
 def _normalize_provider(p: str) -> str:
-    p = (p or "").strip().lower()
-    if p in ("wa", "whatsapp"):
+    v = (p or "").strip().lower()
+    if v in ("wa", "whatsapp"):
         return "wa"
-    if p in ("tg", "telegram"):
+    if v in ("tg", "telegram"):
         return "tg"
-    if p in ("web", "site", "browser"):
-        return "web"
-    return p or "web"
+    return "web"
 
-def _normalize_phone_digits(p: str) -> str:
-    return "".join(ch for ch in (p or "").strip() if ch.isdigit())
+def _acct_key(acct_id: str) -> str:
+    return f"acct:{acct_id}"
 
-def _acct_key(account_id: str) -> str:
-    return f"acct:{account_id}"
+def _resolve_acct_id(provider: str, provider_user_id: str, phone_e164: Optional[str] = None) -> str:
+    """
+    Accounts table only (no Supabase Auth).
+    Unique key: (provider, provider_user_id)
+    Returns acct_id (uuid string).
+    """
+    provider = _normalize_provider(provider)
+    provider_user_id = (provider_user_id or "").strip()
+    if not provider_user_id:
+        raise ValueError("provider_user_id is required")
 
-def _frontend_url(path: str, params: Optional[Dict[str, Any]] = None) -> str:
-    base = (FRONTEND_BASE_URL or "").rstrip("/")
-    if not base:
-        return ""
-    p = "/" + path.lstrip("/")
-    if params:
-        return f"{base}{p}?{urlencode(params)}"
-    return f"{base}{p}"
+    # 1) lookup
+    r = (
+        supabase()
+        .table("accounts")
+        .select("acct_id")
+        .eq("provider", provider)
+        .eq("provider_user_id", provider_user_id)
+        .limit(1)
+        .execute()
+    )
+    rows = getattr(r, "data", None) or []
+    if rows:
+        return str(rows[0]["acct_id"])
+
+    # 2) create
+    payload = {
+        "provider": provider,
+        "provider_user_id": provider_user_id,
+        "status": "active",
+        "updated_at": _now_iso(),
+    }
+    if phone_e164:
+        payload["phone_e164"] = (phone_e164 or "")[:40]
+
+    ins = supabase().table("accounts").insert(payload).execute()
+    created = getattr(ins, "data", None) or []
+    if created and created[0].get("acct_id"):
+        return str(created[0]["acct_id"])
+
+    # 3) retry read
+    r2 = (
+        supabase()
+        .table("accounts")
+        .select("acct_id")
+        .eq("provider", provider)
+        .eq("provider_user_id", provider_user_id)
+        .limit(1)
+        .execute()
+    )
+    rows2 = getattr(r2, "data", None) or []
+    if rows2:
+        return str(rows2[0]["acct_id"])
+
+    raise RuntimeError("Failed to resolve acct_id")
 
 def _get_plan(plan: str) -> Optional[Dict[str, Any]]:
     if not plan:
@@ -102,94 +148,21 @@ def _get_topup_package(code: str) -> Optional[Dict[str, Any]]:
         return None
     return TOPUP_PACKAGES.get(code.strip().upper())
 
-def _resolve_account_id(provider: str, provider_user_id: str, phone_e164: Optional[str] = None) -> str:
+def _frontend_url(path: str, params: Optional[Dict[str, Any]] = None) -> str:
+    base = (FRONTEND_BASE_URL or "").rstrip("/")
+    if not base:
+        return ""
+    p = "/" + path.lstrip("/")
+    if params:
+        return f"{base}{p}?{urlencode(params)}"
+    return f"{base}{p}"
+
+def _get_subscription(acct_key_value: str) -> Optional[Dict[str, Any]]:
     """
-    Resolve accounts.id by (provider, provider_user_id). Create if missing.
-    accounts table columns: id, provider, provider_user_id, phone_e164, created_at, updated_at
+    Option 2: user_subscriptions.wa_phone stores acct:<uuid>
     """
-    provider = _normalize_provider(provider)
-    provider_user_id = (provider_user_id or "").strip()
-    if not provider_user_id:
-        raise ValueError("provider_user_id required")
-
-    # lookup
-    r = (
-        supabase()
-        .table("accounts")
-        .select("id")
-        .eq("provider", provider)
-        .eq("provider_user_id", provider_user_id)
-        .limit(1)
-        .execute()
-    )
-    rows = getattr(r, "data", None) or []
-    if rows and rows[0].get("id"):
-        return str(rows[0]["id"])
-
-    # insert
-    payload = {
-        "provider": provider,
-        "provider_user_id": provider_user_id,
-        "updated_at": _now_iso(),
-    }
-    if phone_e164:
-        payload["phone_e164"] = (phone_e164 or "")[:40]
-
-    ins = supabase().table("accounts").insert(payload).execute()
-    created = getattr(ins, "data", None) or []
-    if created and created[0].get("id"):
-        return str(created[0]["id"])
-
-    # fallback re-read
-    r2 = (
-        supabase()
-        .table("accounts")
-        .select("id")
-        .eq("provider", provider)
-        .eq("provider_user_id", provider_user_id)
-        .limit(1)
-        .execute()
-    )
-    rows2 = getattr(r2, "data", None) or []
-    if rows2 and rows2[0].get("id"):
-        return str(rows2[0]["id"])
-
-    raise RuntimeError("Failed to resolve account id")
-
-def _resolve_identity_from_request(body: dict) -> Dict[str, str]:
-    """
-    Returns: { account_id, acct_key, provider, provider_user_id }
-    Accepts:
-      - acct_key (preferred if frontend already has it), OR
-      - provider + provider_user_id (recommended), OR
-      - phone (legacy web): phone digits -> treated as provider=web
-    """
-    acct_key = (body.get("acct_key") or "").strip()
-    if acct_key.startswith("acct:") and len(acct_key) > 10:
-        # best effort: parse id
-        account_id = acct_key.split("acct:", 1)[1].strip()
-        return {"account_id": account_id, "acct_key": acct_key, "provider": "web", "provider_user_id": "acct_key"}
-
-    provider = _normalize_provider(body.get("provider") or "")
-    provider_user_id = (body.get("provider_user_id") or "").strip()
-
-    if provider and provider_user_id:
-        # optional phone hint (web can pass phone digits)
-        phone_hint = _normalize_phone_digits(body.get("phone") or body.get("wa_phone") or "")
-        account_id = _resolve_account_id(provider, provider_user_id, phone_e164=phone_hint or None)
-        return {"account_id": account_id, "acct_key": _acct_key(account_id), "provider": provider, "provider_user_id": provider_user_id}
-
-    # legacy fallback: phone digits -> web identity
-    phone_digits = _normalize_phone_digits(body.get("phone") or body.get("wa_phone") or "")
-    if phone_digits:
-        account_id = _resolve_account_id("web", phone_digits, phone_e164=phone_digits)
-        return {"account_id": account_id, "acct_key": _acct_key(account_id), "provider": "web", "provider_user_id": phone_digits}
-
-    raise ValueError("Missing identity: provide acct_key OR provider+provider_user_id OR phone")
-
-def _get_subscription(acct_key: str) -> Optional[Dict[str, Any]]:
     try:
-        r = supabase().table("user_subscriptions").select("*").eq("wa_phone", acct_key).limit(1).execute()
+        r = supabase().table("user_subscriptions").select("*").eq("wa_phone", acct_key_value).limit(1).execute()
         rows = getattr(r, "data", None) or []
         return rows[0] if rows else None
     except Exception as e:
@@ -199,12 +172,15 @@ def _get_subscription(acct_key: str) -> Optional[Dict[str, Any]]:
 def _is_active_paid_subscription(sub: Optional[Dict[str, Any]]) -> bool:
     if not sub:
         return False
+
     status = (sub.get("status") or "").strip().lower()
     if status and status not in ("active", "paid"):
         return False
+
     exp = sub.get("expires_at")
     if not exp:
         return False
+
     try:
         exp_dt = datetime.fromisoformat(str(exp).replace("Z", "+00:00"))
         return exp_dt > _now()
@@ -221,27 +197,46 @@ def paystack_health():
 
 
 # -----------------------------
-# SUBSCRIPTION: Initialize (acct:<uuid>)
+# SUBSCRIPTION: Initialize (Option 2)
 # -----------------------------
 @bp.post("/paystack/subscription/initialize")
 def paystack_subscription_initialize():
+    """
+    Recommended JSON (Option 2):
+      {
+        "provider": "web" | "wa" | "tg",
+        "provider_user_id": "...",
+        "email": "user@example.com",
+        "plan": "monthly" | "quarterly" | "yearly",
+        "phone_e164": "234..."  (optional)
+      }
+
+    Backward compatible:
+      { "phone": "234...", "email": "...", "plan": "monthly" }
+      -> treated as provider="web", provider_user_id=digits(phone)
+    """
     if not PAYSTACK_SECRET_KEY:
         return jsonify({"ok": False, "message": "PAYSTACK_SECRET_KEY not set"}), 500
 
     body = request.get_json(silent=True) or {}
 
-    # identity
-    try:
-        ident = _resolve_identity_from_request(body)
-    except Exception as e:
-        return jsonify({"ok": False, "message": str(e)}), 400
+    provider = (body.get("provider") or "").strip()
+    provider_user_id = (body.get("provider_user_id") or "").strip()
+    phone_e164 = _digits(body.get("phone_e164") or "")
 
-    acct_key = ident["acct_key"]
-    account_id = ident["account_id"]
+    # Old fallback
+    old_phone = _digits(body.get("phone") or body.get("wa_phone") or "")
+    if not provider_user_id and old_phone:
+        provider = "web"
+        provider_user_id = old_phone
+        if not phone_e164:
+            phone_e164 = old_phone
 
     email = (body.get("email") or "").strip()
     plan = (body.get("plan") or "").strip().lower()
 
+    if not provider_user_id:
+        return jsonify({"ok": False, "message": "provider_user_id (or phone) is required"}), 400
     if not email or "@" not in email:
         return jsonify({"ok": False, "message": "Valid email is required"}), 400
 
@@ -249,15 +244,19 @@ def paystack_subscription_initialize():
     if not p:
         return jsonify({"ok": False, "message": "Invalid plan"}), 400
 
+    # Resolve acct_key
+    acct_id = _resolve_acct_id(provider or "web", provider_user_id, phone_e164=phone_e164 or None)
+    acct_key_value = _acct_key(acct_id)
+
     amount_kobo = int(p["amount_kobo"])
     duration_days = int(p["duration_days"])
-    reference = f"sub_{plan}_{int(_now().timestamp())}_{account_id[-6:]}"
+    reference = f"sub_{plan}_{int(_now().timestamp())}_{acct_id[:8]}"
 
-    # Save pending subscription UNDER acct_key
+    # Save pending subscription (Option 2 key)
     try:
         supabase().table("user_subscriptions").upsert(
             {
-                "wa_phone": acct_key,              # ✅ unified identity key
+                "wa_phone": acct_key_value,
                 "email": email[:200],
                 "plan": plan,
                 "status": "pending",
@@ -286,12 +285,11 @@ def paystack_subscription_initialize():
         "callback_url": callback_url or None,
         "metadata": {
             "purpose": "subscription",
-            "acct_key": acct_key,               # ✅ the only key we trust later
-            "account_id": account_id,
-            "plan": plan,
+            "acct_key": acct_key_value,                 # ✅ KEY
+            "provider": _normalize_provider(provider),  # helpful for debugging
+            "provider_user_id": provider_user_id,
             "duration_days": duration_days,
-            "provider": ident.get("provider"),
-            "provider_user_id": ident.get("provider_user_id"),
+            "plan": plan,
         },
     }
 
@@ -317,7 +315,8 @@ def paystack_subscription_initialize():
                 "ok": True,
                 "authorization_url": d.get("authorization_url"),
                 "reference": d.get("reference") or reference,
-                "acct_key": acct_key,
+                "acct_key": acct_key_value,
+                "acct_id": acct_id,
             }
         ), 200
 
@@ -339,15 +338,24 @@ def paystack_subscription_callback():
 
 
 # -----------------------------
-# SUBSCRIPTION: Verify (uses metadata.acct_key)
+# SUBSCRIPTION: Verify (Option 2)
 # -----------------------------
 @bp.post("/paystack/subscription/verify")
 def paystack_subscription_verify():
+    """
+    Request JSON:
+      { "reference": "...", "acct_key": "acct:<uuid>" }  OR
+      { "reference": "...", "provider": "...", "provider_user_id": "..." }
+
+    Response:
+      { ok: true, status, plan, expires_at, reference, acct_key }
+    """
     if not PAYSTACK_SECRET_KEY:
         return jsonify({"ok": False, "message": "PAYSTACK_SECRET_KEY not set"}), 500
 
     body = request.get_json(silent=True) or {}
-    reference = (body.get("reference") or body.get("paystack_reference") or "").strip()
+    reference = (body.get("reference") or body.get("paystack_reference") or body.get("trxref") or "").strip()
+
     if not reference:
         return jsonify({"ok": False, "message": "reference is required"}), 400
 
@@ -371,21 +379,43 @@ def paystack_subscription_verify():
             return jsonify({"ok": False, "message": f"Payment not successful (status={paid_status})"}), 400
 
         md = data.get("metadata") or {}
-        acct_key = (md.get("acct_key") or "").strip()
+        purpose = (md.get("purpose") or "").strip().lower()
+
+        if purpose and purpose != "subscription":
+            return jsonify({"ok": False, "message": "Not a subscription payment"}), 400
+
+        # ✅ Prefer acct_key from Paystack metadata
+        acct_key_value = (md.get("acct_key") or "").strip()
+
+        # fallback: resolve from provider info
+        if not acct_key_value:
+            provider = (md.get("provider") or body.get("provider") or "web").strip()
+            provider_user_id = (md.get("provider_user_id") or body.get("provider_user_id") or "").strip()
+            if provider_user_id:
+                acct_id = _resolve_acct_id(provider, provider_user_id)
+                acct_key_value = _acct_key(acct_id)
+
+        if not acct_key_value:
+            return jsonify({"ok": False, "message": "Missing acct_key (or provider/provider_user_id)"}), 400
+
         md_plan = (md.get("plan") or "").strip().lower()
         md_days = _int(md.get("duration_days"), 0)
 
-        if not acct_key.startswith("acct:"):
-            return jsonify({"ok": False, "message": "Missing acct_key in metadata. Re-initialize payment."}), 400
+        p = _get_plan(md_plan) if md_plan else None
+        if not p:
+            # fallback to stored plan
+            row = _get_subscription(acct_key_value)
+            stored_plan = (row.get("plan") if row else "") or "monthly"
+            p = _get_plan(stored_plan) or _get_plan("monthly")
+            md_plan = stored_plan
 
-        p = _get_plan(md_plan) or _get_plan("monthly")
-        duration_days = md_days or int(p["duration_days"])
+        duration_days = md_days or int((p or {}).get("duration_days") or 30)
         expires_at = (_now() + timedelta(days=duration_days)).isoformat()
 
         supabase().table("user_subscriptions").upsert(
             {
-                "wa_phone": acct_key,
-                "plan": md_plan or p["plan"],
+                "wa_phone": acct_key_value,
+                "plan": md_plan,
                 "status": "active",
                 "expires_at": expires_at,
                 "paystack_reference": reference,
@@ -396,7 +426,9 @@ def paystack_subscription_verify():
             on_conflict="wa_phone",
         ).execute()
 
-        return jsonify({"ok": True, "status": "active", "plan": md_plan or p["plan"], "expires_at": expires_at, "reference": reference}), 200
+        return jsonify(
+            {"ok": True, "status": "active", "plan": md_plan, "expires_at": expires_at, "reference": reference, "acct_key": acct_key_value}
+        ), 200
 
     except Exception as e:
         logging.exception("verify exception: %s", e)
@@ -412,29 +444,47 @@ def paystack_topup_packages():
 
 
 # -----------------------------
-# TOP-UP: Initialize (acct:<uuid>, paid-only)
+# TOP-UP: Initialize (Option 2; PAID-ONLY)
 # -----------------------------
 @bp.post("/paystack/topup/initialize")
 def paystack_topup_initialize():
+    """
+    Preferred:
+      { "acct_key": "acct:<uuid>", "email": "...", "package_code": "TOPUP_100" }
+    Or:
+      { "provider":"wa|tg|web", "provider_user_id":"...", "email":"...", "package_code":"TOPUP_100" }
+    """
     if not PAYSTACK_SECRET_KEY:
         return jsonify({"ok": False, "message": "PAYSTACK_SECRET_KEY not set"}), 500
 
     body = request.get_json(silent=True) or {}
-
-    try:
-        ident = _resolve_identity_from_request(body)
-    except Exception as e:
-        return jsonify({"ok": False, "message": str(e)}), 400
-
-    acct_key = ident["acct_key"]
-
     email = (body.get("email") or "").strip()
     package_code = (body.get("package_code") or "").strip().upper()
 
     if not email or "@" not in email:
         return jsonify({"ok": False, "message": "Valid email is required"}), 400
 
-    sub = _get_subscription(acct_key)
+    acct_key_value = (body.get("acct_key") or "").strip()
+
+    if not acct_key_value:
+        provider = (body.get("provider") or "web").strip()
+        provider_user_id = (body.get("provider_user_id") or "").strip()
+
+        # old fallback
+        if not provider_user_id:
+            old_phone = _digits(body.get("phone") or body.get("wa_phone") or "")
+            if old_phone:
+                provider = "web"
+                provider_user_id = old_phone
+
+        if not provider_user_id:
+            return jsonify({"ok": False, "message": "acct_key OR provider+provider_user_id is required"}), 400
+
+        acct_id = _resolve_acct_id(provider, provider_user_id)
+        acct_key_value = _acct_key(acct_id)
+
+    # PAID-ONLY GUARD
+    sub = _get_subscription(acct_key_value)
     if not _is_active_paid_subscription(sub):
         return jsonify(
             {"ok": False, "message": "Top-up is only available to active subscribers. Please upgrade first.", "action": "upgrade", "reason": "not_subscribed_or_expired"}
@@ -446,13 +496,14 @@ def paystack_topup_initialize():
 
     credits = int(pkg["credits"])
     amount_kobo = int(pkg["amount_kobo"])
-    reference = f"topup_{acct_key.replace(':','_')}_{package_code}_{int(_now().timestamp())}"
+    reference = f"topup_{acct_key_value.replace(':','_')}_{package_code}_{int(_now().timestamp())}"
 
+    # store pending order first
     try:
         supabase().table("ai_topup_orders").upsert(
             {
                 "reference": reference,
-                "wa_phone": acct_key,            # ✅ unified identity
+                "wa_phone": acct_key_value,   # ✅ store acct_key here too
                 "email": email[:200],
                 "amount_kobo": amount_kobo,
                 "credits": credits,
@@ -476,7 +527,7 @@ def paystack_topup_initialize():
         "callback_url": callback_url or None,
         "metadata": {
             "purpose": "ai_topup",
-            "acct_key": acct_key,            # ✅
+            "acct_key": acct_key_value,  # ✅ KEY
             "credits": credits,
             "package_code": package_code,
         },
@@ -507,7 +558,7 @@ def paystack_topup_initialize():
                 "credits": credits,
                 "amount_kobo": amount_kobo,
                 "package_code": package_code,
-                "acct_key": acct_key,
+                "acct_key": acct_key_value,
             }
         ), 200
 
@@ -529,7 +580,7 @@ def paystack_topup_callback():
 
 
 # -----------------------------
-# PAYSTACK WEBHOOK (subscription + topup)
+# PAYSTACK WEBHOOK (SUBSCRIPTION + TOPUP) - Option 2
 # -----------------------------
 def _handle_paystack_webhook():
     raw = request.get_data() or b""
@@ -564,7 +615,6 @@ def _handle_paystack_webhook():
 def paystack_webhook():
     return _handle_paystack_webhook()
 
-
 @bp.post("/webhooks/paystack")
 def paystack_webhook_alias():
     return _handle_paystack_webhook()
@@ -578,13 +628,22 @@ def _handle_subscription_webhook(event_type: str, data: Dict[str, Any], full_eve
     if status and status not in ("success", "successful"):
         return jsonify({"ok": True}), 200
 
+    reference = (data.get("reference") or "").strip()
     md = data.get("metadata") or {}
-    acct_key = (md.get("acct_key") or "").strip()
+
+    acct_key_value = (md.get("acct_key") or "").strip()
     plan = (md.get("plan") or "").strip().lower()
     duration_days = _int(md.get("duration_days"), 0)
-    reference = (data.get("reference") or "").strip()
 
-    if not acct_key.startswith("acct:"):
+    # fallback: resolve if acct_key not present
+    if not acct_key_value:
+        provider = (md.get("provider") or "web").strip()
+        provider_user_id = (md.get("provider_user_id") or "").strip()
+        if provider_user_id:
+            acct_id = _resolve_acct_id(provider, provider_user_id)
+            acct_key_value = _acct_key(acct_id)
+
+    if not acct_key_value:
         logging.warning("Subscription webhook missing acct_key ref=%r", reference)
         return jsonify({"ok": True}), 200
 
@@ -594,7 +653,7 @@ def _handle_subscription_webhook(event_type: str, data: Dict[str, Any], full_eve
 
     supabase().table("user_subscriptions").upsert(
         {
-            "wa_phone": acct_key,  # ✅ unified key
+            "wa_phone": acct_key_value,  # ✅ acct_key
             "plan": plan or p["plan"],
             "status": "active",
             "expires_at": expires_at,
@@ -617,21 +676,22 @@ def _handle_topup(event_type: str, data: Dict[str, Any], full_event: Dict[str, A
     if status and status not in ("success", "successful"):
         return jsonify({"ok": True}), 200
 
+    reference = (data.get("reference") or "").strip()
     md = data.get("metadata") or {}
-    acct_key = (md.get("acct_key") or "").strip()
+
+    acct_key_value = (md.get("acct_key") or "").strip()
     credits = _int(md.get("credits"))
     package_code = (md.get("package_code") or "").strip().upper()
-    reference = (data.get("reference") or "").strip()
     amount_kobo = _int(data.get("amount"))
     email = (data.get("customer") or {}).get("email") or ""
 
-    if not acct_key.startswith("acct:") or credits <= 0 or not package_code or not reference:
-        logging.warning("Topup missing metadata ref=%r acct_key=%r credits=%r package=%r", reference, acct_key, credits, package_code)
+    if not reference or not acct_key_value or credits <= 0 or not package_code:
+        logging.warning("Topup missing metadata ref=%r acct_key=%r credits=%r package=%r", reference, acct_key_value, credits, package_code)
         return jsonify({"ok": True}), 200
 
     pkg = _get_topup_package(package_code)
     if not pkg:
-        logging.warning("Topup invalid package_code=%r", package_code)
+        logging.warning("Topup webhook invalid package_code=%r", package_code)
         return jsonify({"ok": True}), 200
 
     if int(pkg["credits"]) != int(credits):
@@ -642,11 +702,12 @@ def _handle_topup(event_type: str, data: Dict[str, Any], full_event: Dict[str, A
         logging.warning("Topup amount mismatch. pkg=%s got=%s", pkg["amount_kobo"], amount_kobo)
         return jsonify({"ok": True}), 200
 
+    # mark order paid
     try:
         supabase().table("ai_topup_orders").upsert(
             {
                 "reference": reference,
-                "wa_phone": acct_key,   # ✅ unified
+                "wa_phone": acct_key_value,  # ✅ acct_key
                 "email": (email or "")[:200],
                 "amount_kobo": amount_kobo,
                 "credits": credits,
@@ -660,9 +721,10 @@ def _handle_topup(event_type: str, data: Dict[str, Any], full_event: Dict[str, A
     except Exception as e:
         logging.exception("ai_topup_orders upsert paid failed: %s", e)
 
+    # credit ledger
     try:
         supabase().table("ai_credit_ledger").insert(
-            {"wa_phone": acct_key, "reference": reference, "credits": credits, "created_at": _now_iso()}
+            {"wa_phone": acct_key_value, "reference": reference, "credits": credits, "created_at": _now_iso()}
         ).execute()
     except Exception:
         pass
