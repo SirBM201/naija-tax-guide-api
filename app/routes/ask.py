@@ -5,14 +5,11 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from app.services.engine import resolve_answer
-from app.db.supabase_client import supabase  # FUNCTION -> use supabase().table(...)
+from app.db.supabase_client import supabase
 
 bp = Blueprint("ask", __name__)
 
 
-# -----------------------------
-# Helpers
-# -----------------------------
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -34,13 +31,12 @@ def _normalize_provider(p: str) -> str:
 
 def _resolve_account_id(provider: str, provider_user_id: str, phone_e164: Optional[str] = None) -> str:
     """
-    Uses public.accounts (NO Supabase Auth).
-    Table columns confirmed: id, provider, provider_user_id, phone_e164, created_at, updated_at
+    Accounts table only (no Supabase Auth).
+    We store channel identity in public.accounts(provider, provider_user_id).
     Returns accounts.id (uuid as string).
     """
     provider = _normalize_provider(provider)
     provider_user_id = (provider_user_id or "").strip()
-
     if not provider_user_id:
         raise ValueError("provider_user_id is required")
 
@@ -58,7 +54,7 @@ def _resolve_account_id(provider: str, provider_user_id: str, phone_e164: Option
     if rows and rows[0].get("id"):
         return str(rows[0]["id"])
 
-    # 2) create minimal account row
+    # 2) create
     payload = {
         "provider": provider,
         "provider_user_id": provider_user_id,
@@ -72,7 +68,7 @@ def _resolve_account_id(provider: str, provider_user_id: str, phone_e164: Option
     if created and created[0].get("id"):
         return str(created[0]["id"])
 
-    # 3) fallback re-read (handles race/unique constraint)
+    # 3) fallback re-read (race/unique)
     r2 = (
         supabase()
         .table("accounts")
@@ -86,7 +82,7 @@ def _resolve_account_id(provider: str, provider_user_id: str, phone_e164: Option
     if rows2 and rows2[0].get("id"):
         return str(rows2[0]["id"])
 
-    raise RuntimeError("Failed to resolve accounts.id")
+    raise RuntimeError("Failed to resolve account id")
 
 
 def _acct_key(account_id: str) -> str:
@@ -94,9 +90,6 @@ def _acct_key(account_id: str) -> str:
 
 
 def _get_subscription(acct_key: str) -> Optional[Dict[str, Any]]:
-    """
-    user_subscriptions.wa_phone stores unified identity: "acct:<uuid>"
-    """
     try:
         r = (
             supabase()
@@ -116,15 +109,12 @@ def _get_subscription(acct_key: str) -> Optional[Dict[str, Any]]:
 def _is_active(sub: Optional[Dict[str, Any]]) -> bool:
     if not sub:
         return False
-
     status = (sub.get("status") or "").strip().lower()
     if status and status not in ("active", "paid"):
         return False
-
     exp = sub.get("expires_at")
     if not exp:
         return False
-
     try:
         exp_dt = datetime.fromisoformat(str(exp).replace("Z", "+00:00"))
         return exp_dt > _now_utc()
@@ -132,26 +122,8 @@ def _is_active(sub: Optional[Dict[str, Any]]) -> bool:
         return False
 
 
-# -----------------------------
-# ASK
-# -----------------------------
 @bp.post("/ask")
 def ask():
-    """
-    Accepts BOTH formats:
-
-    A) New:
-      {
-        "provider": "web" | "wa" | "tg",
-        "provider_user_id": "<unique id per channel>",
-        "question": "...",
-        "mode": "text" | "voice",
-        "lang": "en" | "pcm" | "yo" | "ig" | "ha"
-      }
-
-    B) Old:
-      { "wa_phone": "2348012345678", "question": "..." }
-    """
     data = request.get_json(silent=True) or {}
 
     question = str(data.get("question") or data.get("text") or "").strip()
@@ -167,22 +139,19 @@ def ask():
     if not question:
         return jsonify({"ok": False, "message": "question is required"}), 400
 
-    # Resolve account id
     if provider and provider_user_id:
         provider_norm = _normalize_provider(provider)
         account_id = _resolve_account_id(provider_norm, provider_user_id, phone_e164=None)
     else:
-        # Old style => treat as web identity (phone digits)
         if not phone_digits:
             return jsonify({"ok": False, "message": "provider+provider_user_id OR wa_phone/user_key is required"}), 400
         account_id = _resolve_account_id("web", phone_digits, phone_e164=phone_digits)
 
     acct_key = _acct_key(account_id)
 
-    # subscription for UI plan expiry display
     sub = _get_subscription(acct_key)
-    plan_expiry = sub.get("expires_at") if sub else None
     active = _is_active(sub)
+    plan_expiry = sub.get("expires_at") if sub else None
 
     logging.info(
         "ASK acct_key=%s active=%s provider=%s provider_user_id=%s lang=%s mode=%s q=%s",
@@ -195,7 +164,6 @@ def ask():
         question[:200],
     )
 
-    # Engine identity is acct_key (string)
     res = resolve_answer(
         wa_phone=acct_key,
         question=question,
