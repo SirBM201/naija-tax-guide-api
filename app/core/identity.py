@@ -1,22 +1,36 @@
-import uuid
+# app/core/identity.py
 import logging
-from app.db.supabase_client import supabase
+from typing import Optional, Dict, Any
 
-log = logging.getLogger(__name__)
+from app.db.supabase_client import sb
+
+
+def acct_key(acct_id: str) -> str:
+    """
+    Store subscription identity as: 'acct:<uuid>'
+    """
+    return f"acct:{acct_id}"
 
 
 def resolve_acct_id(provider: str, provider_user_id: str) -> str:
     """
-    Returns existing acct_id or creates a new guest account.
+    Finds or creates an account for (provider, provider_user_id).
+    Returns acct_id (uuid string).
     """
-    provider = provider.strip()
-    provider_user_id = provider_user_id.strip()
+    provider = (provider or "").strip().lower()
+    provider_user_id = (provider_user_id or "").strip()
 
-    # 1) lookup
+    if provider not in ("wa", "tg", "web"):
+        raise ValueError("provider must be one of: wa, tg, web")
+    if not provider_user_id:
+        raise ValueError("provider_user_id is required")
+
+    client = sb()
+
+    # lookup
     r = (
-        supabase()
-        .table("account_identities")
-        .select("acct_id")
+        client.table("accounts")
+        .select("id")
         .eq("provider", provider)
         .eq("provider_user_id", provider_user_id)
         .limit(1)
@@ -24,21 +38,36 @@ def resolve_acct_id(provider: str, provider_user_id: str) -> str:
     )
     rows = getattr(r, "data", None) or []
     if rows:
-        return rows[0]["acct_id"]
+        return str(rows[0]["id"])
 
-    # 2) create guest account
-    acct_id = str(uuid.uuid4())
+    # create
+    ins = (
+        client.table("accounts")
+        .insert({"provider": provider, "provider_user_id": provider_user_id})
+        .execute()
+    )
+    data = getattr(ins, "data", None) or []
+    if not data:
+        raise RuntimeError("Failed to create account")
+    return str(data[0]["id"])
 
-    supabase().table("accounts").insert({
-        "acct_id": acct_id,
-        "status": "guest",
-    }).execute()
 
-    supabase().table("account_identities").insert({
-        "provider": provider,
-        "provider_user_id": provider_user_id,
-        "acct_id": acct_id,
-    }).execute()
-
-    log.info("Created guest acct_id=%s for %s:%s", acct_id, provider, provider_user_id)
-    return acct_id
+def get_subscription_by_acct_key(acct_key_str: str) -> Optional[Dict[str, Any]]:
+    """
+    Reads subscription row from user_subscriptions using wa_phone = 'acct:<uuid>'.
+    (We keep column name wa_phone for now to avoid risky refactor.)
+    """
+    try:
+        client = sb()
+        r = (
+            client.table("user_subscriptions")
+            .select("*")
+            .eq("wa_phone", acct_key_str)
+            .limit(1)
+            .execute()
+        )
+        rows = getattr(r, "data", None) or []
+        return rows[0] if rows else None
+    except Exception as e:
+        logging.exception("subscription lookup failed: %s", e)
+        return None
