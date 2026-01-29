@@ -1,6 +1,6 @@
 # app/services/engine.py
 import logging
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, List
 
 from app.db.qa import cache_get, cache_put, library_get
 from app.core.text import normalize_question
@@ -9,10 +9,7 @@ from app.services.ai import generate_answer
 from app.services.ai_policy import can_use_ai, consume_ai, log_ai_cost
 from app.services.reviewer import review_answer
 
-
-def _db():
-    from app.db.supabase_client import supabase as get_supabase
-    return get_supabase()
+from app.db.supabase_client import supabase
 
 
 def _pick_answer_columns(lang: str) -> List[str]:
@@ -29,7 +26,7 @@ def _pick_answer_columns(lang: str) -> List[str]:
 
 def _insert_suggestion(q_norm: str, q_raw: str, lang: str, answer: str, source: str, review: Dict[str, Any]) -> None:
     try:
-        _db().table("qa_suggestions").insert(
+        supabase().table("qa_suggestions").insert(
             {
                 "normalized_question": q_norm,
                 "question_raw": (q_raw or "")[:500],
@@ -62,14 +59,15 @@ def _auto_promote_to_library(q_norm: str, q_raw: str, lang: str, answer: str) ->
         payload[ans_col] = answer
 
         try:
-            _db().table("qa_library").upsert(payload, on_conflict="normalized_question").execute()
+            supabase().table("qa_library").upsert(payload, on_conflict="normalized_question").execute()
             return True
         except Exception as e:
             logging.exception("qa_library auto-promote failed using %s (ignored): %s", ans_col, e)
 
+            # retry minimal
             try:
                 minimal = {"normalized_question": q_norm, ans_col: answer}
-                _db().table("qa_library").upsert(minimal, on_conflict="normalized_question").execute()
+                supabase().table("qa_library").upsert(minimal, on_conflict="normalized_question").execute()
                 return True
             except Exception as e2:
                 logging.exception("qa_library auto-promote retry failed using %s (ignored): %s", ans_col, e2)
@@ -84,7 +82,7 @@ def resolve_answer(
     lang: str = "en",
     source: str = "web",
 ) -> Dict[str, Any]:
-    identity = (wa_phone or "").strip()
+    identity = (wa_phone or "").strip()  # IMPORTANT: this is your unified identity string (acct:<uuid>)
     q_raw = (question or "").strip()
     q_norm = normalize_question(q_raw)
 
