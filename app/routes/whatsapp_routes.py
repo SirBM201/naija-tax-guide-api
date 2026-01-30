@@ -62,6 +62,10 @@ def _call_ask(provider_user_id: str, question: str) -> str:
         log.exception("Internal /ask call failed")
         return "Sorry — something went wrong. Please try again."
 
+@bp.get("/whatsapp/ping")
+def whatsapp_ping():
+    return jsonify(ok=True, service="whatsapp"), 200
+
 
 @bp.get("/whatsapp/webhook")
 def whatsapp_verify():
