@@ -17,7 +17,7 @@ def create_app():
     from app.routes.whatsapp_routes import bp as whatsapp_bp
     from app.routes.paystack_routes import bp as paystack_bp
     from app.routes.subscription_routes import bp as subscription_bp  # NEW
-
+    
     app.register_blueprint(health_bp)
     app.register_blueprint(ask_bp)
     app.register_blueprint(telegram_bp)
