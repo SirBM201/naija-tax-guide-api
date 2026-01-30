@@ -4,13 +4,13 @@ import hmac
 import hashlib
 import logging
 from uuid import uuid4
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 
 import requests
 from flask import Blueprint, request, jsonify
+from supabase import create_client
 
-from app.db.supabase import supabase
 from app.core.timeutils import now_utc, iso
 
 log = logging.getLogger(__name__)
@@ -21,10 +21,19 @@ PAYSTACK_WEBHOOK_SECRET = os.getenv("PAYSTACK_WEBHOOK_SECRET", PAYSTACK_SECRET_K
 PAYSTACK_CALLBACK_URL = os.getenv("PAYSTACK_CALLBACK_URL", "").strip()
 PAYSTACK_BASE = "https://api.paystack.co"
 
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
 
-# -----------------------------
-# Helpers
-# -----------------------------
+_client = None
+def supabase():
+    global _client
+    if _client is None:
+        if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+            raise RuntimeError("SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY not set")
+        _client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+    return _client
+
+
 def parse_iso(s: str) -> Optional[datetime]:
     try:
         return datetime.fromisoformat(s)
@@ -33,14 +42,6 @@ def parse_iso(s: str) -> Optional[datetime]:
 
 
 def get_plan_from_db(plan: str) -> Dict[str, Any]:
-    """
-    plans table expected columns:
-      - plan (text) e.g. monthly|quarterly|yearly
-      - title (text)
-      - amount_kobo (int)  (already kobo)
-      - currency (text) default NGN
-      - duration_days (int) optional
-    """
     res = (
         supabase()
         .table("plans")
@@ -55,11 +56,9 @@ def get_plan_from_db(plan: str) -> Dict[str, Any]:
     row = res.data
     if row.get("amount_kobo") is None:
         raise ValueError(f"Plan has no amount_kobo: {plan}")
-
     if not row.get("currency"):
         row["currency"] = "NGN"
 
-    # Reasonable defaults if duration_days not set
     dur = row.get("duration_days")
     if dur is None:
         if plan == "monthly":
@@ -77,7 +76,6 @@ def get_plan_from_db(plan: str) -> Dict[str, Any]:
 
 
 def resolve_or_create_account(provider: str, provider_user_id: str) -> str:
-    """Returns acct_key like 'acct:<uuid>'."""
     res = (
         supabase()
         .table("accounts")
@@ -106,11 +104,6 @@ def resolve_or_create_account(provider: str, provider_user_id: str) -> str:
 
 
 def activate_or_extend_subscription(acct_key: str, plan: str, duration_days: int) -> None:
-    """
-    Extend-safe:
-    - if existing expires_at is in the future, extend from expires_at
-    - else extend from now
-    """
     existing = None
     try:
         r = (
@@ -144,20 +137,8 @@ def activate_or_extend_subscription(acct_key: str, plan: str, duration_days: int
     supabase().table("user_subscriptions").upsert(payload, on_conflict="wa_phone").execute()
 
 
-# -----------------------------
-# PAYSTACK: Initialize
-# -----------------------------
 @bp.post("/paystack/initialize")
 def paystack_initialize():
-    """
-    Body:
-    {
-      "provider": "wa" | "tg" | "web",
-      "provider_user_id": "...",
-      "email": "user@email.com",
-      "plan": "monthly|quarterly|yearly"
-    }
-    """
     if not PAYSTACK_SECRET_KEY:
         return jsonify(ok=False, error="PAYSTACK_SECRET_KEY not set"), 500
 
@@ -176,27 +157,21 @@ def paystack_initialize():
     if plan not in ("monthly", "quarterly", "yearly"):
         return jsonify(ok=False, error="plan must be monthly|quarterly|yearly"), 400
 
-    try:
-        plan_row = get_plan_from_db(plan)
-    except ValueError as ve:
-        return jsonify(ok=False, error=str(ve)), 400
-
-    # Ensure account exists so webhook can resolve it later
+    plan_row = get_plan_from_db(plan)
     acct_key = resolve_or_create_account(provider, provider_user_id)
 
     reference = f"ntg_{uuid4().hex}"
 
     payload = {
         "email": email,
-        "amount": plan_row["amount_kobo"],  # already in kobo
+        "amount": plan_row["amount_kobo"],
         "currency": plan_row.get("currency", "NGN"),
         "reference": reference,
         "metadata": {
             "provider": provider,
             "provider_user_id": provider_user_id,
             "plan": plan,
-            "acct_key": acct_key,  # optional debug
-            "plan_title": plan_row.get("title") or plan.upper(),
+            "acct_key": acct_key,
         },
     }
     if PAYSTACK_CALLBACK_URL:
@@ -204,37 +179,23 @@ def paystack_initialize():
 
     resp = requests.post(
         f"{PAYSTACK_BASE}/transaction/initialize",
-        headers={
-            "Authorization": f"Bearer {PAYSTACK_SECRET_KEY}",
-            "Content-Type": "application/json",
-        },
+        headers={"Authorization": f"Bearer {PAYSTACK_SECRET_KEY}", "Content-Type": "application/json"},
         json=payload,
         timeout=30,
     )
 
     data = resp.json() if resp.content else {}
     if resp.status_code >= 400 or not data.get("status"):
-        return jsonify(
-            ok=False,
-            error="Paystack initialize failed",
-            paystack_status_code=resp.status_code,
-            paystack_response=data,
-        ), 400
+        return jsonify(ok=False, error="Paystack initialize failed", paystack_status_code=resp.status_code, paystack_response=data), 400
 
     return jsonify(
         ok=True,
         authorization_url=data["data"]["authorization_url"],
         access_code=data["data"]["access_code"],
         reference=data["data"]["reference"],
-        plan=plan,
-        amount_kobo=plan_row["amount_kobo"],
-        currency=plan_row.get("currency", "NGN"),
     ), 200
 
 
-# -----------------------------
-# PAYSTACK: Webhook
-# -----------------------------
 @bp.post("/paystack/webhook")
 def paystack_webhook():
     raw = request.get_data() or b""
@@ -248,37 +209,26 @@ def paystack_webhook():
         return "invalid signature", 401
 
     event = request.get_json(silent=True) or {}
-    event_type = event.get("event")
+    if event.get("event") != "charge.success":
+        return "ok", 200
+
     data = event.get("data") or {}
-
-    if event_type != "charge.success":
+    status = (data.get("status") or "").lower()
+    if status != "success":
         return "ok", 200
 
-    try:
-        status = (data.get("status") or "").lower()
-        if status != "success":
-            return "ok", 200
+    metadata = data.get("metadata") or {}
+    provider = (metadata.get("provider") or "").strip()
+    provider_user_id = (metadata.get("provider_user_id") or "").strip()
+    plan = (metadata.get("plan") or "").strip().lower()
 
-        metadata = data.get("metadata") or {}
-        provider = (metadata.get("provider") or "").strip()
-        provider_user_id = (metadata.get("provider_user_id") or "").strip()
-        plan = (metadata.get("plan") or "").strip().lower()
-
-        if provider not in ("wa", "tg", "web") or not provider_user_id or plan not in ("monthly", "quarterly", "yearly"):
-            log.warning("Webhook missing/invalid metadata. ref=%s meta=%s", data.get("reference"), metadata)
-            return "ok", 200
-
-        plan_row = get_plan_from_db(plan)
-        duration_days = int(plan_row["duration_days"])
-
-        # Do NOT trust acct_key from metadata; resolve from provider identity
-        acct_key = resolve_or_create_account(provider, provider_user_id)
-
-        activate_or_extend_subscription(acct_key=acct_key, plan=plan, duration_days=duration_days)
-
-        log.info("Subscription activated/extended acct_key=%s plan=%s", acct_key, plan)
+    if provider not in ("wa", "tg", "web") or not provider_user_id or plan not in ("monthly", "quarterly", "yearly"):
+        log.warning("Webhook missing/invalid metadata. ref=%s meta=%s", data.get("reference"), metadata)
         return "ok", 200
 
-    except Exception as e:
-        log.exception("Webhook processing error: %s", e)
-        return "ok", 200
+    plan_row = get_plan_from_db(plan)
+    acct_key = resolve_or_create_account(provider, provider_user_id)
+    activate_or_extend_subscription(acct_key, plan, int(plan_row["duration_days"]))
+
+    log.info("Subscription activated/extended acct_key=%s plan=%s", acct_key, plan)
+    return "ok", 200
