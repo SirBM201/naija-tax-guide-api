@@ -4,14 +4,12 @@ import hmac
 import hashlib
 import logging
 from uuid import uuid4
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, Optional
 
 import requests
 from flask import Blueprint, request, jsonify
 from supabase import create_client
-
-from app.core.timeutils import now_utc, iso
 
 log = logging.getLogger(__name__)
 bp = Blueprint("paystack", __name__)
@@ -33,6 +31,12 @@ def supabase():
         _client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
     return _client
 
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+def iso(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat()
 
 def parse_iso(s: str) -> Optional[datetime]:
     try:
