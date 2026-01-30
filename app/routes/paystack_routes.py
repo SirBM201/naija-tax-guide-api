@@ -1,6 +1,13 @@
+# app/routes/paystack_routes.py
 from flask import Blueprint, request, jsonify
-import hmac, hashlib, os, logging, requests
+import hmac
+import hashlib
+import os
+import logging
 from datetime import timedelta
+
+import requests
+
 from app.core.timeutils import now_utc, iso
 from app.db.supabase import supabase
 
@@ -9,6 +16,7 @@ bp = Blueprint("paystack", __name__)
 PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY", "").strip()
 PAYSTACK_BASE = "https://api.paystack.co"
 PAYSTACK_CALLBACK_URL = os.getenv("PAYSTACK_CALLBACK_URL", "").strip()
+
 
 # ---- Plan mapping (adjust amounts to your final pricing) ----
 def plan_to_amount_kobo(plan: str) -> int:
@@ -20,6 +28,7 @@ def plan_to_amount_kobo(plan: str) -> int:
     if p == "yearly":
         return 30000 * 100
     raise ValueError("Invalid plan")
+
 
 def plan_to_duration_days(plan: str) -> int:
     p = (plan or "").strip().lower()
@@ -61,7 +70,7 @@ def paystack_initialize():
     if not email:
         return jsonify(ok=False, error="email required"), 400
 
-    # IMPORTANT: ensure account exists so webhook can resolve it later
+    # Ensure account exists so webhook can resolve it later
     res = (
         supabase()
         .table("accounts")
@@ -71,6 +80,7 @@ def paystack_initialize():
         .limit(1)
         .execute()
     )
+
     if res.data:
         acct_id = res.data[0]["id"]
     else:
@@ -87,7 +97,11 @@ def paystack_initialize():
         acct_id = ins.data[0]["id"]
 
     acct_key = f"acct:{acct_id}"
-    amount_kobo = plan_to_amount_kobo(plan)
+
+    try:
+        amount_kobo = plan_to_amount_kobo(plan)
+    except ValueError as e:
+        return jsonify(ok=False, error=str(e)), 400
 
     headers = {
         "Authorization": f"Bearer {PAYSTACK_SECRET_KEY}",
@@ -98,23 +112,33 @@ def paystack_initialize():
         "email": email,
         "amount": amount_kobo,
         "currency": "NGN",
-        "callback_url": PAYSTACK_CALLBACK_URL,
-        # CRITICAL: identity metadata (acct_key is backend derived; ok to include too, but not required)
+        "callback_url": PAYSTACK_CALLBACK_URL or None,
         "metadata": {
             "provider": provider,
             "provider_user_id": provider_user_id,
             "plan": plan,
-            "acct_key": acct_key,  # optional but helpful for debugging
+            "acct_key": acct_key,  # optional, helpful for debugging
         },
     }
 
-    r = requests.post(f"{PAYSTACK_BASE}/transaction/initialize", headers=headers, json=payload, timeout=30)
+    # Remove callback_url if empty/None (Paystack accepts missing field)
+    if not payload.get("callback_url"):
+        payload.pop("callback_url", None)
+
+    r = requests.post(
+        f"{PAYSTACK_BASE}/transaction/initialize",
+        headers=headers,
+        json=payload,
+        timeout=30
+    )
+
     if not r.ok:
-        logging.error(f"Paystack init failed: {r.status_code} {r.text}")
+        logging.error("Paystack init failed: %s %s", r.status_code, r.text)
         return jsonify(ok=False, error="paystack init failed", details=r.text), 400
 
     resj = r.json()
     dataj = resj.get("data") or {}
+
     return jsonify(
         ok=True,
         authorization_url=dataj.get("authorization_url"),
@@ -140,18 +164,22 @@ def paystack_webhook():
     if not hmac.compare_digest(expected, sig):
         return "invalid signature", 401
 
-    event = request.json or {}
+    event = request.get_json(silent=True) or {}
     event_type = event.get("event")
 
+    # We only activate on success
     if event_type != "charge.success":
         return jsonify(ok=True)
 
-    data = event.get("data", {})
+    data = event.get("data", {}) or {}
     metadata = data.get("metadata", {}) or {}
 
-    provider = metadata.get("provider")
-    provider_user_id = metadata.get("provider_user_id")
-    plan = (metadata.get("plan") or "monthly").lower()
+    provider = (metadata.get("provider") or "").strip()
+    provider_user_id = (metadata.get("provider_user_id") or "").strip()
+    plan = (metadata.get("plan") or "monthly").strip().lower()
+
+    if plan not in ("monthly", "quarterly", "yearly"):
+        plan = "monthly"
 
     if not provider or not provider_user_id:
         logging.error("Paystack webhook missing identity metadata")
@@ -167,14 +195,14 @@ def paystack_webhook():
         .limit(1)
         .execute()
     )
+
     if not res.data:
-        logging.error("No account found for Paystack metadata")
+        logging.error("No account found for Paystack metadata provider=%s provider_user_id=%s", provider, provider_user_id)
         return jsonify(ok=False, error="account not found"), 404
 
     acct_id = res.data[0]["id"]
     acct_key = f"acct:{acct_id}"
 
-    # Activate subscription (duration from plan)
     expires_at = iso(now_utc() + timedelta(days=plan_to_duration_days(plan)))
 
     supabase().table("user_subscriptions").upsert({
@@ -185,5 +213,5 @@ def paystack_webhook():
         "updated_at": iso(now_utc())
     }, on_conflict="wa_phone").execute()
 
-    logging.info(f"Subscription activated for {acct_key} plan={plan}")
+    logging.info("Subscription activated for %s plan=%s", acct_key, plan)
     return jsonify(ok=True)
