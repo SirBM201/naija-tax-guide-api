@@ -12,18 +12,20 @@ def create_app():
     register_error_handlers(app)
 
     from app.routes.health import bp as health_bp
-    from app.routes.ask import bp as ask_bp
+    from app.routes.ask_routes import bp as ask_bp
     from app.routes.telegram_routes import bp as telegram_bp
     from app.routes.whatsapp_routes import bp as whatsapp_bp
     from app.routes.paystack_routes import bp as paystack_bp
-    from app.routes.subscription_routes import bp as subscription_bp  # NEW
-    
+    from app.routes.subscription_routes import bp as subscription_bp
+    from app.routes.admin_routes import bp as admin_bp
+
     app.register_blueprint(health_bp)
     app.register_blueprint(ask_bp)
     app.register_blueprint(telegram_bp)
     app.register_blueprint(whatsapp_bp)
     app.register_blueprint(paystack_bp)
-    app.register_blueprint(subscription_bp)  # NEW
+    app.register_blueprint(subscription_bp)
+    app.register_blueprint(admin_bp)
 
     @app.get("/")
     def root():
