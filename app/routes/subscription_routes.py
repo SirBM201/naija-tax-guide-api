@@ -4,9 +4,10 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from flask import Blueprint, request, jsonify
-from app.db.supabase_client import supabase  # function: supabase().table(...)
+from app.core.supabase_client import supabase  # ✅ keep consistent everywhere
 
 bp = Blueprint("subscription", __name__)
+log = logging.getLogger(__name__)
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
@@ -27,19 +28,24 @@ def _acct_key(acct_id: str) -> str:
 
 def _resolve_acct_id(provider: str, provider_user_id: str) -> str:
     """
-    Accounts table only (no Supabase Auth).
+    Accounts table only.
     Unique key: (provider, provider_user_id)
+    Expected PK column: id
     """
     provider = _normalize_provider(provider)
     provider_user_id = (provider_user_id or "").strip()
     if not provider_user_id:
         raise ValueError("provider_user_id is required")
 
+    # Normalize only web ids to digits
+    if provider == "web":
+        provider_user_id = _digits(provider_user_id)
+
     # 1) lookup
     r = (
         supabase()
         .table("accounts")
-        .select("acct_id")
+        .select("id")
         .eq("provider", provider)
         .eq("provider_user_id", provider_user_id)
         .limit(1)
@@ -47,7 +53,7 @@ def _resolve_acct_id(provider: str, provider_user_id: str) -> str:
     )
     rows = getattr(r, "data", None) or []
     if rows:
-        return str(rows[0]["acct_id"])
+        return str(rows[0]["id"])
 
     # 2) create
     ins = (
@@ -57,21 +63,20 @@ def _resolve_acct_id(provider: str, provider_user_id: str) -> str:
             {
                 "provider": provider,
                 "provider_user_id": provider_user_id,
-                "status": "active",
-                "updated_at": _now_utc().isoformat(),
+                "phone_e164": None,
             }
         )
         .execute()
     )
     created = getattr(ins, "data", None) or []
-    if created and created[0].get("acct_id"):
-        return str(created[0]["acct_id"])
+    if created and created[0].get("id"):
+        return str(created[0]["id"])
 
     # 3) retry read (race-safe)
     r2 = (
         supabase()
         .table("accounts")
-        .select("acct_id")
+        .select("id")
         .eq("provider", provider)
         .eq("provider_user_id", provider_user_id)
         .limit(1)
@@ -79,25 +84,21 @@ def _resolve_acct_id(provider: str, provider_user_id: str) -> str:
     )
     rows2 = getattr(r2, "data", None) or []
     if rows2:
-        return str(rows2[0]["acct_id"])
+        return str(rows2[0]["id"])
 
-    raise RuntimeError("Failed to resolve acct_id")
+    raise RuntimeError("Failed to resolve account id")
 
 def _get_subscription_by_acct_key(acct_key: str) -> Optional[Dict[str, Any]]:
-    try:
-        r = (
-            supabase()
-            .table("user_subscriptions")
-            .select("*")
-            .eq("wa_phone", acct_key)
-            .limit(1)
-            .execute()
-        )
-        rows = getattr(r, "data", None) or []
-        return rows[0] if rows else None
-    except Exception as e:
-        logging.exception("subscription lookup failed: %s", e)
-        return None
+    r = (
+        supabase()
+        .table("user_subscriptions")
+        .select("wa_phone,plan,status,expires_at,paystack_reference,updated_at")
+        .eq("wa_phone", acct_key)
+        .limit(1)
+        .execute()
+    )
+    rows = getattr(r, "data", None) or []
+    return rows[0] if rows else None
 
 def _status_from_row(row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if not row:
@@ -105,18 +106,12 @@ def _status_from_row(row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 
     plan = row.get("plan")
     expires_at = row.get("expires_at")
-    reference = row.get("paystack_reference") or row.get("reference")
+    reference = row.get("paystack_reference")
 
-    # active vs expired
     status = (row.get("status") or "").strip().lower()
+    # Only treat active/paid as active candidates
     if status not in ("active", "paid"):
-        # if pending, show none/expired based on expires
-        return {
-            "status": "none",
-            "plan": plan,
-            "expires_at": expires_at,
-            "reference": reference,
-        }
+        return {"status": "none", "plan": plan, "expires_at": expires_at, "reference": reference}
 
     if not expires_at:
         return {"status": "expired", "plan": plan, "expires_at": None, "reference": reference}
@@ -132,11 +127,11 @@ def _status_from_row(row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 @bp.post("/subscription/status")
 def subscription_status():
     """
-    NEW:
+    Body (new):
       { "provider": "web|wa|tg", "provider_user_id": "..." }
 
-    OLD fallback:
-      { "wa_phone": "234..." } -> treated as web identity digits
+    Body (legacy fallback):
+      { "wa_phone": "234..." } => treated as web digits
     """
     body = request.get_json(silent=True) or {}
 
@@ -144,14 +139,13 @@ def subscription_status():
     provider_user_id = (body.get("provider_user_id") or "").strip()
 
     if not provider_user_id:
-        # backward compat
         wa_phone = _digits(body.get("wa_phone") or body.get("phone") or body.get("user_key") or "")
         if wa_phone:
             provider = "web"
             provider_user_id = wa_phone
 
     if not provider_user_id:
-        return jsonify({"ok": False, "message": "provider + provider_user_id (or wa_phone) is required"}), 400
+        return jsonify(ok=False, message="provider + provider_user_id (or wa_phone) is required"), 400
 
     try:
         acct_id = _resolve_acct_id(provider or "web", provider_user_id)
@@ -161,16 +155,15 @@ def subscription_status():
         out = _status_from_row(row)
 
         return jsonify(
-            {
-                "ok": True,
-                "status": out["status"],
-                "plan": out["plan"],
-                "expires_at": out["expires_at"],
-                "reference": out["reference"],
-                "acct_id": acct_id,
-                "acct_key": acct_key,
-            }
+            ok=True,
+            status=out["status"],
+            plan=out["plan"],
+            expires_at=out["expires_at"],
+            reference=out["reference"],
+            acct_id=acct_id,
+            acct_key=acct_key,
         ), 200
+
     except Exception as e:
-        logging.exception("subscription/status failed: %s", e)
-        return jsonify({"ok": False, "message": "Unable to check status"}), 500
+        log.exception("subscription/status failed: %s", e)
+        return jsonify(ok=False, message="Unable to check status"), 500
