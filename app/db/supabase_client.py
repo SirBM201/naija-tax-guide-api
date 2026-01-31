@@ -7,7 +7,6 @@ SUPABASE_SERVICE_ROLE_KEY = (os.getenv("SUPABASE_SERVICE_ROLE_KEY") or "").strip
 
 _client = None
 
-
 def supabase():
     """
     Singleton Supabase client factory.
