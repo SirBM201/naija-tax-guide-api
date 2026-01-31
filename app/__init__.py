@@ -1,3 +1,4 @@
+# app/__init__.py
 from flask import Flask, jsonify
 from flask_cors import CORS
 
@@ -11,12 +12,12 @@ def create_app():
     register_error_handlers(app)
 
     from app.routes.health import bp as health_bp
-    from app.routes.ask_routes import bp as ask_bp
     from app.routes.telegram_routes import bp as telegram_bp
     from app.routes.whatsapp_routes import bp as whatsapp_bp
     from app.routes.paystack_routes import bp as paystack_bp
     from app.routes.subscription_routes import bp as subscription_bp
     from app.routes.admin_routes import bp as admin_bp
+    from app.routes.ask_routes import bp as ask_bp   # ✅ only this one
 
     app.register_blueprint(health_bp)
     app.register_blueprint(ask_bp)
