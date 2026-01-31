@@ -5,28 +5,49 @@ from flask_cors import CORS
 from app.core.utils import init_logging, register_error_handlers
 from app.core.config import allowed_origins
 
+
 def create_app():
     init_logging()
+
     app = Flask(__name__)
+
+    # CORS (origins list comes from app.core.config.allowed_origins)
     CORS(app, resources={r"/*": {"origins": allowed_origins}})
+
+    # Centralized error handlers (keeps responses consistent)
     register_error_handlers(app)
 
+    # -----------------------------
+    # Blueprints (IMPORT INSIDE to avoid boot-time circular imports)
+    # -----------------------------
     from app.routes.health import bp as health_bp
+    from app.routes.ask_routes import bp as ask_bp  # ✅ only ask blueprint
+
     from app.routes.telegram_routes import bp as telegram_bp
     from app.routes.whatsapp_routes import bp as whatsapp_bp
+
     from app.routes.paystack_routes import bp as paystack_bp
     from app.routes.subscription_routes import bp as subscription_bp
-    from app.routes.admin_routes import bp as admin_bp
-    from app.routes.ask_routes import bp as ask_bp   # ✅ only this one
 
+    from app.routes.admin_routes import bp as admin_bp
+
+    # -----------------------------
+    # Register blueprints
+    # -----------------------------
     app.register_blueprint(health_bp)
     app.register_blueprint(ask_bp)
+
     app.register_blueprint(telegram_bp)
     app.register_blueprint(whatsapp_bp)
+
     app.register_blueprint(paystack_bp)
     app.register_blueprint(subscription_bp)
+
     app.register_blueprint(admin_bp)
 
+    # -----------------------------
+    # Root
+    # -----------------------------
     @app.get("/")
     def root():
         return jsonify(ok=True, service="naija-tax-guide-api")
