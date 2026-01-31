@@ -9,10 +9,9 @@ from typing import Any, Dict, Optional
 import requests
 from flask import Blueprint, request, jsonify
 
-from app.core.supabase_client import supabase  # must be a FUNCTION that returns a client
+from app.core.supabase_client import supabase  # MUST be a function returning supabase client
 
 log = logging.getLogger(__name__)
-
 bp = Blueprint("paystack", __name__)
 
 PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY", "").strip()
@@ -44,54 +43,77 @@ def normalize_digits(s: str) -> str:
     return "".join(ch for ch in (s or "") if ch.isdigit())
 
 
-def safe_email_from_phone(phone_digits: str) -> str:
-    # Paystack requires email. If user didn't supply one, generate placeholder.
-    digits = normalize_digits(phone_digits) or "0000000000"
-    return f"user_{digits}@naija-tax-guide.local"
+def normalize_provider(p: str) -> str:
+    v = (p or "").strip().lower()
+    if v in ("wa", "whatsapp"):
+        return "wa"
+    if v in ("tg", "telegram"):
+        return "tg"
+    return "web"
+
+
+def safe_email_from_identity(provider: str, provider_user_id: str) -> str:
+    """
+    Paystack requires email.
+    If user didn't supply, generate a safe placeholder that is stable per identity.
+    """
+    base = provider_user_id.strip()
+    if provider in ("wa", "web"):
+        base = normalize_digits(base) or "0000000000"
+    else:
+        base = base or "000000"
+    return f"user_{provider}_{base}@naija-tax-guide.local"
 
 
 def get_plan_from_db(plan: str) -> Dict[str, Any]:
     """
-    Reads public.plans:
-    - plan (text) e.g. monthly/quarterly/yearly
-    - amount_kobo (int)
-    - currency (text) default NGN
-    - duration_days (int) optional (fallback if missing)
+    Reads public.plans.
+    Your DB currently has title NOT NULL, so we select it too.
+
+    Expected columns (based on your screenshots):
+      - plan (text pk)
+      - title (text not null)
+      - amount_kobo (int not null)
+      - currency (text not null default 'NGN')
+      - duration_days (int not null)  (some earlier drafts called it duration_days)
     """
     p = (plan or "").strip().lower()
+    if p not in ("monthly", "quarterly", "yearly"):
+        raise ValueError("invalid plan")
 
     res = (
         supabase()
         .table("plans")
-        .select("plan,amount_kobo,currency,duration_days")
+        .select("plan,title,amount_kobo,currency,duration_days,duration_days")
         .eq("plan", p)
         .limit(1)
         .execute()
     )
-    if not res.data:
+
+    if not getattr(res, "data", None):
         raise ValueError(f"Plan not found in DB: {p}")
 
-    row = res.data[0]
+    row = res.data[0] or {}
     amount_kobo = row.get("amount_kobo")
     if amount_kobo is None:
         raise ValueError(f"Plan '{p}' has no amount_kobo")
 
     currency = row.get("currency") or "NGN"
 
+    # support both duration_days and duration_days (just in case)
     duration_days = row.get("duration_days")
     if duration_days is None:
-        # fallback if duration_days missing
-        if p == "monthly":
-            duration_days = 30
-        elif p == "quarterly":
-            duration_days = 90
-        elif p == "yearly":
-            duration_days = 365
-        else:
-            duration_days = 30
+        duration_days = row.get("duration_days")
+
+    if duration_days is None:
+        # fallback safety
+        duration_days = 30 if p == "monthly" else 90 if p == "quarterly" else 365
+
+    title = row.get("title") or p.title()
 
     return {
         "plan": p,
+        "title": title,
         "amount_kobo": int(amount_kobo),
         "currency": currency,
         "duration_days": int(duration_days),
@@ -101,7 +123,21 @@ def get_plan_from_db(plan: str) -> Dict[str, Any]:
 def ensure_account(provider: str, provider_user_id: str) -> str:
     """
     Ensure accounts row exists and return acct_key = acct:<uuid>
+    accounts schema you showed:
+      id uuid pk
+      provider text
+      provider_user_id text
+      created_at timestamptz (likely default now())
     """
+    provider = normalize_provider(provider)
+    provider_user_id = (provider_user_id or "").strip()
+    if not provider_user_id:
+        raise ValueError("provider_user_id required")
+
+    # normalize digits for web/wa identities
+    if provider in ("wa", "web"):
+        provider_user_id = normalize_digits(provider_user_id)
+
     r = (
         supabase()
         .table("accounts")
@@ -111,7 +147,8 @@ def ensure_account(provider: str, provider_user_id: str) -> str:
         .limit(1)
         .execute()
     )
-    if r.data:
+
+    if getattr(r, "data", None):
         acct_id = r.data[0]["id"]
         return f"acct:{acct_id}"
 
@@ -127,6 +164,22 @@ def ensure_account(provider: str, provider_user_id: str) -> str:
         )
         .execute()
     )
+
+    if not getattr(ins, "data", None):
+        # race-safe fallback: re-read
+        r2 = (
+            supabase()
+            .table("accounts")
+            .select("id")
+            .eq("provider", provider)
+            .eq("provider_user_id", provider_user_id)
+            .limit(1)
+            .execute()
+        )
+        if getattr(r2, "data", None):
+            return f"acct:{r2.data[0]['id']}"
+        raise RuntimeError("Failed to create account")
+
     acct_id = ins.data[0]["id"]
     return f"acct:{acct_id}"
 
@@ -135,23 +188,38 @@ def activate_or_extend_subscription(acct_key: str, plan: str, duration_days: int
     """
     Upsert into user_subscriptions using acct_key in wa_phone column.
     Extend from current expiry if still active.
+
+    user_subscriptions schema you showed:
+      wa_phone text primary key  (stores acct:<uuid>)
+      plan text
+      status text
+      expires_at timestamptz
+      paystack_reference text
+      updated_at timestamptz
     """
     base_time = now_utc()
 
     existing = (
         supabase()
         .table("user_subscriptions")
-        .select("expires_at,status")
+        .select("expires_at,status,paystack_reference")
         .eq("wa_phone", acct_key)
         .limit(1)
         .execute()
     )
 
-    if existing.data:
-        exp_raw = existing.data[0].get("expires_at")
+    if getattr(existing, "data", None):
+        row = existing.data[0] or {}
+
+        # idempotency: if same reference already applied, do nothing
+        if reference and row.get("paystack_reference") == reference:
+            log.info("Subscription already activated for %s ref=%s (idempotent)", acct_key, reference)
+            return
+
+        exp_raw = row.get("expires_at")
         if exp_raw:
             try:
-                exp_dt = datetime.fromisoformat(exp_raw.replace("Z", "+00:00"))
+                exp_dt = datetime.fromisoformat(str(exp_raw).replace("Z", "+00:00"))
                 if exp_dt > base_time:
                     base_time = exp_dt
             except Exception:
@@ -169,11 +237,11 @@ def activate_or_extend_subscription(acct_key: str, plan: str, duration_days: int
 
     supabase().table("user_subscriptions").upsert(payload, on_conflict="wa_phone").execute()
 
-    # Optional column
     if reference:
+        # store paystack_reference if column exists
         try:
             supabase().table("user_subscriptions").update(
-                {"paystack_reference": reference}
+                {"paystack_reference": reference, "updated_at": iso(now_utc())}
             ).eq("wa_phone", acct_key).execute()
         except Exception:
             pass
@@ -189,7 +257,6 @@ def paystack_initialize():
 
     A) Frontend simple body:
       { "wa_phone": "2348012345678", "plan": "monthly", "email": "x@y.com" }
-
       -> provider defaults to "wa"
       -> provider_user_id = wa_phone
 
@@ -201,17 +268,14 @@ def paystack_initialize():
 
     body = request.get_json(silent=True) or {}
 
-    # ---- Accept BOTH formats ----
     wa_phone = (body.get("wa_phone") or "").strip()
     plan = (body.get("plan") or "").strip().lower()
     email = (body.get("email") or "").strip()
 
-    provider = (body.get("provider") or "").strip()
+    provider = normalize_provider(body.get("provider") or ("wa" if wa_phone else "web"))
     provider_user_id = (body.get("provider_user_id") or "").strip()
 
     if wa_phone and not provider_user_id:
-        # Frontend format: treat wa_phone as identity
-        provider = provider or "wa"
         provider_user_id = normalize_digits(wa_phone)
 
     # validate
@@ -222,9 +286,9 @@ def paystack_initialize():
     if plan not in ("monthly", "quarterly", "yearly"):
         return jsonify(ok=False, error="plan must be monthly|quarterly|yearly"), 400
 
-    # email optional: if missing, generate placeholder
+    # email optional: if missing, generate placeholder (stable per identity)
     if not email:
-        email = safe_email_from_phone(provider_user_id)
+        email = safe_email_from_identity(provider, provider_user_id)
 
     try:
         acct_key = ensure_account(provider, provider_user_id)
@@ -259,7 +323,7 @@ def paystack_initialize():
         )
 
         if not r.ok:
-            log.error("Paystack init failed: %s %s", r.status_code, r.text)
+            log.error("Paystack init failed: %s %s", r.status_code, r.text[:500])
             return jsonify(ok=False, error="paystack init failed", details=r.text), 400
 
         resj = r.json()
@@ -269,6 +333,9 @@ def paystack_initialize():
             ok=True,
             authorization_url=dataj.get("authorization_url"),
             reference=dataj.get("reference"),
+            plan=plan_row["plan"],
+            label=plan_row.get("title") or plan_row["plan"],
+            amount_kobo=plan_row["amount_kobo"],
             acct_key=acct_key,
         ), 200
 
@@ -277,7 +344,7 @@ def paystack_initialize():
         return jsonify(ok=False, error="server_error", details=str(e)), 500
 
 
-# ✅ NEW: alias to stop old frontend paths from breaking
+# ✅ Alias to stop old frontend paths from breaking
 @bp.post("/paystack/subscription/initialize")
 def paystack_subscription_initialize_alias():
     return paystack_initialize()
@@ -300,7 +367,7 @@ def paystack_webhook():
     event = request.get_json(silent=True) or {}
     event_type = event.get("event")
 
-    # handle successful charges
+    # Only handle successful charges
     if event_type != "charge.success":
         return jsonify(ok=True), 200
 
@@ -310,10 +377,13 @@ def paystack_webhook():
         return jsonify(ok=True), 200
 
     metadata = data.get("metadata", {}) or {}
-    provider = (metadata.get("provider") or "").strip()
+    provider = normalize_provider(metadata.get("provider") or "")
     provider_user_id = (metadata.get("provider_user_id") or "").strip()
     plan = (metadata.get("plan") or "").lower().strip()
     reference = (data.get("reference") or "").strip() or None
+
+    if provider in ("wa", "web"):
+        provider_user_id = normalize_digits(provider_user_id)
 
     if provider not in ("wa", "tg", "web") or not provider_user_id or plan not in ("monthly", "quarterly", "yearly"):
         log.warning(
@@ -335,10 +405,10 @@ def paystack_webhook():
             reference=reference,
         )
 
-        log.info("Subscription activated for %s plan=%s", acct_key, plan)
+        log.info("Subscription activated for %s plan=%s ref=%s", acct_key, plan, reference)
         return jsonify(ok=True), 200
 
     except Exception as e:
         log.exception("Webhook processing error: %s", e)
-        # Return 200 to avoid retries storm
+        # Return 200 to avoid Paystack retries storm
         return jsonify(ok=True), 200
