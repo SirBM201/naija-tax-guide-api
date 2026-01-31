@@ -34,10 +34,10 @@ _rl_bucket: Dict[str, Tuple[float, int]] = {}  # key -> (window_start_ts, count)
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
-def json_error(message: str, status: int = 400, **extra):
+def json_error(message: str, http_status: int = 400, **extra):
     payload = {"ok": False, "message": message}
     payload.update(extra)
-    return jsonify(payload), status
+    return jsonify(payload), http_status
 
 def json_ok(**data):
     payload = {"ok": True}
