@@ -8,10 +8,7 @@ from typing import Any, Dict, Optional, Tuple
 from flask import Blueprint, request, jsonify
 
 from app.core.supabase_client import supabase
-
-# ✅ IMPORTANT: point this import to wherever you stored your OpenAI HTTP function
-# Example: app/services/ai.py contains generate_answer(question, lang="en") -> Optional[str]
-from app.services.ai import generate_answer  # <-- adjust if your file path differs
+from app.services.ai import generate_answer  # adjust if your file path differs
 
 log = logging.getLogger(__name__)
 bp = Blueprint("ask", __name__)
@@ -34,6 +31,7 @@ _rl_bucket: Dict[str, Tuple[float, int]] = {}  # key -> (window_start_ts, count)
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
+# ✅ FIX: avoid "status" name clash with subscription status keyword
 def json_error(message: str, http_status: int = 400, **extra):
     payload = {"ok": False, "message": message}
     payload.update(extra)
@@ -45,7 +43,7 @@ def json_ok(**data):
     return jsonify(payload), 200
 
 def normalize_digits(s: str) -> str:
-    return "".join([c for c in (s or "") if c.isdigit()])
+    return "".join(c for c in (s or "") if c.isdigit())
 
 
 # -----------------------------
@@ -122,6 +120,10 @@ def ensure_account(provider: str, provider_user_id: str) -> str:
     if not provider_user_id:
         raise ValueError("provider_user_id required")
 
+    # normalize digits for web (consistent with your other routes)
+    if provider == "web":
+        provider_user_id = normalize_digits(provider_user_id)
+
     r = (
         supabase()
         .table("accounts")
@@ -148,9 +150,24 @@ def ensure_account(provider: str, provider_user_id: str) -> str:
         .execute()
     )
     created = getattr(ins, "data", None) or []
-    if not created or not created[0].get("id"):
-        raise RuntimeError("Failed to create account row")
-    return f"acct:{created[0]['id']}"
+    if created and created[0].get("id"):
+        return f"acct:{created[0]['id']}"
+
+    # race-safe fallback: re-read
+    r2 = (
+        supabase()
+        .table("accounts")
+        .select("id")
+        .eq("provider", provider)
+        .eq("provider_user_id", provider_user_id)
+        .limit(1)
+        .execute()
+    )
+    rows2 = getattr(r2, "data", None) or []
+    if rows2:
+        return f"acct:{rows2[0]['id']}"
+
+    raise RuntimeError("Failed to create account row")
 
 
 # -----------------------------
@@ -179,7 +196,7 @@ def get_subscription_status(acct_key: str) -> Tuple[str, Optional[str], Optional
         return "none", None, None
 
     row = rows[0]
-    status = (row.get("status") or "").strip().lower() or "none"
+    sub_status = (row.get("status") or "").strip().lower() or "none"
     plan = row.get("plan")
     expires_at = row.get("expires_at")
 
@@ -193,8 +210,8 @@ def get_subscription_status(acct_key: str) -> Tuple[str, Optional[str], Optional
             # malformed expires_at => block safer
             return "expired", plan, str(expires_at)
 
-    if status != "active":
-        return status, plan, str(expires_at) if expires_at else None
+    if sub_status != "active":
+        return sub_status, plan, str(expires_at) if expires_at else None
 
     return "active", plan, str(expires_at) if expires_at else None
 
@@ -226,7 +243,7 @@ def check_rate_limit(key: str) -> Optional[str]:
 # -----------------------------
 def run_ai_answer(question: str, lang: str) -> str:
     """
-    Uses your HTTP OpenAI function generate_answer().
+    Uses your OpenAI HTTP function generate_answer().
     If AI is not configured or fails, returns a safe fallback.
     """
     ans = generate_answer(question=question, lang=lang)
@@ -255,7 +272,7 @@ def ask():
         return json_error(
             "Identity required. Send provider + provider_user_id.",
             400,
-            example={"provider": "web", "provider_user_id": "2348012345678"}
+            example={"provider": "web", "provider_user_id": "2348012345678"},
         )
 
     try:
@@ -268,17 +285,16 @@ def ask():
     admin_ok = is_admin_request()
 
     # 3) Subscription guard
-    status, plan, expires_at = get_subscription_status(acct_key)
-    if not admin_ok:
-        if status != "active":
-            return json_error(
-                "Subscription required or expired.",
-                403,
-                status=status,
-                plan=plan,
-                expires_at=expires_at,
-                subscribe_url="/pricing",
-            )
+    sub_status, plan, expires_at = get_subscription_status(acct_key)
+    if not admin_ok and sub_status != "active":
+        return json_error(
+            "Subscription required or expired.",
+            403,
+            status=sub_status,  # subscription status (safe now)
+            plan=plan,
+            expires_at=expires_at,
+            subscribe_url="/pricing",
+        )
 
     # 4) Rate limit
     msg = check_rate_limit(rate_limit_key(acct_key))
@@ -289,7 +305,6 @@ def ask():
     try:
         answer = run_ai_answer(question=question, lang=lang)
 
-        # Keep response compatible with your frontend expectations
         return json_ok(
             answer=answer,
             audio_url=None,
