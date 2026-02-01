@@ -1,73 +1,75 @@
-# app/core/identity.py
-import logging
-from typing import Optional, Dict, Any
+from typing import Optional
+from app.db.supabase_client import supabase
 
-from app.db.supabase_client import sb
+def digits_only(s: str) -> str:
+    return "".join(ch for ch in (s or "").strip() if ch.isdigit())
 
+def normalize_provider(p: str) -> str:
+    v = (p or "").strip().lower()
+    if v in ("wa", "whatsapp"):
+        return "wa"
+    if v in ("tg", "telegram"):
+        return "tg"
+    return "web"
+
+def normalize_provider_user_id(provider: str, provider_user_id: str) -> str:
+    provider = normalize_provider(provider)
+    uid = (provider_user_id or "").strip()
+    if provider in ("wa", "web"):
+        uid = digits_only(uid)
+    return uid
 
 def acct_key(acct_id: str) -> str:
-    """
-    Store subscription identity as: 'acct:<uuid>'
-    """
     return f"acct:{acct_id}"
 
-
-def resolve_acct_id(provider: str, provider_user_id: str) -> str:
+def ensure_account(provider: str, provider_user_id: str) -> str:
     """
-    Finds or creates an account for (provider, provider_user_id).
-    Returns acct_id (uuid string).
+    Ensures row exists in accounts, returns acct_key = acct:<uuid>
+
+    accounts table expected:
+      - id (uuid)
+      - provider (text)
+      - provider_user_id (text)
     """
-    provider = (provider or "").strip().lower()
-    provider_user_id = (provider_user_id or "").strip()
+    provider = normalize_provider(provider)
+    uid = normalize_provider_user_id(provider, provider_user_id)
+    if not uid:
+        raise ValueError("provider_user_id required")
 
-    if provider not in ("wa", "tg", "web"):
-        raise ValueError("provider must be one of: wa, tg, web")
-    if not provider_user_id:
-        raise ValueError("provider_user_id is required")
-
-    client = sb()
-
-    # lookup
     r = (
-        client.table("accounts")
+        supabase()
+        .table("accounts")
         .select("id")
         .eq("provider", provider)
-        .eq("provider_user_id", provider_user_id)
+        .eq("provider_user_id", uid)
         .limit(1)
         .execute()
     )
     rows = getattr(r, "data", None) or []
     if rows:
-        return str(rows[0]["id"])
+        return acct_key(str(rows[0]["id"]))
 
-    # create
     ins = (
-        client.table("accounts")
-        .insert({"provider": provider, "provider_user_id": provider_user_id})
+        supabase()
+        .table("accounts")
+        .insert({"provider": provider, "provider_user_id": uid})
         .execute()
     )
     data = getattr(ins, "data", None) or []
     if not data:
-        raise RuntimeError("Failed to create account")
-    return str(data[0]["id"])
-
-
-def get_subscription_by_acct_key(acct_key_str: str) -> Optional[Dict[str, Any]]:
-    """
-    Reads subscription row from user_subscriptions using wa_phone = 'acct:<uuid>'.
-    (We keep column name wa_phone for now to avoid risky refactor.)
-    """
-    try:
-        client = sb()
-        r = (
-            client.table("user_subscriptions")
-            .select("*")
-            .eq("wa_phone", acct_key_str)
+        # race-safe fallback
+        r2 = (
+            supabase()
+            .table("accounts")
+            .select("id")
+            .eq("provider", provider)
+            .eq("provider_user_id", uid)
             .limit(1)
             .execute()
         )
-        rows = getattr(r, "data", None) or []
-        return rows[0] if rows else None
-    except Exception as e:
-        logging.exception("subscription lookup failed: %s", e)
-        return None
+        rows2 = getattr(r2, "data", None) or []
+        if rows2:
+            return acct_key(str(rows2[0]["id"]))
+        raise RuntimeError("Failed to create account")
+
+    return acct_key(str(data[0]["id"]))
