@@ -1,6 +1,7 @@
 # app/routes/ask_routes.py
 import os
 import time
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
@@ -8,7 +9,7 @@ from typing import Any, Dict, Optional, Tuple
 from flask import Blueprint, request, jsonify
 
 from app.core.supabase_client import supabase
-from app.services.ai import generate_answer  # adjust if your file path differs
+from app.services.ai import generate_answer  # your OpenAI HTTP wrapper
 
 log = logging.getLogger(__name__)
 bp = Blueprint("ask", __name__)
@@ -31,8 +32,10 @@ _rl_bucket: Dict[str, Tuple[float, int]] = {}  # key -> (window_start_ts, count)
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
-# ✅ FIX: avoid "status" name clash with subscription status keyword
 def json_error(message: str, http_status: int = 400, **extra):
+    """
+    IMPORTANT: param is http_status (NOT status) to avoid clashing with payload keys like status=...
+    """
     payload = {"ok": False, "message": message}
     payload.update(extra)
     return jsonify(payload), http_status
@@ -43,7 +46,28 @@ def json_ok(**data):
     return jsonify(payload), 200
 
 def normalize_digits(s: str) -> str:
-    return "".join(c for c in (s or "") if c.isdigit())
+    return "".join([c for c in (s or "") if c.isdigit()])
+
+def parse_body() -> dict:
+    """
+    Robust JSON parsing:
+    - Normal application/json
+    - If header is wrong but body is JSON, still parse
+    """
+    body = request.get_json(silent=True)
+    if isinstance(body, dict):
+        return body
+
+    raw = (request.data or b"").decode("utf-8", errors="ignore").strip()
+    if raw:
+        try:
+            j = json.loads(raw)
+            if isinstance(j, dict):
+                return j
+        except Exception:
+            pass
+
+    return {}
 
 
 # -----------------------------
@@ -105,12 +129,6 @@ def extract_identity(body: dict) -> Tuple[str, str]:
 def ensure_account(provider: str, provider_user_id: str) -> str:
     """
     Ensures accounts row exists and returns acct_key = acct:<uuid>.
-    accounts columns expected:
-      - id uuid primary key default gen_random_uuid()
-      - provider text
-      - provider_user_id text
-      - phone_e164 text null
-      - created_at timestamptz default now()
     """
     provider = (provider or "").strip().lower()
     provider_user_id = (provider_user_id or "").strip()
@@ -119,10 +137,6 @@ def ensure_account(provider: str, provider_user_id: str) -> str:
         raise ValueError("provider must be wa|tg|web")
     if not provider_user_id:
         raise ValueError("provider_user_id required")
-
-    # normalize digits for web (consistent with your other routes)
-    if provider == "web":
-        provider_user_id = normalize_digits(provider_user_id)
 
     r = (
         supabase()
@@ -150,38 +164,17 @@ def ensure_account(provider: str, provider_user_id: str) -> str:
         .execute()
     )
     created = getattr(ins, "data", None) or []
-    if created and created[0].get("id"):
-        return f"acct:{created[0]['id']}"
-
-    # race-safe fallback: re-read
-    r2 = (
-        supabase()
-        .table("accounts")
-        .select("id")
-        .eq("provider", provider)
-        .eq("provider_user_id", provider_user_id)
-        .limit(1)
-        .execute()
-    )
-    rows2 = getattr(r2, "data", None) or []
-    if rows2:
-        return f"acct:{rows2[0]['id']}"
-
-    raise RuntimeError("Failed to create account row")
+    if not created or not created[0].get("id"):
+        raise RuntimeError("Failed to create account row")
+    return f"acct:{created[0]['id']}"
 
 
 # -----------------------------
-# Subscription enforcement (airtight)
+# Subscription enforcement
 # -----------------------------
 def get_subscription_status(acct_key: str) -> Tuple[str, Optional[str], Optional[str]]:
     """
-    user_subscriptions expected columns:
-      - wa_phone text primary key   (stores acct:<uuid>)
-      - plan text
-      - status text  (active/expired/etc)
-      - expires_at timestamptz
-      - paystack_reference text null
-      - updated_at timestamptz
+    user_subscriptions stores acct_key in wa_phone (legacy name).
     """
     r = (
         supabase()
@@ -242,10 +235,6 @@ def check_rate_limit(key: str) -> Optional[str]:
 # AI pipeline wrapper
 # -----------------------------
 def run_ai_answer(question: str, lang: str) -> str:
-    """
-    Uses your OpenAI HTTP function generate_answer().
-    If AI is not configured or fails, returns a safe fallback.
-    """
     ans = generate_answer(question=question, lang=lang)
     if ans:
         return ans
@@ -257,29 +246,29 @@ def run_ai_answer(question: str, lang: str) -> str:
 # -----------------------------
 @bp.post("/ask")
 def ask():
-    body = request.get_json(silent=True) or {}
+    body = parse_body()
 
     question = (body.get("question") or body.get("q") or "").strip()
     mode = (body.get("mode") or "text").strip()
     lang = (body.get("lang") or "en").strip()
 
     if not question or len(question) < 2:
-        return json_error("Question is required.", 400)
+        return json_error("Question is required.", http_status=400)
 
     # 1) Identity
     provider, provider_user_id = extract_identity(body)
     if not provider or not provider_user_id:
         return json_error(
             "Identity required. Send provider + provider_user_id.",
-            400,
-            example={"provider": "web", "provider_user_id": "2348012345678"},
+            http_status=400,
+            example={"provider": "web", "provider_user_id": "2348012345678"}
         )
 
     try:
         acct_key = ensure_account(provider, provider_user_id)
     except Exception as e:
         log.exception("ensure_account failed")
-        return json_error("Unable to process identity.", 400, detail=str(e))
+        return json_error("Unable to process identity.", http_status=400, detail=str(e))
 
     # 2) Admin bypass?
     admin_ok = is_admin_request()
@@ -289,8 +278,8 @@ def ask():
     if not admin_ok and sub_status != "active":
         return json_error(
             "Subscription required or expired.",
-            403,
-            status=sub_status,  # subscription status (safe now)
+            http_status=403,
+            status=sub_status,     # payload key is safe now
             plan=plan,
             expires_at=expires_at,
             subscribe_url="/pricing",
@@ -299,12 +288,11 @@ def ask():
     # 4) Rate limit
     msg = check_rate_limit(rate_limit_key(acct_key))
     if msg:
-        return json_error(msg, 429)
+        return json_error(msg, http_status=429)
 
     # 5) AI
     try:
         answer = run_ai_answer(question=question, lang=lang)
-
         return json_ok(
             answer=answer,
             audio_url=None,
@@ -319,4 +307,4 @@ def ask():
         )
     except Exception as e:
         log.exception("AI ask failed")
-        return json_error("AI service error.", 500, detail=str(e))
+        return json_error("AI service error.", http_status=500, detail=str(e))
