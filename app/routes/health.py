@@ -1,4 +1,3 @@
-# app/routes/health.py
 from flask import Blueprint, current_app, jsonify
 
 bp = Blueprint("health", __name__)
@@ -15,7 +14,7 @@ def routes_list():
             continue
         items.append({
             "rule": str(rule),
-            "methods": sorted([m for m in rule.methods if m in ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")]),
+            "methods": sorted([m for m in rule.methods if m in ("GET","POST","PUT","PATCH","DELETE","OPTIONS")]),
             "endpoint": rule.endpoint,
         })
     return jsonify({"ok": True, "routes": items})
