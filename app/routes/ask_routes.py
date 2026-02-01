@@ -1,282 +1,75 @@
-# app/routes/ask_routes.py
 import os
-import time
 import logging
-from datetime import datetime, timezone
-from typing import Dict, Optional, Tuple
-
 from flask import Blueprint, request, jsonify
 
-from app.core.supabase_client import supabase
-from app.services.ai import generate_answer  # make sure this exists
+from app.core.utils import json_error
+from app.core.identity import ensure_account, normalize_provider
+from app.core.subscriptions import require_active_subscription
+from app.services.ai_pipeline import generate_answer
 
 log = logging.getLogger(__name__)
 bp = Blueprint("ask", __name__)
 
-# -----------------------------
-# ENV / SETTINGS
-# -----------------------------
 ADMIN_API_KEY = (os.getenv("ADMIN_API_KEY") or "").strip()
 
-ASK_RL_WINDOW_SEC = int(os.getenv("ASK_RL_WINDOW_SEC", "60"))
-ASK_RL_MAX_REQ_PER_WINDOW = int(os.getenv("ASK_RL_MAX_REQ_PER_WINDOW", "20"))
-
-# In-memory limiter (resets on restart)
-_rl_bucket: Dict[str, Tuple[float, int]] = {}  # key -> (window_start_ts, count)
-
-
-# -----------------------------
-# Helpers
-# -----------------------------
-def now_utc() -> datetime:
-    return datetime.now(timezone.utc)
-
-def json_error(message: str, http_status: int = 400, **extra):
-    """
-    IMPORTANT:
-      - http_status is the HTTP response code.
-      - extra fields become JSON fields.
-    This avoids collisions with JSON fields like 'status'.
-    """
-    payload = {"ok": False, "message": message}
-    payload.update(extra)
-    return jsonify(payload), http_status
-
-def json_ok(**data):
-    payload = {"ok": True}
-    payload.update(data)
-    return jsonify(payload), 200
-
-def normalize_digits(s: str) -> str:
-    return "".join([c for c in (s or "") if c.isdigit()])
-
-
-# -----------------------------
-# Admin bypass
-# -----------------------------
-def is_admin_request() -> bool:
-    """
-    Admin bypass allowed ONLY when ADMIN_API_KEY is set and matches:
-      - x-admin-key: <ADMIN_API_KEY>
-      - Authorization: Bearer <ADMIN_API_KEY>
-    """
-    if not ADMIN_API_KEY:
-        return False
-
-    x = (request.headers.get("x-admin-key") or "").strip()
-    if x and x == ADMIN_API_KEY:
-        return True
-
-    auth = (request.headers.get("Authorization") or "").strip()
-    if auth.lower().startswith("bearer "):
-        token = auth.split(" ", 1)[1].strip()
-        return token == ADMIN_API_KEY
-
-    return False
-
-
-# -----------------------------
-# Identity extraction
-# -----------------------------
-def extract_identity(body: dict) -> Tuple[str, str]:
-    """
-    Recommended:
-      { "provider": "wa|tg|web", "provider_user_id": "..." }
-
-    Backward compat:
-      { "wa_phone": "234..." } -> provider="wa"
-      { "user_key": "234..." } -> provider="wa"
-    """
-    provider = (body.get("provider") or "").strip().lower()
-    provider_user_id = (body.get("provider_user_id") or "").strip()
-
-    if provider and provider_user_id:
-        if provider == "web":
-            provider_user_id = normalize_digits(provider_user_id)
-        return provider, provider_user_id
-
-    wa_phone = (body.get("wa_phone") or "").strip()
-    user_key = (body.get("user_key") or "").strip()
-
-    if wa_phone:
-        return "wa", normalize_digits(wa_phone)
-    if user_key:
-        return "wa", normalize_digits(user_key)
-
-    return "", ""
-
-
-def ensure_account(provider: str, provider_user_id: str) -> str:
-    """
-    Ensures accounts row exists and returns acct_key = acct:<uuid>.
-    """
-    provider = (provider or "").strip().lower()
-    provider_user_id = (provider_user_id or "").strip()
-
-    if provider not in ("wa", "tg", "web"):
-        raise ValueError("provider must be wa|tg|web")
-    if not provider_user_id:
-        raise ValueError("provider_user_id required")
-
-    r = (
-        supabase()
-        .table("accounts")
-        .select("id")
-        .eq("provider", provider)
-        .eq("provider_user_id", provider_user_id)
-        .limit(1)
-        .execute()
-    )
-    rows = getattr(r, "data", None) or []
-    if rows:
-        return f"acct:{rows[0]['id']}"
-
-    ins = (
-        supabase()
-        .table("accounts")
-        .insert(
-            {"provider": provider, "provider_user_id": provider_user_id, "phone_e164": None}
-        )
-        .execute()
-    )
-    created = getattr(ins, "data", None) or []
-    if not created or not created[0].get("id"):
-        raise RuntimeError("Failed to create account row")
-
-    return f"acct:{created[0]['id']}"
-
-
-# -----------------------------
-# Subscription enforcement
-# -----------------------------
-def get_subscription_status(acct_key: str) -> Tuple[str, Optional[str], Optional[str]]:
-    """
-    Reads user_subscriptions by wa_phone=acct:<uuid>.
-    Returns: (sub_status, plan, expires_at_str)
-    """
-    r = (
-        supabase()
-        .table("user_subscriptions")
-        .select("status,plan,expires_at")
-        .eq("wa_phone", acct_key)
-        .limit(1)
-        .execute()
-    )
-    rows = getattr(r, "data", None) or []
-    if not rows:
-        return "none", None, None
-
-    row = rows[0]
-    sub_status = (row.get("status") or "").strip().lower() or "none"
-    plan = row.get("plan")
-    expires_at = row.get("expires_at")
-
-    # expiry wins even if status says active
-    if expires_at:
-        try:
-            exp_dt = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
-            if exp_dt <= now_utc():
-                return "expired", plan, str(expires_at)
-        except Exception:
-            return "expired", plan, str(expires_at)
-
-    if sub_status != "active":
-        return sub_status, plan, str(expires_at) if expires_at else None
-
-    return "active", plan, str(expires_at) if expires_at else None
-
-
-# -----------------------------
-# Rate limiting
-# -----------------------------
-def rate_limit_key(acct_key: str) -> str:
-    ip = (request.headers.get("x-forwarded-for") or request.remote_addr or "unknown").split(",")[0].strip()
-    return acct_key or f"ip:{ip}"
-
-def check_rate_limit(key: str) -> Optional[str]:
-    now = time.time()
-    win_start, count = _rl_bucket.get(key, (now, 0))
-
-    if now - win_start >= ASK_RL_WINDOW_SEC:
-        win_start, count = now, 0
-
-    count += 1
-    _rl_bucket[key] = (win_start, count)
-
-    if count > ASK_RL_MAX_REQ_PER_WINDOW:
-        return "Too many requests. Please wait and try again."
-    return None
-
-
-# -----------------------------
-# AI wrapper
-# -----------------------------
-def run_ai_answer(question: str, lang: str) -> str:
-    ans = generate_answer(question=question, lang=lang)
-    if ans:
-        return ans
-    return "Sorry, AI service is temporarily unavailable. Please try again shortly."
-
-
-# -----------------------------
-# POST /ask
-# -----------------------------
 @bp.post("/ask")
 def ask():
     body = request.get_json(silent=True) or {}
 
-    question = (body.get("question") or body.get("q") or "").strip()
-    mode = (body.get("mode") or "text").strip()
+    provider = normalize_provider(body.get("provider") or "web")
+    provider_user_id = (body.get("provider_user_id") or "").strip()
+    question = (body.get("question") or "").strip()
     lang = (body.get("lang") or "en").strip()
+    mode = (body.get("mode") or "text").strip()
 
-    if not question or len(question) < 2:
-        return json_error("Question is required.", 400)
+    if not provider_user_id:
+        return json_error("provider_user_id is required.", http_status=400)
+    if not question:
+        return json_error("Question is required.", http_status=400)
 
-    provider, provider_user_id = extract_identity(body)
-    if not provider or not provider_user_id:
-        return json_error(
-            "Identity required. Send provider + provider_user_id.",
-            400,
-            example={"provider": "web", "provider_user_id": "2348012345678"},
-        )
-
+    # identity -> acct:<uuid>
     try:
         acct_key = ensure_account(provider, provider_user_id)
     except Exception as e:
-        log.exception("ensure_account failed")
-        return json_error("Unable to process identity.", 400, detail=str(e))
+        log.exception("identity error")
+        return json_error("Identity error", http_status=400, details=str(e))
 
-    admin_ok = is_admin_request()
+    # admin bypass
+    is_admin = False
+    if ADMIN_API_KEY:
+        hdr = (request.headers.get("x-admin-key") or "").strip()
+        if hdr and hdr == ADMIN_API_KEY:
+            is_admin = True
 
-    sub_status, plan, expires_at = get_subscription_status(acct_key)
-    if not admin_ok and sub_status != "active":
-        return json_error(
-            "Subscription required or expired.",
-            403,
-            status=sub_status,          # JSON field ok
-            plan=plan,
-            expires_at=expires_at,
-            subscribe_url="/pricing",
-        )
+    sub = {"status": "unknown", "plan": None, "expires_at": None, "reference": None}
+    if not is_admin:
+        gate = require_active_subscription(acct_key)
+        sub = gate.get("sub") or sub
+        if not gate.get("ok"):
+            return jsonify({
+                "ok": False,
+                "message": gate.get("message") or "Subscription required or expired.",
+                "reason": gate.get("reason") or "subscription_required",
+                "subscribe_url": "/pricing",
+                "plan_expiry": sub.get("expires_at"),
+            }), 403
 
-    msg = check_rate_limit(rate_limit_key(acct_key))
-    if msg:
-        return json_error(msg, 429)
+    # AI response
+    answer = generate_answer(question=question, lang=lang)
+    if not answer:
+        # keep stable response format even if AI key missing
+        answer = "AI is temporarily unavailable. Please try again shortly."
 
-    try:
-        answer = run_ai_answer(question=question, lang=lang)
-        return json_ok(
-            answer=answer,
-            audio_url=None,
-            provider=provider,
-            provider_user_id=provider_user_id,
-            acct_key=acct_key,
-            plan=plan,
-            expires_at=expires_at,
-            admin=admin_ok,
-            mode=mode,
-            lang=lang,
-        )
-    except Exception as e:
-        log.exception("AI ask failed")
-        return json_error("AI service error.", 500, detail=str(e))
+    return jsonify({
+        "ok": True,
+        "answer": answer,
+        "audio_url": None,
+        "plan_expiry": (sub.get("expires_at") if sub else None),
+        "admin": is_admin,
+        "acct_key": acct_key,
+        "meta": {
+            "provider": provider,
+            "lang": lang,
+            "mode": mode,
+        },
+    }), 200
