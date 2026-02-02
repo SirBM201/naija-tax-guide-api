@@ -378,9 +378,8 @@ def start_trial_if_eligible(account_id: str, trial_plan_code: str = "trial") -> 
 # -----------------------------
 def manual_activate_subscription(account_id: str, plan_code: Optional[str], expires_at: Optional[str]) -> Dict[str, Any]:
     """
-    Keeps your existing route working:
-      - If expires_at provided: create row with that expiry
-      - Else: uses plan duration_days (or 30 days default)
+    Backward-compatible manual activation for /subscription/activate route.
+    Creates a NEW subscription row and deactivates any previous active row (history preserved).
     """
     plan = (plan_code or "manual").strip() or "manual"
     starts = _now_utc()
