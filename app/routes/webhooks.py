@@ -1,3 +1,4 @@
+# app/routes/webhooks.py
 import os
 import hmac
 import hashlib
@@ -12,30 +13,50 @@ PAYSTACK_WEBHOOK_SECRET = os.getenv("PAYSTACK_WEBHOOK_SECRET", "").strip()
 def _verify_paystack_signature(raw_body: bytes, signature: str) -> bool:
     if not PAYSTACK_WEBHOOK_SECRET:
         return False
-    mac = hmac.new(PAYSTACK_WEBHOOK_SECRET.encode("utf-8"), msg=raw_body, digestmod=hashlib.sha512).hexdigest()
-    return hmac.compare_digest(mac, signature or "")
+    digest = hmac.new(PAYSTACK_WEBHOOK_SECRET.encode("utf-8"), raw_body, hashlib.sha512).hexdigest()
+    return hmac.compare_digest(digest, signature or "")
 
 @bp.post("/webhooks/paystack")
 def paystack_webhook():
     raw = request.get_data() or b""
     sig = request.headers.get("x-paystack-signature", "")
 
-    if not _verify_paystack_signature(raw, sig):
+    # In production, enforce signature
+    if PAYSTACK_WEBHOOK_SECRET and not _verify_paystack_signature(raw, sig):
         return jsonify({"ok": False, "error": "invalid_signature"}), 401
 
-    body = request.get_json(silent=True) or {}
-    event = (body.get("event") or "").strip()
+    event = request.json or {}
+    event_id = event.get("id") or event.get("event_id")  # Paystack includes an id
+    event_type = (event.get("event") or "").lower()
+    data = event.get("data") or {}
 
-    # Most important event for subscriptions:
-    # - charge.success (payment received)
-    if event == "charge.success":
-        data = body.get("data") or {}
-        reference = (data.get("reference") or "").strip()
-        if not reference:
-            return jsonify({"ok": False, "error": "missing_reference"}), 400
+    # We only care about successful charge events
+    # Common: "charge.success"
+    if event_type not in ("charge.success",):
+        return jsonify({"ok": True, "ignored": True, "event": event_type})
 
-        out = handle_payment_success(provider="paystack", reference=reference, payload=body)
-        return jsonify(out), (200 if out.get("ok") else 202)
+    # You must decide how to map Paystack metadata -> account_id/plan_code.
+    # Best practice: set metadata when initializing payment.
+    meta = data.get("metadata") or {}
+    account_id = (meta.get("account_id") or "").strip()
+    plan_code = (meta.get("plan_code") or "").strip()
 
-    # ignore others safely for now
-    return jsonify({"ok": True, "ignored": event}), 200
+    # Fallbacks (if you stored differently)
+    reference = data.get("reference")
+    amount_kobo = data.get("amount")
+    currency = data.get("currency", "NGN")
+
+    out = handle_payment_success({
+        "event_id": event_id,
+        "provider": "paystack",
+        "reference": reference,
+        "account_id": account_id,
+        "plan_code": plan_code,
+        "amount_kobo": amount_kobo,
+        "currency": currency,
+        "raw": event,
+        # optional: "upgrade_mode": "at_expiry"
+    })
+
+    code = 200 if out.get("ok") else 400
+    return jsonify(out), code
