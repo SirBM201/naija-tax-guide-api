@@ -2,42 +2,19 @@ from flask import Blueprint, jsonify, request
 from ..core.security import require_admin_key
 from ..services.subscriptions_service import (
     get_subscription_status,
-    manual_activate_subscription,
+    manual_activate_subscription,  # if you still keep it elsewhere
+    start_trial,
+    change_plan,
 )
 
 bp = Blueprint("subscriptions", __name__)
 
-@bp.get("/subscription/status")
-def subscription_status():
+@bp.post("/subscription/trial")
+def subscription_trial():
     """
-    Query params:
-      - account_id (preferred) OR
-      - provider + provider_user_id
-    """
-    account_id = (request.args.get("account_id") or "").strip()
-    provider = (request.args.get("provider") or "").strip().lower()
-    provider_user_id = (request.args.get("provider_user_id") or "").strip()
-
-    status = get_subscription_status(
-        account_id=account_id or None,
-        provider=provider or None,
-        provider_user_id=provider_user_id or None,
-    )
-    return jsonify({"ok": True, **status})
-
-@bp.post("/subscription/activate")
-def subscription_activate():
-    """
-    Admin-only manual activation.
+    Start trial for an account (admin-only for now).
     Header: X-Admin-Key
-
-    Body:
-      {
-        "account_id": "<uuid>",
-        "plan_code": "monthly|quarterly|yearly|pro|..." (optional),
-        "expires_at": "2026-12-31T00:00:00Z" (optional)
-      }
-    If expires_at omitted, we auto-add 30 days.
+    Body: { "account_id": "<uuid>" }
     """
     guard = require_admin_key()
     if guard is not None:
@@ -48,13 +25,36 @@ def subscription_activate():
     if not account_id:
         return jsonify({"ok": False, "error": "account_id is required"}), 400
 
-    plan_code = (body.get("plan_code") or "").strip() or None
-    expires_at = (body.get("expires_at") or "").strip() or None
+    out = start_trial(account_id=account_id)
+    code = 200 if out.get("ok") else 400
+    return jsonify(out), code
 
-    result = manual_activate_subscription(
-        account_id=account_id,
-        plan_code=plan_code,
-        expires_at=expires_at,
-    )
-    return jsonify({"ok": True, "subscription": result})
+@bp.post("/subscription/change")
+def subscription_change():
+    """
+    Upgrade/downgrade (admin-only for now).
+    Header: X-Admin-Key
+    Body:
+      {
+        "account_id": "<uuid>",
+        "new_plan_code": "monthly|quarterly|yearly",
+        "change_type": "upgraded|downgraded"
+      }
+    """
+    guard = require_admin_key()
+    if guard is not None:
+        return guard
 
+    body = request.get_json(silent=True) or {}
+    account_id = (body.get("account_id") or "").strip()
+    new_plan_code = (body.get("new_plan_code") or "").strip()
+    change_type = (body.get("change_type") or "upgraded").strip().lower()
+
+    if not account_id or not new_plan_code:
+        return jsonify({"ok": False, "error": "account_id and new_plan_code are required"}), 400
+
+    if change_type not in ("upgraded", "downgraded"):
+        change_type = "upgraded"
+
+    out = change_plan(account_id=account_id, new_plan_code=new_plan_code, change_type=change_type)
+    return jsonify(out), 200
