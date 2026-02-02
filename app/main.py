@@ -15,4 +15,3 @@ def handle_any(err):
         return jsonify({"ok": False, "error": err.name}), err.code
     logging.exception("Unhandled error: %s", err)
     return jsonify({"ok": False, "error": "Internal Server Error"}), 500
-
