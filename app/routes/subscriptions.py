@@ -1,11 +1,10 @@
 from flask import Blueprint, jsonify, request
 from ..core.security import require_admin_key
-from ..services.subscriptions_service import (
-    get_subscription_status,
-    manual_activate_subscription,  # if you still keep it elsewhere
-    start_trial,
-    change_plan,
-)
+from ..services.subscriptions_service import get_subscription_status
+
+# TEMP fallback so the app boots even if the function is missing
+def manual_activate_subscription(*args, **kwargs):
+    raise RuntimeError("manual_activate_subscription not implemented in subscriptions_service.py")
 
 bp = Blueprint("subscriptions", __name__)
 
