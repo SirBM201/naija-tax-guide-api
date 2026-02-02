@@ -403,3 +403,73 @@ def manual_activate_subscription(account_id: str, plan_code: Optional[str], expi
     db = supabase()
     ins = db.table("user_subscriptions").insert(payload).execute()
     return ins.data[0]
+
+from typing import Optional, Dict, Any
+from datetime import datetime, timedelta, timezone
+
+from ..core.supabase_client import supabase
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+def _parse_iso(value: str) -> Optional[datetime]:
+    try:
+        v = value.replace("Z", "+00:00")
+        return datetime.fromisoformat(v)
+    except Exception:
+        return None
+
+def _iso(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+def _build_expiry_from_plan(plan_code: str, started_at: datetime) -> datetime:
+    # simple mapping for now (edit later to use plans table)
+    p = (plan_code or "").lower()
+    if p == "yearly":
+        return started_at + timedelta(days=365)
+    if p == "quarterly":
+        return started_at + timedelta(days=90)
+    # default monthly/manual
+    return started_at + timedelta(days=30)
+
+def _deactivate_any_active(account_id: str, reason: str = "replaced") -> None:
+    db = supabase()
+    now = _iso(_now_utc())
+    # deactivate any currently active rows (history preserved)
+    db.table("user_subscriptions") \
+      .update({"is_active": False, "status": reason, "updated_at": now}) \
+      .eq("account_id", account_id) \
+      .eq("is_active", True) \
+      .execute()
+
+def manual_activate_subscription(account_id: str, plan_code: Optional[str], expires_at: Optional[str]) -> Dict[str, Any]:
+    """
+    Route-compatible function required by app/routes/subscriptions.py
+
+    Behavior:
+    - keeps history (inserts a NEW row)
+    - ensures only one active subscription by deactivating previous active rows
+    """
+    plan = (plan_code or "manual").strip() or "manual"
+    started = _now_utc()
+
+    exp_dt = _parse_iso(expires_at) if expires_at else None
+    if exp_dt is None:
+        exp_dt = _build_expiry_from_plan(plan, started)
+
+    _deactivate_any_active(account_id, reason="replaced")
+
+    payload = {
+        "account_id": account_id,
+        "plan_code": plan,
+        "status": "active",
+        "started_at": _iso(started),
+        "expires_at": _iso(exp_dt),
+        "is_active": True,
+        "created_at": _iso(started),
+        "updated_at": _iso(started),
+    }
+
+    db = supabase()
+    ins = db.table("user_subscriptions").insert(payload).execute()
+    return ins.data[0]
