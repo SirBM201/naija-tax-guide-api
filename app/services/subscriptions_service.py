@@ -27,9 +27,17 @@ def _iso(dt: datetime) -> str:
 # -----------------------------
 # Lookups
 # -----------------------------
-def _find_account_id(account_id: Optional[str], provider: Optional[str], provider_user_id: Optional[str]) -> Optional[str]:
+def _find_account_id(
+    account_id: Optional[str],
+    provider: Optional[str],
+    provider_user_id: Optional[str],
+) -> Optional[str]:
+    """
+    If account_id is given -> use it.
+    Else try to find account by (provider, provider_user_id) from accounts table.
+    """
     if account_id:
-        return account_id
+        return account_id.strip() or None
 
     if not provider or not provider_user_id:
         return None
@@ -49,6 +57,7 @@ def _find_account_id(account_id: Optional[str], provider: Optional[str], provide
 
 
 def _get_plan(code: str) -> Optional[Dict[str, Any]]:
+    code = (code or "").strip()
     if not code:
         return None
     db = supabase()
@@ -92,25 +101,32 @@ def _compute_access_state(sub_row: Dict[str, Any]) -> Tuple[str, Optional[str], 
       - state: "active" | "grace" | "expired"
     """
     expires_at = sub_row.get("expires_at")
-    plan_code = sub_row.get("plan_code") or ""
+    plan_code = (sub_row.get("plan_code") or "").strip()
     is_active_flag = bool(sub_row.get("is_active"))
 
     if not expires_at:
+        # No expiry means we trust is_active flag
         return ("active" if is_active_flag else "expired", None, None)
 
     exp_dt = _parse_iso(expires_at) if isinstance(expires_at, str) else None
     if not exp_dt:
+        # Can't parse -> trust flag, but still return raw expires_at
         return ("active" if is_active_flag else "expired", expires_at, None)
 
     plan = _get_plan(plan_code) if plan_code else None
-    grace_days = int(plan.get("grace_days") or 0) if plan else 0
+    grace_days = 0
+    if plan and plan.get("grace_days") is not None:
+        try:
+            grace_days = int(plan.get("grace_days") or 0)
+        except Exception:
+            grace_days = 0
 
     now = _now_utc()
     grace_until_dt = exp_dt + timedelta(days=grace_days)
 
-    if now <= exp_dt and is_active_flag:
+    if is_active_flag and now <= exp_dt:
         return ("active", expires_at, _iso(grace_until_dt))
-    if now <= grace_until_dt and is_active_flag:
+    if is_active_flag and now <= grace_until_dt:
         return ("grace", expires_at, _iso(grace_until_dt))
     return ("expired", expires_at, _iso(grace_until_dt))
 
@@ -123,6 +139,12 @@ def get_subscription_status(
     provider: Optional[str],
     provider_user_id: Optional[str],
 ) -> Dict[str, Any]:
+    """
+    Returns:
+      active: bool  (true in ACTIVE or GRACE)
+      state: "none" | "active" | "grace" | "expired"
+      plan_code, expires_at, grace_until
+    """
     aid = _find_account_id(account_id, provider, provider_user_id)
     if not aid:
         return {
@@ -165,31 +187,61 @@ def get_subscription_status(
 # Core mutations
 # -----------------------------
 def _deactivate_any_active(account_id: str, reason: str = "replaced") -> None:
+    """
+    Turn off existing active row (if any). Keep it as history.
+    """
     db = supabase()
     cur = _get_active_sub_row(account_id)
     if not cur:
         return
 
-    db.table("user_subscriptions").update(
-        {"is_active": False, "status": reason, "updated_at": _iso(_now_utc())}
-    ).eq("id", cur["id"]).execute()
+    # Your user_subscriptions columns list doesn't show status/updated_at,
+    # so we update only what we KNOW exists. (is_active definitely exists)
+    try:
+        db.table("user_subscriptions").update({"is_active": False}).eq("id", cur["id"]).execute()
+    except Exception:
+        # fallback: try update more fields if they exist in some environments
+        try:
+            db.table("user_subscriptions").update(
+                {"is_active": False, "status": reason, "updated_at": _iso(_now_utc())}
+            ).eq("id", cur["id"]).execute()
+        except Exception:
+            pass
 
 
 def _build_expiry_from_plan(plan_code: str, starts_at: datetime) -> datetime:
+    """
+    Uses plans.duration_days by default.
+    If plan.is_trial == true and trial_days exists, use trial_days.
+    """
     plan = _get_plan(plan_code)
-    duration_days = int(plan.get("duration_days") or 30) if plan else 30
-    # If trial plan has trial_days, prefer that
-    if plan and bool(plan.get("is_trial")) and plan.get("trial_days") is not None:
-        duration_days = int(plan.get("trial_days") or duration_days)
+    duration_days = 30
+
+    if plan:
+        try:
+            duration_days = int(plan.get("duration_days") or 30)
+        except Exception:
+            duration_days = 30
+
+        # trial override
+        try:
+            if bool(plan.get("is_trial")) and plan.get("trial_days") is not None:
+                duration_days = int(plan.get("trial_days") or duration_days)
+        except Exception:
+            pass
+
     return starts_at + timedelta(days=duration_days)
 
 
-def activate_subscription_now(
-    account_id: str,
-    plan_code: str,
-    *,
-    status: str = "active",
-) -> Dict[str, Any]:
+def activate_subscription_now(account_id: str, plan_code: str, *, status: str = "active") -> Dict[str, Any]:
+    """
+    Creates a NEW subscription row starting now and deactivates any previous active row.
+    """
+    account_id = (account_id or "").strip()
+    plan_code = (plan_code or "").strip()
+    if not account_id or not plan_code:
+        raise ValueError("account_id and plan_code are required")
+
     starts = _now_utc()
     expires = _build_expiry_from_plan(plan_code, starts)
 
@@ -198,12 +250,9 @@ def activate_subscription_now(
     payload = {
         "account_id": account_id,
         "plan_code": plan_code,
-        "status": status,
         "started_at": _iso(starts),
         "expires_at": _iso(expires),
         "is_active": True,
-        "created_at": _iso(starts),
-        "updated_at": _iso(starts),
     }
 
     db = supabase()
@@ -212,6 +261,16 @@ def activate_subscription_now(
 
 
 def schedule_plan_change_at_expiry(account_id: str, next_plan_code: str) -> Dict[str, Any]:
+    """
+    Store pending change on CURRENT active row:
+      - pending_plan_code
+      - pending_starts_at (usually expires_at)
+    """
+    account_id = (account_id or "").strip()
+    next_plan_code = (next_plan_code or "").strip()
+    if not account_id or not next_plan_code:
+        raise ValueError("account_id and next_plan_code are required")
+
     db = supabase()
     cur = _get_active_sub_row(account_id)
     if not cur:
@@ -228,7 +287,6 @@ def schedule_plan_change_at_expiry(account_id: str, next_plan_code: str) -> Dict
             {
                 "pending_plan_code": next_plan_code,
                 "pending_starts_at": _iso(exp_dt),
-                "updated_at": _iso(_now_utc()),
             }
         )
         .eq("id", cur["id"])
@@ -238,6 +296,13 @@ def schedule_plan_change_at_expiry(account_id: str, next_plan_code: str) -> Dict
 
 
 def apply_scheduled_change_if_due(account_id: str) -> Optional[Dict[str, Any]]:
+    """
+    If pending is due, create next plan row and deactivate old.
+    """
+    account_id = (account_id or "").strip()
+    if not account_id:
+        return None
+
     db = supabase()
     cur = _get_active_sub_row(account_id)
     if not cur:
@@ -257,11 +322,13 @@ def apply_scheduled_change_if_due(account_id: str) -> Optional[Dict[str, Any]]:
         return None
 
     # clear pending on old row
-    db.table("user_subscriptions").update(
-        {"pending_plan_code": None, "pending_starts_at": None, "updated_at": _iso(_now_utc())}
-    ).eq("id", cur["id"]).execute()
+    try:
+        db.table("user_subscriptions").update(
+            {"pending_plan_code": None, "pending_starts_at": None}
+        ).eq("id", cur["id"]).execute()
+    except Exception:
+        pass
 
-    # activate new plan now
     return activate_subscription_now(account_id, pending_plan, status="active")
 
 
@@ -270,12 +337,16 @@ def apply_scheduled_change_if_due(account_id: str) -> Optional[Dict[str, Any]]:
 # -----------------------------
 def start_trial_if_eligible(account_id: str, trial_plan_code: str = "trial") -> Dict[str, Any]:
     """
-    Simple MVP eligibility: trial once per account, inferred from subscription history.
-    (No schema change required.)
+    Simple MVP eligibility: trial only once per account (no schema change required).
+    Rule:
+      - if user_subscriptions ever had plan_code == trial_plan_code -> block
+      - else activate trial now
     """
-    db = supabase()
+    account_id = (account_id or "").strip()
+    if not account_id:
+        return {"ok": False, "error": "account_id_required"}
 
-    # If they ever had plan_code == trial_plan_code, block
+    db = supabase()
     seen = (
         db.table("user_subscriptions")
         .select("id")
@@ -295,9 +366,18 @@ def start_trial_if_eligible(account_id: str, trial_plan_code: str = "trial") -> 
 # Manual activation (required by routes)
 # -----------------------------
 def manual_activate_subscription(account_id: str, plan_code: Optional[str], expires_at: Optional[str]) -> Dict[str, Any]:
+    """
+    Backward-compatible manual activation for /subscription/activate route.
+    - Inserts a NEW row (history kept)
+    - Deactivates old active row
+    - If expires_at missing, compute from plan duration_days
+    """
+    account_id = (account_id or "").strip()
     plan = (plan_code or "manual").strip() or "manual"
-    starts = _now_utc()
+    if not account_id:
+        raise ValueError("account_id is required")
 
+    starts = _now_utc()
     exp_dt = _parse_iso(expires_at) if expires_at else None
     if exp_dt is None:
         exp_dt = _build_expiry_from_plan(plan, starts)
@@ -307,12 +387,9 @@ def manual_activate_subscription(account_id: str, plan_code: Optional[str], expi
     payload = {
         "account_id": account_id,
         "plan_code": plan,
-        "status": "active",
         "started_at": _iso(starts),
         "expires_at": _iso(exp_dt),
         "is_active": True,
-        "created_at": _iso(starts),
-        "updated_at": _iso(starts),
     }
 
     db = supabase()
@@ -326,8 +403,8 @@ def manual_activate_subscription(account_id: str, plan_code: Optional[str], expi
 def handle_payment_success(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     Idempotent-ish payment handler:
-    - record event in paystack_events (if provided)
-    - record payment row
+    - store event in paystack_events (best effort)
+    - store payment row (best effort)
     - activate subscription (or schedule if upgrade_mode='at_expiry')
     """
     db = supabase()
@@ -338,22 +415,21 @@ def handle_payment_success(payload: Dict[str, Any]) -> Dict[str, Any]:
     account_id = (payload.get("account_id") or "").strip()
     plan_code = (payload.get("plan_code") or "").strip()
     amount_kobo = payload.get("amount_kobo")
-    currency = payload.get("currency") or "NGN"
+    currency = (payload.get("currency") or "NGN").strip()
     raw = payload.get("raw")
-    upgrade_mode = (payload.get("upgrade_mode") or "now").strip().lower()  # "now" | "at_expiry"
+    upgrade_mode = (payload.get("upgrade_mode") or "now").strip().lower()  # now | at_expiry
 
     if not account_id or not plan_code:
         return {"ok": False, "error": "missing_account_id_or_plan_code"}
 
-    # 1) store event if table exists + event_id present
+    # 1) store event (best effort)
     if event_id:
         try:
             db.table("paystack_events").insert({"event_id": event_id, "payload": raw}).execute()
         except Exception:
-            # ignore duplicates / table missing / etc
             pass
 
-    # 2) store payment (best-effort; do not crash webhook)
+    # 2) store payment (best effort) - columns may differ; do not crash webhook
     try:
         db.table("payments").insert(
             {
@@ -365,8 +441,6 @@ def handle_payment_success(payload: Dict[str, Any]) -> Dict[str, Any]:
                 "status": "success",
                 "plan_code": plan_code,
                 "raw": raw,
-                "created_at": _iso(_now_utc()),
-                "updated_at": _iso(_now_utc()),
             }
         ).execute()
     except Exception:
