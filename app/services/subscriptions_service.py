@@ -473,3 +473,4 @@ def manual_activate_subscription(account_id: str, plan_code: Optional[str], expi
     db = supabase()
     ins = db.table("user_subscriptions").insert(payload).execute()
     return ins.data[0]
+
