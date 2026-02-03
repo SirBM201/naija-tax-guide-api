@@ -56,12 +56,17 @@ def _find_account_id(
     return None
 
 
-def _get_plan(code: str) -> Optional[Dict[str, Any]]:
-    code = (code or "").strip()
-    if not code:
+def _get_plan(plan_code: str) -> Optional[Dict[str, Any]]:
+    """
+    IMPORTANT: aligns with DB schema:
+      public.plans.plan_code (primary key)
+    """
+    plan_code = (plan_code or "").strip()
+    if not plan_code:
         return None
+
     db = supabase()
-    res = db.table("plans").select("*").eq("code", code).limit(1).execute()
+    res = db.table("plans").select("*").eq("plan_code", plan_code).limit(1).execute()
     return res.data[0] if res.data else None
 
 
@@ -93,28 +98,30 @@ def _get_active_sub_row(account_id: str) -> Optional[Dict[str, Any]]:
 
 
 # -----------------------------
-# Access computation (active / grace / expired)
+# Access computation (active / expired)
 # -----------------------------
 def _compute_access_state(sub_row: Dict[str, Any]) -> Tuple[str, Optional[str], Optional[str]]:
     """
     Returns: (state, expires_at, grace_until)
-      - state: "active" | "grace" | "expired"
+      - state: "active" | "expired"
+    NOTE:
+      Your current DB shown does NOT include grace_days in plans,
+      so we keep grace_days as 0 by default (safe).
     """
     expires_at = sub_row.get("expires_at")
     plan_code = (sub_row.get("plan_code") or "").strip()
     is_active_flag = bool(sub_row.get("is_active"))
 
     if not expires_at:
-        # No expiry means we trust is_active flag
         return ("active" if is_active_flag else "expired", None, None)
 
     exp_dt = _parse_iso(expires_at) if isinstance(expires_at, str) else None
     if not exp_dt:
-        # Can't parse -> trust flag, but still return raw expires_at
         return ("active" if is_active_flag else "expired", expires_at, None)
 
-    plan = _get_plan(plan_code) if plan_code else None
+    # Optional grace support (won't break if column not present)
     grace_days = 0
+    plan = _get_plan(plan_code) if plan_code else None
     if plan and plan.get("grace_days") is not None:
         try:
             grace_days = int(plan.get("grace_days") or 0)
@@ -126,8 +133,11 @@ def _compute_access_state(sub_row: Dict[str, Any]) -> Tuple[str, Optional[str], 
 
     if is_active_flag and now <= exp_dt:
         return ("active", expires_at, _iso(grace_until_dt))
+
+    # If grace_days is 0, this is effectively disabled
     if is_active_flag and now <= grace_until_dt:
-        return ("grace", expires_at, _iso(grace_until_dt))
+        return ("active", expires_at, _iso(grace_until_dt))
+
     return ("expired", expires_at, _iso(grace_until_dt))
 
 
@@ -141,8 +151,8 @@ def get_subscription_status(
 ) -> Dict[str, Any]:
     """
     Returns:
-      active: bool  (true in ACTIVE or GRACE)
-      state: "none" | "active" | "grace" | "expired"
+      active: bool
+      state: "none" | "active" | "expired"
       plan_code, expires_at, grace_until
     """
     aid = _find_account_id(account_id, provider, provider_user_id)
@@ -170,11 +180,11 @@ def get_subscription_status(
         }
 
     state, expires_at, grace_until = _compute_access_state(latest)
-    active = state in ("active", "grace")
+    active = state == "active"
 
     return {
         "active": active,
-        "state": state,
+        "state": "active" if active else "expired",
         "account_id": aid,
         "plan_code": latest.get("plan_code"),
         "expires_at": expires_at,
@@ -195,12 +205,10 @@ def _deactivate_any_active(account_id: str, reason: str = "replaced") -> None:
     if not cur:
         return
 
-    # Your user_subscriptions columns list doesn't show status/updated_at,
-    # so we update only what we KNOW exists. (is_active definitely exists)
     try:
         db.table("user_subscriptions").update({"is_active": False}).eq("id", cur["id"]).execute()
     except Exception:
-        # fallback: try update more fields if they exist in some environments
+        # fallback only if your env has these columns (won't crash if not)
         try:
             db.table("user_subscriptions").update(
                 {"is_active": False, "status": reason, "updated_at": _iso(_now_utc())}
@@ -211,8 +219,8 @@ def _deactivate_any_active(account_id: str, reason: str = "replaced") -> None:
 
 def _build_expiry_from_plan(plan_code: str, starts_at: datetime) -> datetime:
     """
-    Uses plans.duration_days by default.
-    If plan.is_trial == true and trial_days exists, use trial_days.
+    Uses plans.duration_days.
+    This aligns with your current DB: duration_days exists.
     """
     plan = _get_plan(plan_code)
     duration_days = 30
@@ -223,19 +231,13 @@ def _build_expiry_from_plan(plan_code: str, starts_at: datetime) -> datetime:
         except Exception:
             duration_days = 30
 
-        # trial override
-        try:
-            if bool(plan.get("is_trial")) and plan.get("trial_days") is not None:
-                duration_days = int(plan.get("trial_days") or duration_days)
-        except Exception:
-            pass
-
     return starts_at + timedelta(days=duration_days)
 
 
 def activate_subscription_now(account_id: str, plan_code: str, *, status: str = "active") -> Dict[str, Any]:
     """
     Creates a NEW subscription row starting now and deactivates any previous active row.
+    'status' is accepted for compatibility, but we store only columns we know exist.
     """
     account_id = (account_id or "").strip()
     plan_code = (plan_code or "").strip()
@@ -341,6 +343,10 @@ def start_trial_if_eligible(account_id: str, trial_plan_code: str = "trial") -> 
     Rule:
       - if user_subscriptions ever had plan_code == trial_plan_code -> block
       - else activate trial now
+
+    NOTE:
+      If you want trial to work, you must add a 'trial' plan row in public.plans
+      OR leave it as-is; it will still create a subscription row but expiry will default to 30 days.
     """
     account_id = (account_id or "").strip()
     if not account_id:
@@ -429,7 +435,7 @@ def handle_payment_success(payload: Dict[str, Any]) -> Dict[str, Any]:
         except Exception:
             pass
 
-    # 2) store payment (best effort) - columns may differ; do not crash webhook
+    # 2) store payment (best effort)
     try:
         db.table("payments").insert(
             {
