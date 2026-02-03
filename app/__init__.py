@@ -7,6 +7,7 @@ from .routes.accounts import bp as accounts_bp
 from .routes.subscriptions import bp as subs_bp
 from .routes.ask import bp as ask_bp
 from .routes.webhooks import bp as webhooks_bp
+from app.routes.inbound import bp as inbound_bp
 
 def create_app() -> Flask:
     app = Flask(__name__)
@@ -24,5 +25,6 @@ def create_app() -> Flask:
     app.register_blueprint(subs_bp, url_prefix=API_PREFIX)
     app.register_blueprint(ask_bp, url_prefix=API_PREFIX)
     app.register_blueprint(webhooks_bp, url_prefix=API_PREFIX)
+    app.register_blueprint(inbound_bp)
     return app
 
