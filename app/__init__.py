@@ -10,6 +10,7 @@ from .routes.ask import bp as ask_bp
 from .routes.webhooks import bp as webhooks_bp
 from .routes.plans import bp as plans_bp
 from .routes.inbound import bp as inbound_bp
+from app.routes.paystack import paystack_bp
 
 
 def create_app() -> Flask:
@@ -29,6 +30,7 @@ def create_app() -> Flask:
     app.register_blueprint(ask_bp, url_prefix=API_PREFIX)
     app.register_blueprint(webhooks_bp, url_prefix=API_PREFIX)
     app.register_blueprint(plans_bp, url_prefix=API_PREFIX)
+    app.register_blueprint(paystack_bp)
 
     # Inbound webhook endpoints (no prefix is fine, but keep consistent with your current)
     # If you want them under /api too, change to url_prefix=API_PREFIX
