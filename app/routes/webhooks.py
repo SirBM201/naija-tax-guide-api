@@ -2,9 +2,6 @@
 import os
 import hmac
 import hashlib
-import json
-from typing import Any, Dict, Optional, Tuple
-
 from flask import Blueprint, request, jsonify
 
 from ..services.subscriptions_service import handle_payment_success
@@ -31,7 +28,6 @@ def paystack_webhook():
     raw = request.get_data() or b""
     sig = request.headers.get("x-paystack-signature", "")
 
-    # In production, enforce signature
     if PAYSTACK_WEBHOOK_SECRET and not _verify_paystack_signature(raw, sig):
         return jsonify({"ok": False, "error": "invalid_signature"}), 401
 
@@ -65,95 +61,38 @@ def paystack_webhook():
     return jsonify(out), (200 if out.get("ok") else 400)
 
 # -----------------------------
-# WhatsApp Cloud API (Meta)
+# Meta (WhatsApp / Messenger / Instagram)
 # -----------------------------
-WA_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "").strip()
-# If you use app secret-based signature verification:
-WA_APP_SECRET = os.getenv("WHATSAPP_APP_SECRET", "").strip()
+META_VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN", "").strip()
 
-def _verify_meta_signature(raw: bytes, sig_header: str) -> bool:
+@bp.get("/webhooks/meta")
+def meta_verify():
     """
-    Meta may send header: X-Hub-Signature-256: sha256=...
-    Only enable if you set WHATSAPP_APP_SECRET.
-    """
-    if not WA_APP_SECRET:
-        return True  # skip if not configured
-    if not sig_header or "=" not in sig_header:
-        return False
-    algo, sig = sig_header.split("=", 1)
-    if algo.strip().lower() != "sha256":
-        return False
-    digest = hmac.new(WA_APP_SECRET.encode("utf-8"), raw, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(digest, sig.strip())
-
-@bp.get("/webhooks/whatsapp")
-def whatsapp_verify():
-    """
-    Meta webhook verification
+    Meta webhook verification endpoint.
+    Configure this URL in:
+    - WhatsApp Cloud API webhooks
+    - Facebook Messenger webhooks
+    - Instagram webhooks
     """
     mode = request.args.get("hub.mode", "")
     token = request.args.get("hub.verify_token", "")
     challenge = request.args.get("hub.challenge", "")
 
-    if mode == "subscribe" and WA_VERIFY_TOKEN and token == WA_VERIFY_TOKEN:
+    if mode == "subscribe" and META_VERIFY_TOKEN and token == META_VERIFY_TOKEN:
         return challenge, 200
     return "forbidden", 403
 
-@bp.post("/webhooks/whatsapp")
-def whatsapp_inbound():
-    raw = request.get_data() or b""
-    sig = request.headers.get("X-Hub-Signature-256", "")
-
-    if not _verify_meta_signature(raw, sig):
-        return jsonify({"ok": False, "error": "invalid_signature"}), 401
-
-    payload = request.json or {}
-
-    # TODO: route into your WA handler/service.
-    # For now we just ack and log minimal safe info.
-    # You will parse messages under: entry -> changes -> value -> messages
-    return jsonify({"ok": True}), 200
-
-# -----------------------------
-# Telegram Bot API webhook
-# -----------------------------
-TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
-
-def _verify_telegram_secret() -> bool:
+@bp.post("/webhooks/meta")
+def meta_events():
     """
-    If you configured secret token when setting webhook:
-    Telegram will send header: X-Telegram-Bot-Api-Secret-Token
+    Receives Meta webhook events.
+    For now: just acknowledge. Later we will route to:
+    - WA inbound handler
+    - Messenger inbound handler
+    - Instagram DM inbound handler
     """
-    if not TELEGRAM_WEBHOOK_SECRET:
-        return True
-    got = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-    return hmac.compare_digest(got or "", TELEGRAM_WEBHOOK_SECRET)
+    payload = request.get_json(silent=True) or {}
 
-@bp.post("/webhooks/telegram")
-def telegram_inbound():
-    if not _verify_telegram_secret():
-        return jsonify({"ok": False, "error": "invalid_secret"}), 401
-
-    payload = request.json or {}
-
-    # TODO: route into your Telegram handler/service.
-    # Telegram inbound messages come under: message / edited_message / callback_query etc.
+    # TODO next: route by payload structure.
+    # We'll implement in the inbound routes step.
     return jsonify({"ok": True}), 200
-
-# -----------------------------
-# Placeholders for later (Messenger / Instagram / Email)
-# -----------------------------
-@bp.post("/webhooks/messenger")
-def messenger_inbound():
-    # TODO: implement Meta Messenger webhook verification + parsing
-    return jsonify({"ok": True, "todo": True}), 200
-
-@bp.post("/webhooks/instagram")
-def instagram_inbound():
-    # TODO: implement IG webhook verification + parsing
-    return jsonify({"ok": True, "todo": True}), 200
-
-@bp.post("/webhooks/email")
-def email_inbound():
-    # TODO: depends on your provider (SendGrid inbound parse, Mailgun routes, SES, etc.)
-    return jsonify({"ok": True, "todo": True}), 200
