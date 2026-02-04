@@ -31,6 +31,7 @@ def create_app() -> Flask:
     app.register_blueprint(webhooks_bp, url_prefix=API_PREFIX)
     app.register_blueprint(plans_bp, url_prefix=API_PREFIX)
     app.register_blueprint(paystack_bp)
+     app.register_blueprint(paystack_webhook_bp)
 
     # Inbound webhook endpoints (no prefix is fine, but keep consistent with your current)
     # If you want them under /api too, change to url_prefix=API_PREFIX
