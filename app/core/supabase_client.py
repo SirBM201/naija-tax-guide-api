@@ -15,11 +15,14 @@ Rules:
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
+from threading import Lock
+
 from supabase import create_client
 from .config import SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
 
-_client: Any | None = None
+_client: Optional[Any] = None
+_lock = Lock()
 
 
 def supabase() -> Any:
@@ -31,18 +34,23 @@ def supabase() -> Any:
     """
     global _client
 
+    # Fast path (already initialized)
     if _client is not None:
         return _client
 
-    if not SUPABASE_URL:
-        raise RuntimeError("SUPABASE_URL is not set")
+    # Thread-safe init
+    with _lock:
+        if _client is not None:
+            return _client
 
-    if not SUPABASE_SERVICE_ROLE_KEY:
-        raise RuntimeError("SUPABASE_SERVICE_ROLE_KEY is not set")
+        url = (SUPABASE_URL or "").strip()
+        key = (SUPABASE_SERVICE_ROLE_KEY or "").strip()
 
-    _client = create_client(
-        SUPABASE_URL,
-        SUPABASE_SERVICE_ROLE_KEY,
-    )
+        if not url:
+            raise RuntimeError("SUPABASE_URL is not set")
 
-    return _client
+        if not key:
+            raise RuntimeError("SUPABASE_SERVICE_ROLE_KEY is not set")
+
+        _client = create_client(url, key)
+        return _client
