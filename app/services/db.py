@@ -1,23 +1,21 @@
 # app/services/db.py
 """
 Compatibility layer for imports like:
-  from app.services.db import supabase_admin
+  from ..services.db import supabase_admin
 
 This codebase uses:
-  from app.core.supabase_client import supabase
+  from ..core.supabase_client import supabase
 
 We expose:
 - supabase_admin() -> returns the service-role Supabase client (from core.supabase_client)
 
 Also includes:
-- supabase_admin_client proxy for older code that does:
-    from app.services.db import supabase_admin_client
-    supabase_admin_client.rpc(...)
-
-And ALSO supports the legacy pattern:
-    from app.services.db import supabase_admin
+- a backwards-compatible "supabase_admin_client" proxy for older code that does:
+    from ..services.db import supabase_admin
     supabase_admin.rpc(...)
-by making supabase_admin a function, and providing a proxy if needed.
+
+If any old code imports supabase_admin as a CLIENT (not as a function),
+it will still work by calling through the proxy.
 """
 
 from __future__ import annotations
@@ -37,14 +35,14 @@ def supabase_admin() -> Any:
 class _SupabaseAdminProxy:
     """
     Proxy that forwards attribute access to supabase_admin().
+    Allows older code patterns like:
 
-    Allows old code patterns like:
-        from app.services.db import supabase_admin_client
+        from ..services.db import supabase_admin_client
         supabase_admin_client.rpc("fn", {...}).execute()
     """
     def __getattr__(self, name: str) -> Any:
         return getattr(supabase_admin(), name)
 
 
-# Legacy-friendly "client object" form
+# Optional: if any legacy modules expect a client-like object.
 supabase_admin_client = _SupabaseAdminProxy()
