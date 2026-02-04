@@ -1,4 +1,5 @@
 # app/services/db.py
+
 """
 Compatibility layer for imports like:
   from ..services.db import supabase_admin
@@ -10,12 +11,12 @@ We expose:
 - supabase_admin() -> returns the service-role Supabase client (from core.supabase_client)
 
 Also includes:
-- a backwards-compatible "supabase_admin_client" proxy for older code that does:
+- supabase_admin_client proxy for older code that does:
+    from ..services.db import supabase_admin_client as supabase_admin
+    supabase_admin.rpc(...)
+or even mistakenly:
     from ..services.db import supabase_admin
     supabase_admin.rpc(...)
-
-If any old code imports supabase_admin as a CLIENT (not as a function),
-it will still work by calling through the proxy.
 """
 
 from __future__ import annotations
@@ -35,16 +36,23 @@ def supabase_admin() -> Any:
 class _SupabaseAdminProxy:
     """
     Proxy that forwards attribute access to supabase_admin().
-    This allows older code patterns like:
 
-        from ..services.db import supabase_admin
+    Supports legacy patterns like:
+        from ..services.db import supabase_admin_client as supabase_admin
         supabase_admin.rpc("fn", {...}).execute()
 
-    Even though supabase_admin is now a function.
+    Or even (old buggy usage):
+        from ..services.db import supabase_admin
+        supabase_admin.rpc("fn", {...}).execute()
     """
     def __getattr__(self, name: str) -> Any:
         return getattr(supabase_admin(), name)
 
 
-# Optional: if any legacy modules expect supabase_admin to be a client object.
+# ✅ Use this in any legacy modules that expect "a client object"
 supabase_admin_client = _SupabaseAdminProxy()
+
+# ✅ Extra backwards-compat: if any old file does `from ..services.db import supabase_admin`
+# and then calls `.rpc` on it, they will fail because supabase_admin is a function.
+# So we also export a second name many devs accidentally used.
+supabase_admin_proxy = supabase_admin_client
