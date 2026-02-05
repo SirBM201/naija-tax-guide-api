@@ -1,22 +1,18 @@
 from flask import Blueprint, jsonify, request
 import os
 import re
-from datetime import datetime, timezone
-
-from app.core.supabase_client import supabase  # your existing helper
+from app.core.supabase_client import supabase
 
 bp = Blueprint("link_tokens", __name__)
 
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
-
-CODE_RE = re.compile(r"^[A-Z0-9]{6,12}$")  # supports 6-12 chars
+CODE_RE = re.compile(r"^[A-Z0-9]{6,12}$")
 
 def _bad(msg: str, status: int = 400):
     return jsonify({"ok": False, "error": msg}), status
 
-@bp.post("/api/link-tokens/create")
+@bp.post("/link-tokens/create")
 def create_link_token_api():
-    # --- Admin auth ---
     admin_key = (request.headers.get("X-Admin-Key") or "").strip()
     if not ADMIN_API_KEY or admin_key != ADMIN_API_KEY:
         return _bad("Unauthorized", 401)
@@ -29,10 +25,6 @@ def create_link_token_api():
         return _bad("provider must be wa or tg")
     if ttl_minutes < 5 or ttl_minutes > 1440:
         return _bad("ttl_minutes must be between 5 and 1440")
-
-    # Option A (recommended): call create_link_token_admin(provider, ttl_minutes)
-    # Assumes RPC uses auth.uid() internally.
-    # If you aren't using Supabase JWT auth here, switch to create_link_token(provider, auth_user_id, ttl).
 
     try:
         res = supabase().rpc("create_link_token_admin", {
@@ -54,7 +46,7 @@ def create_link_token_api():
         "expires_at": row.get("expires_at"),
     })
 
-@bp.post("/api/link-tokens/consume")
+@bp.post("/link-tokens/consume")
 def consume_link_token_api():
     body = request.get_json(silent=True) or {}
     provider = (body.get("provider") or "").strip().lower()
