@@ -1,5 +1,5 @@
 # app/__init__.py
-
+import os
 from flask import Flask
 from flask_cors import CORS
 
@@ -16,22 +16,42 @@ from app.routes.paystack import paystack_bp
 from app.routes.paystack_webhook import bp as paystack_webhook_bp
 
 
-def create_app():
+def create_app() -> Flask:
     app = Flask(__name__)
 
-    # Enable CORS
-    CORS(app)
+    # ------------------------------------------------------------
+    # CORS (allow your frontend domains; default is "*")
+    # Set CORS_ORIGINS like:
+    #   CORS_ORIGINS=https://your-frontend.vercel.app,http://localhost:3000
+    # ------------------------------------------------------------
+    origins_raw = os.getenv("CORS_ORIGINS", "*").strip()
+    origins = "*" if origins_raw == "*" else [o.strip() for o in origins_raw.split(",") if o.strip()]
 
-    # Register core routes
-    app.register_blueprint(health_bp)
-    app.register_blueprint(accounts_bp)
-    app.register_blueprint(subs_bp)
-    app.register_blueprint(ask_bp)
-    app.register_blueprint(webhooks_bp)
-    app.register_blueprint(plans_bp)
+    CORS(
+        app,
+        resources={r"/api/*": {"origins": origins}},
+        supports_credentials=True,
+    )
 
-    # Register Paystack routes
-    app.register_blueprint(paystack_bp)
-    app.register_blueprint(paystack_webhook_bp)
+    # ------------------------------------------------------------
+    # Register ALL routes under /api
+    # IMPORTANT: Your blueprint route decorators should be like:
+    #   @bp.get("/health")
+    # NOT:
+    #   @bp.get("/api/health")
+    # ------------------------------------------------------------
+    api_prefix = "/api"
+
+    # Core routes
+    app.register_blueprint(health_bp, url_prefix=api_prefix)
+    app.register_blueprint(accounts_bp, url_prefix=api_prefix)
+    app.register_blueprint(subs_bp, url_prefix=api_prefix)
+    app.register_blueprint(ask_bp, url_prefix=api_prefix)
+    app.register_blueprint(webhooks_bp, url_prefix=api_prefix)
+    app.register_blueprint(plans_bp, url_prefix=api_prefix)
+
+    # Paystack routes
+    app.register_blueprint(paystack_bp, url_prefix=api_prefix)
+    app.register_blueprint(paystack_webhook_bp, url_prefix=api_prefix)
 
     return app
