@@ -1,3 +1,4 @@
+# app/routes/accounts.py
 from flask import Blueprint, jsonify, request
 from ..services.accounts_service import upsert_account
 
@@ -16,6 +17,7 @@ def create_or_get_account():
       }
     """
     body = request.get_json(silent=True) or {}
+
     provider = (body.get("provider") or "").strip().lower()
     provider_user_id = (body.get("provider_user_id") or "").strip()
 
@@ -30,4 +32,5 @@ def create_or_get_account():
         display_name=(body.get("display_name") or "").strip() or None,
         phone=(body.get("phone") or "").strip() or None,
     )
-    return jsonify({"ok": True, "account": account})
+
+    return jsonify({"ok": True, "account": account}), 200
