@@ -18,7 +18,7 @@ def _consume_link(provider: str, code: str):
     Uses service role (admin) because this is server-side.
     """
     provider = (provider or "").strip().lower()
-    code = (code or "").strip()
+    code = (code or "").strip().upper()
     if not provider or not code:
         return None
 
@@ -133,7 +133,6 @@ def whatsapp_inbound():
     # Normal question flow
     resp = ask_guarded({"account_id": account["id"], "question": text})
 
-    # Reply to WhatsApp
     answer = ""
     if isinstance(resp, dict):
         answer = (resp.get("answer") or resp.get("message") or "").strip()
@@ -170,7 +169,6 @@ def telegram_inbound():
     # Normal question flow
     resp = ask_guarded({"account_id": account["id"], "question": text})
 
-    # Reply to Telegram
     answer = ""
     if isinstance(resp, dict):
         answer = (resp.get("answer") or resp.get("message") or "").strip()
