@@ -1,24 +1,36 @@
+from flask import Blueprint, request, jsonify
 import os
 import re
 import requests
-from flask import Blueprint, request, jsonify
 
 bp = Blueprint("telegram", __name__)
 
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-BASE_URL = os.getenv("PUBLIC_API_BASE_URL", "").strip()
+
+PUBLIC_API_BASE_URL = os.getenv(
+    "PUBLIC_API_BASE_URL",
+    "https://incredible-nonie-bmsconcept-37359733.koyeb.app"
+).strip()
 
 CODE_RE = re.compile(r"^[A-Z0-9]{6,12}$")
 
-def tg_send(chat_id: int, text: str):
+def _tg_send(chat_id: int, text: str) -> None:
+    if not TG_TOKEN:
+        return
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": chat_id, "text": text}, timeout=15)
+    try:
+        requests.post(url, json={"chat_id": chat_id, "text": text}, timeout=15)
+    except Exception:
+        pass
 
 @bp.post("/telegram/webhook")
 def telegram_webhook():
     data = request.get_json(silent=True) or {}
 
     msg = data.get("message") or data.get("edited_message") or {}
+    if not msg:
+        return jsonify({"ok": True})
+
     chat = msg.get("chat") or {}
     chat_id = chat.get("id")
     text = (msg.get("text") or "").strip()
@@ -26,37 +38,43 @@ def telegram_webhook():
     user = msg.get("from") or {}
     tg_user_id = user.get("id")
 
-    # ACK quickly
     if not chat_id or not tg_user_id or not text:
         return jsonify({"ok": True})
 
-    parts = text.strip().split()
+    parts = text.split()
     cmd = parts[0].lower()
 
-    # Support "/link CODE"
+    # /link CODE
     if cmd in ("/link", "link") and len(parts) >= 2:
         code = parts[1].strip().upper()
     else:
+        # optional help:
+        # _tg_send(chat_id, "Use: /link ABCD1234 to connect your account.")
         return jsonify({"ok": True})
 
     if not CODE_RE.match(code):
-        tg_send(chat_id, "❌ Invalid code format. Use: /link ABCD1234")
+        _tg_send(chat_id, "❌ Invalid code format. Use: /link ABCD1234")
         return jsonify({"ok": True})
 
+    # Consume code
     try:
         resp = requests.post(
-            f"{BASE_URL}/api/link-tokens/consume",
-            json={"provider": "tg", "code": code, "provider_user_id": str(tg_user_id)},
-            timeout=15,
+            f"{PUBLIC_API_BASE_URL}/api/link-tokens/consume",
+            json={
+                "provider": "tg",
+                "code": code,
+                "provider_user_id": str(tg_user_id)
+            },
+            timeout=15
         )
         j = resp.json()
     except Exception:
-        tg_send(chat_id, "⚠️ Linking failed due to network error. Please try again.")
+        _tg_send(chat_id, "⚠️ Network error. Please try again.")
         return jsonify({"ok": True})
 
     if j.get("ok"):
-        tg_send(chat_id, "✅ Linked successfully! Your Telegram is now connected to your account.")
+        _tg_send(chat_id, "✅ Linked successfully! Your Telegram is now connected.")
     else:
-        tg_send(chat_id, "❌ Invalid or expired code. Please request a new code from your dashboard/admin.")
+        _tg_send(chat_id, "❌ Invalid or expired code. Please request a new code and try again.")
 
     return jsonify({"ok": True})
