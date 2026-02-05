@@ -21,26 +21,6 @@ def _is_uuid(value: str) -> bool:
 
 @bp.post("/link-tokens/create")
 def create_link_token_api():
-    """
-    Admin creates a link token for a specific auth_user_id.
-
-    Headers:
-      X-Admin-Key: <ADMIN_API_KEY>
-
-    Body:
-      {
-        "provider": "wa" | "tg",
-        "ttl_minutes": 30,
-        "auth_user_id": "<uuid>"
-      }
-
-    Calls Supabase RPC:
-      public.create_link_token(p_provider text, p_auth_user_id uuid, p_ttl_minutes integer)
-
-    NOTE:
-      We DO NOT call create_link_token_admin() here because backend requests
-      are not authenticated with a Supabase user JWT (auth.uid() would be null).
-    """
     admin_key = (request.headers.get("X-Admin-Key") or "").strip()
     if not ADMIN_API_KEY or admin_key != ADMIN_API_KEY:
         return _bad("Unauthorized", 401)
@@ -82,19 +62,6 @@ def create_link_token_api():
 
 @bp.post("/link-tokens/consume")
 def consume_link_token_api():
-    """
-    Public consumption of a link token.
-
-    Body:
-      {
-        "provider": "wa" | "tg",
-        "code": "FF7F134F",
-        "provider_user_id": "2348012345678"
-      }
-
-    Calls Supabase RPC:
-      public.consume_link_token(p_provider text, p_code text, p_provider_user_id text)
-    """
     body = request.get_json(silent=True) or {}
     provider = (body.get("provider") or "").strip().lower()
     code = (body.get("code") or "").strip().upper()
@@ -118,7 +85,6 @@ def consume_link_token_api():
 
     row = (res.data or [None])[0]
     if not row or not row.get("ok"):
-        # Don't leak whether a code exists vs expired vs wrong provider
         return jsonify({"ok": False, "provider": provider, "message": "Invalid or expired code"}), 400
 
     return jsonify({
