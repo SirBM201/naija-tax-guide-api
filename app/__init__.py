@@ -11,6 +11,8 @@ from app.routes.ask import bp as ask_bp
 from app.routes.webhooks import bp as webhooks_bp
 from app.routes.plans import bp as plans_bp
 from app.routes.link_tokens import bp as link_tokens_bp
+from app.routes.whatsapp import bp as whatsapp_bp
+from app.routes.telegram import bp as telegram_bp  # if you created it
 
 # Paystack
 from app.routes.paystack import paystack_bp
@@ -45,8 +47,10 @@ def create_app() -> Flask:
     app.register_blueprint(ask_bp, url_prefix=api_prefix)
     app.register_blueprint(webhooks_bp, url_prefix=api_prefix)
     app.register_blueprint(plans_bp, url_prefix=api_prefix)
-    app.register_blueprint(link_tokens_bp)
-    
+    app.register_blueprint(link_tokens_bp, url_prefix="/api")
+    app.register_blueprint(whatsapp_bp, url_prefix="/api")
+    app.register_blueprint(telegram_bp, url_prefix="/api")
+
     # Paystack routes
     app.register_blueprint(paystack_bp, url_prefix=api_prefix)
     app.register_blueprint(paystack_webhook_bp, url_prefix=api_prefix)
