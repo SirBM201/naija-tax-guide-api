@@ -20,9 +20,8 @@ def create_app() -> Flask:
     app = Flask(__name__)
 
     # ------------------------------------------------------------
-    # CORS (allow your frontend domains; default is "*")
-    # Set CORS_ORIGINS like:
-    #   CORS_ORIGINS=https://your-frontend.vercel.app,http://localhost:3000
+    # CORS
+    # CORS_ORIGINS="https://your-frontend.vercel.app,http://localhost:3000"
     # ------------------------------------------------------------
     origins_raw = os.getenv("CORS_ORIGINS", "*").strip()
     origins = "*" if origins_raw == "*" else [o.strip() for o in origins_raw.split(",") if o.strip()]
@@ -35,10 +34,6 @@ def create_app() -> Flask:
 
     # ------------------------------------------------------------
     # Register ALL routes under /api
-    # IMPORTANT: Your blueprint route decorators should be like:
-    #   @bp.get("/health")
-    # NOT:
-    #   @bp.get("/api/health")
     # ------------------------------------------------------------
     api_prefix = "/api"
 
