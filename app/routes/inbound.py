@@ -17,7 +17,7 @@ def _consume_link(provider: str, code: str):
     Call RPC consume_link_token(provider, code)
     Uses service role (admin) because this is server-side.
     """
-    provider = (provider or "").strip()
+    provider = (provider or "").strip().lower()
     code = (code or "").strip()
     if not provider or not code:
         return None
@@ -27,6 +27,7 @@ def _consume_link(provider: str, code: str):
         "consume_link_token",
         {"p_provider": provider, "p_code": code},
     ).execute()
+
     return res.data[0] if getattr(res, "data", None) else None
 
 
@@ -38,8 +39,7 @@ def _maybe_link_from_message(provider: str, text: str):
     if not txt:
         return None
 
-    low = txt.lower()
-    if not low.startswith("link "):
+    if not txt.lower().startswith("link "):
         return None
 
     code = txt[5:].strip()
@@ -85,7 +85,6 @@ def _extract_telegram_text(body: dict):
     Telegram update extractor.
     Returns (chat_id, user_id, text) or (None, None, None) if not a text message.
     """
-    # message, edited_message, callback_query.message etc.
     msg = body.get("message") or body.get("edited_message") or {}
     if not msg and body.get("callback_query"):
         msg = (body.get("callback_query") or {}).get("message") or {}
@@ -114,31 +113,27 @@ def _extract_telegram_text(body: dict):
 @bp.post("/inbound/whatsapp")
 def whatsapp_inbound():
     body = _json_body()
-
     wa_user_id, text = _extract_whatsapp_text(body)
 
     if not wa_user_id:
-        # likely status update or invalid payload
         return jsonify({"ok": True, "ignored": True, "reason": "no_sender_or_status"}), 200
 
     if not text:
-        # Non-text message type or empty text
         return jsonify({"ok": True, "ignored": True, "reason": "no_text"}), 200
 
-    # Ensure account exists
-    account = upsert_account(provider="wa", provider_user_id=wa_user_id)
+    # ✅ Standardized provider id
+    account = upsert_account(provider="whatsapp", provider_user_id=wa_user_id)
 
-    # Try linking
-    link_result = _maybe_link_from_message("wa", text)
+    # Linking flow
+    link_result = _maybe_link_from_message("whatsapp", text)
     if link_result:
-        # Reply confirmation
         send_whatsapp_text(wa_user_id, "✅ Linked successfully. You can now use the service.")
         return jsonify({"ok": True, "linked": True}), 200
 
     # Normal question flow
     resp = ask_guarded({"account_id": account["id"], "question": text})
 
-    # Send answer back to WhatsApp (best effort)
+    # Reply to WhatsApp
     answer = ""
     if isinstance(resp, dict):
         answer = (resp.get("answer") or resp.get("message") or "").strip()
@@ -155,7 +150,6 @@ def whatsapp_inbound():
 @bp.post("/inbound/telegram")
 def telegram_inbound():
     body = _json_body()
-
     tg_chat_id, tg_user_id, text = _extract_telegram_text(body)
 
     if not tg_chat_id or not tg_user_id:
@@ -164,10 +158,10 @@ def telegram_inbound():
     if not text:
         return jsonify({"ok": True, "ignored": True, "reason": "no_text"}), 200
 
-    # Ensure account exists
+    # ✅ Standardized provider id
     account = upsert_account(provider="telegram", provider_user_id=tg_user_id)
 
-    # Try linking
+    # Linking flow
     link_result = _maybe_link_from_message("telegram", text)
     if link_result:
         send_telegram_text(tg_chat_id, "✅ Linked successfully. You can now use the service.")
@@ -176,7 +170,7 @@ def telegram_inbound():
     # Normal question flow
     resp = ask_guarded({"account_id": account["id"], "question": text})
 
-    # Send answer back to Telegram (best effort)
+    # Reply to Telegram
     answer = ""
     if isinstance(resp, dict):
         answer = (resp.get("answer") or resp.get("message") or "").strip()
