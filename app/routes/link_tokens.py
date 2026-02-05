@@ -1,6 +1,7 @@
 from flask import Blueprint, jsonify, request
 import os
 import re
+import uuid
 from app.core.supabase_client import supabase
 
 bp = Blueprint("link_tokens", __name__)
@@ -11,8 +12,35 @@ CODE_RE = re.compile(r"^[A-Z0-9]{6,12}$")
 def _bad(msg: str, status: int = 400):
     return jsonify({"ok": False, "error": msg}), status
 
+def _is_uuid(value: str) -> bool:
+    try:
+        uuid.UUID(str(value))
+        return True
+    except Exception:
+        return False
+
 @bp.post("/link-tokens/create")
 def create_link_token_api():
+    """
+    Admin creates a link token for a specific auth_user_id.
+
+    Headers:
+      X-Admin-Key: <ADMIN_API_KEY>
+
+    Body:
+      {
+        "provider": "wa" | "tg",
+        "ttl_minutes": 30,
+        "auth_user_id": "<uuid>"
+      }
+
+    Calls Supabase RPC:
+      public.create_link_token(p_provider text, p_auth_user_id uuid, p_ttl_minutes integer)
+
+    NOTE:
+      We DO NOT call create_link_token_admin() here because backend requests
+      are not authenticated with a Supabase user JWT (auth.uid() would be null).
+    """
     admin_key = (request.headers.get("X-Admin-Key") or "").strip()
     if not ADMIN_API_KEY or admin_key != ADMIN_API_KEY:
         return _bad("Unauthorized", 401)
@@ -20,15 +48,21 @@ def create_link_token_api():
     body = request.get_json(silent=True) or {}
     provider = (body.get("provider") or "").strip().lower()
     ttl_minutes = int(body.get("ttl_minutes") or 30)
+    auth_user_id = (body.get("auth_user_id") or "").strip()
 
     if provider not in ("wa", "tg"):
         return _bad("provider must be wa or tg")
     if ttl_minutes < 5 or ttl_minutes > 1440:
         return _bad("ttl_minutes must be between 5 and 1440")
+    if not auth_user_id:
+        return _bad("auth_user_id required (uuid)")
+    if not _is_uuid(auth_user_id):
+        return _bad("auth_user_id must be a valid uuid")
 
     try:
-        res = supabase().rpc("create_link_token_admin", {
+        res = supabase().rpc("create_link_token", {
             "p_provider": provider,
+            "p_auth_user_id": auth_user_id,
             "p_ttl_minutes": ttl_minutes
         }).execute()
     except Exception as e:
@@ -48,6 +82,19 @@ def create_link_token_api():
 
 @bp.post("/link-tokens/consume")
 def consume_link_token_api():
+    """
+    Public consumption of a link token.
+
+    Body:
+      {
+        "provider": "wa" | "tg",
+        "code": "FF7F134F",
+        "provider_user_id": "2348012345678"
+      }
+
+    Calls Supabase RPC:
+      public.consume_link_token(p_provider text, p_code text, p_provider_user_id text)
+    """
     body = request.get_json(silent=True) or {}
     provider = (body.get("provider") or "").strip().lower()
     code = (body.get("code") or "").strip().upper()
@@ -71,6 +118,7 @@ def consume_link_token_api():
 
     row = (res.data or [None])[0]
     if not row or not row.get("ok"):
+        # Don't leak whether a code exists vs expired vs wrong provider
         return jsonify({"ok": False, "provider": provider, "message": "Invalid or expired code"}), 400
 
     return jsonify({
