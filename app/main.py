@@ -15,3 +15,10 @@ def handle_any(err):
         return jsonify({"ok": False, "error": err.name}), err.code
     logging.exception("Unhandled error: %s", err)
     return jsonify({"ok": False, "error": "Internal Server Error"}), 500
+
+@app.get("/api/_routes")
+def list_routes():
+    out = []
+    for r in sorted(app.url_map.iter_rules(), key=lambda x: str(x)):
+        out.append({"rule": str(r), "methods": sorted(list(r.methods or []))})
+    return {"ok": True, "routes": out}
