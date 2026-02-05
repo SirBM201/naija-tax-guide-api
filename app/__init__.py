@@ -10,6 +10,7 @@ from app.routes.subscriptions import bp as subs_bp
 from app.routes.ask import bp as ask_bp
 from app.routes.webhooks import bp as webhooks_bp
 from app.routes.plans import bp as plans_bp
+from app.routes.link_tokens import bp as link_tokens_bp
 
 # Paystack
 from app.routes.paystack import paystack_bp
@@ -44,7 +45,8 @@ def create_app() -> Flask:
     app.register_blueprint(ask_bp, url_prefix=api_prefix)
     app.register_blueprint(webhooks_bp, url_prefix=api_prefix)
     app.register_blueprint(plans_bp, url_prefix=api_prefix)
-
+    app.register_blueprint(link_tokens_bp)
+    
     # Paystack routes
     app.register_blueprint(paystack_bp, url_prefix=api_prefix)
     app.register_blueprint(paystack_webhook_bp, url_prefix=api_prefix)
