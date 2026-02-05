@@ -9,25 +9,14 @@ def upsert_account(
     display_name: Optional[str] = None,
     phone: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Expected Supabase table: accounts
-      - id (uuid, pk)
-      - provider (text)
-      - provider_user_id (text)
-      - display_name (text, nullable)
-      - phone (text, nullable)
-      - created_at (timestamptz)
-      - updated_at (timestamptz)
+    db = supabase()
 
-    Unique constraint recommended on (provider, provider_user_id)
-    """
     provider = (provider or "").strip().lower()
     provider_user_id = (provider_user_id or "").strip()
 
-    if not provider or not provider_user_id:
-        raise ValueError("provider and provider_user_id are required")
-
-    db = supabase()
+    # normalize provider used in DB
+    if provider == "whatsapp":
+        provider = "wa"
 
     # Try fetch
     got = (
@@ -39,29 +28,21 @@ def upsert_account(
         .execute()
     )
 
-    if getattr(got, "data", None):
+    if got.data:
         row = got.data[0]
+        updates = {}
 
-        # Optional update fields (non-destructive)
-        updates: Dict[str, Any] = {}
         if display_name and (row.get("display_name") != display_name):
             updates["display_name"] = display_name
         if phone and (row.get("phone") != phone):
             updates["phone"] = phone
 
         if updates:
-            upd = (
-                db.table("accounts")
-                .update(updates)
-                .eq("id", row["id"])
-                .execute()
-            )
-            if getattr(upd, "data", None):
+            upd = db.table("accounts").update(updates).eq("id", row["id"]).execute()
+            if upd.data:
                 row = upd.data[0]
-
         return row
 
-    # Insert
     ins = (
         db.table("accounts")
         .insert(
@@ -74,8 +55,4 @@ def upsert_account(
         )
         .execute()
     )
-
-    if not getattr(ins, "data", None):
-        raise RuntimeError("Failed to create account")
-
     return ins.data[0]
