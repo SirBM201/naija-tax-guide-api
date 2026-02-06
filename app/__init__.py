@@ -15,6 +15,7 @@ from app.routes.whatsapp import bp as whatsapp_bp
 from app.routes.telegram import bp as telegram_bp  # if you created it
 from app.routes.admin_link_tokens import bp as admin_link_tokens_bp
 from app.routes.debug_routes import bp as debug_routes_bp
+from app.routes.accounts_admin import bp as accounts_admin_bp
 
 # Paystack
 from app.routes.paystack import paystack_bp
@@ -54,6 +55,7 @@ def create_app() -> Flask:
     app.register_blueprint(telegram_bp, url_prefix="/api")
     app.register_blueprint(admin_link_tokens_bp, url_prefix="/api")
     app.register_blueprint(debug_routes_bp, url_prefix="/api")
+    app.register_blueprint(accounts_admin_bp, url_prefix="/api")
     
     # Paystack routes
     app.register_blueprint(paystack_bp, url_prefix=api_prefix)
