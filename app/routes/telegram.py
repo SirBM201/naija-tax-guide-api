@@ -1,3 +1,4 @@
+# app/routes/telegram.py
 from __future__ import annotations
 
 import os
@@ -41,18 +42,16 @@ def telegram_webhook():
     ).strip() or None
     username = (from_user.get("username") or "").strip() or None
 
-    # Always ACK 200 to Telegram
     if not chat_id or not tg_user_id:
         return jsonify({"ok": True})
 
     code = extract_code(text)
 
     if not code:
-        # Basic guide message (no spam)
         if text.lower().startswith("/start"):
             _tg_send(
                 chat_id,
-                f"Welcome 👋\n\nTo link your Telegram to your Naija Tax Guide account, send your 6–12 character code.\n\nExample:\n/start ABC12345",
+                "Welcome 👋\n\nTo link Telegram, send your 6–12 character code.\n\nExample:\nABC12345\n(or /start ABC12345)",
             )
         return jsonify({"ok": True})
 
@@ -67,14 +66,8 @@ def telegram_webhook():
     )
 
     if result.get("ok"):
-        _tg_send(
-            chat_id,
-            "✅ Linked successfully!\n\nYour Telegram is now connected to your Naija Tax Guide account.",
-        )
+        _tg_send(chat_id, "✅ Linked successfully!\n\nYour Telegram is now connected to your Naija Tax Guide account.")
     else:
-        _tg_send(
-            chat_id,
-            "❌ Link failed.\n\nYour code is invalid or expired. Please generate a new code from your dashboard and try again.",
-        )
+        _tg_send(chat_id, "❌ Link failed.\n\nInvalid/expired code OR already used. Generate a new code and try again.")
 
     return jsonify({"ok": True})
