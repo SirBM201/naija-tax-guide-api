@@ -1,3 +1,4 @@
+# app/routes/accounts.py
 from __future__ import annotations
 
 from flask import Blueprint, jsonify, request
@@ -55,7 +56,7 @@ def account_lookup_get():
         return _bad(res.get("error") or "Lookup failed")
 
     auth_user_id = res.get("auth_user_id")
-    plan_status = get_plan_status(auth_user_id) if auth_user_id else {"known": False, "is_active": False}
+    plan_status = get_plan_status(auth_user_id) if auth_user_id else {"ok": True, "known": False, "is_active": False}
 
     return jsonify(
         {
@@ -91,7 +92,7 @@ def account_lookup_post():
         return _bad(res.get("error") or "Lookup failed")
 
     auth_user_id = res.get("auth_user_id")
-    plan_status = get_plan_status(auth_user_id) if auth_user_id else {"known": False, "is_active": False}
+    plan_status = get_plan_status(auth_user_id) if auth_user_id else {"ok": True, "known": False, "is_active": False}
 
     return jsonify(
         {
