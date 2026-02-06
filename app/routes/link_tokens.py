@@ -25,6 +25,11 @@ def _is_uuid(value: str) -> bool:
         return False
 
 
+@bp.get("/link-tokens/health")
+def link_tokens_health():
+    return jsonify({"ok": True, "service": "link_tokens"})
+
+
 @bp.post("/link-tokens/create")
 def create_link_token_api():
     admin_key = (request.headers.get("X-Admin-Key") or "").strip()
@@ -35,7 +40,7 @@ def create_link_token_api():
     provider = (body.get("provider") or "").strip().lower()
     ttl_minutes = int(body.get("ttl_minutes") or 30)
 
-    # IMPORTANT: request field is auth_user_id (what you used successfully)
+    # request field is auth_user_id
     auth_user_id = (body.get("auth_user_id") or "").strip()
 
     if provider not in ("wa", "tg"):
