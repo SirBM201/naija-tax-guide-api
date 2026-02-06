@@ -1,49 +1,17 @@
 # app/services/channel_linking_service.py
 from __future__ import annotations
 
-import os
 import re
-import time
 from typing import Optional, Dict, Any
 
 from app.core.supabase_client import supabase
 from app.services.accounts_service import upsert_account_link
 
-# 6–12 alphanumeric (accept lowercase too, normalize to upper)
-CODE_RE = re.compile(r"\b([A-Z0-9]{6,12})\b", re.IGNORECASE)
-
-# simple in-memory rate limiting (per instance)
-# NOTE: On Koyeb (multi-instance), this is best-effort. Still very useful.
-_RATE_BUCKET: Dict[str, list[float]] = {}
-RATE_WINDOW_SEC = int(os.getenv("LINK_RATE_WINDOW_SEC", "60").strip() or "60")      # 60s
-RATE_MAX_ATTEMPTS = int(os.getenv("LINK_RATE_MAX_ATTEMPTS", "6").strip() or "6")   # 6 per 60s
-
-
-def _rate_key(provider: str, provider_user_id: str) -> str:
-    return f"{provider}:{provider_user_id}"
-
-
-def _rate_allow(key: str) -> bool:
-    now = time.time()
-    arr = _RATE_BUCKET.get(key) or []
-    # keep only recent
-    arr = [t for t in arr if now - t <= RATE_WINDOW_SEC]
-    if len(arr) >= RATE_MAX_ATTEMPTS:
-        _RATE_BUCKET[key] = arr
-        return False
-    arr.append(now)
-    _RATE_BUCKET[key] = arr
-    return True
+# 8 chars, NON-ambiguous: 23456789 + A-HJ-NP-Z (no I, O)
+CODE_RE = re.compile(r"\b([2-9A-HJ-NP-Z]{8})\b", re.IGNORECASE)
 
 
 def extract_code(text: str) -> Optional[str]:
-    """
-    Extracts the first 6–12 alphanumeric token from user text.
-    Works with:
-      - "ABC12345"
-      - "/start ABC12345"
-      - "my code is abc12345"
-    """
     t = (text or "").strip()
     if not t:
         return None
@@ -61,36 +29,24 @@ def consume_and_link(
     display_name: Optional[str] = None,
     phone: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    1) consume_link_token RPC
-    2) link channel to auth_user_id in accounts table (safe guard against overwrite)
-    Adds:
-      - best-effort rate limiting per provider_user_id
-    """
     provider = (provider or "").strip().lower()
     code = (code or "").strip().upper()
     provider_user_id = (provider_user_id or "").strip()
 
-    if provider not in ("wa", "tg"):
-        return {"ok": False, "error": "provider must be wa or tg"}
+    if provider not in ("wa", "tg", "msgr", "ig", "email"):
+        return {"ok": False, "error": "provider_not_supported"}
     if not code:
-        return {"ok": False, "error": "code required"}
+        return {"ok": False, "error": "code_required"}
     if not provider_user_id:
-        return {"ok": False, "error": "provider_user_id required"}
+        return {"ok": False, "error": "provider_user_id_required"}
 
-    # Rate limit
-    rk = _rate_key(provider, provider_user_id)
-    if not _rate_allow(rk):
-        return {"ok": False, "error": "rate_limited"}
-
-    # 1) consume via RPC
     try:
         res = supabase().rpc(
             "consume_link_token",
             {"p_provider": provider, "p_code": code, "p_provider_user_id": provider_user_id},
         ).execute()
     except Exception as e:
-        return {"ok": False, "error": f"RPC error: {str(e)}"}
+        return {"ok": False, "error": f"rpc_error:{str(e)}"}
 
     row = (res.data or [None])[0]
     if not row or not row.get("ok"):
@@ -98,9 +54,8 @@ def consume_and_link(
 
     auth_user_id = row.get("auth_user_id")
     if not auth_user_id:
-        return {"ok": False, "error": "consume_link_token_missing_auth_user_id"}
+        return {"ok": False, "error": "consume_missing_auth_user_id"}
 
-    # 2) link account mapping safely
     link = upsert_account_link(
         provider=provider,
         provider_user_id=provider_user_id,
@@ -109,12 +64,7 @@ def consume_and_link(
         phone=phone,
     )
     if not link.get("ok"):
-        # Most important case: channel already linked to another user
-        return {
-            "ok": False,
-            "error": link.get("error") or "failed_to_link",
-            "reason": link.get("reason"),
-        }
+        return {"ok": False, "error": link.get("error") or "failed_to_link", "reason": link.get("reason")}
 
     return {
         "ok": True,
