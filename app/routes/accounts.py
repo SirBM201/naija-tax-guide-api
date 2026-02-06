@@ -1,49 +1,99 @@
+from __future__ import annotations
+
 from flask import Blueprint, jsonify, request
-from app.services.accounts_service import upsert_account
+
+from app.services.accounts_service import upsert_account, lookup_account
 
 bp = Blueprint("accounts", __name__)
+
+
+def _bad(msg: str, status: int = 400):
+    return jsonify({"ok": False, "error": msg}), status
 
 
 @bp.post("/accounts")
 def create_or_get_account():
     """
-    Create or update an account row by provider identity.
-
+    Create or update an account shell (pre-link).
     Body:
       {
         "provider": "wa" | "tg",
         "provider_user_id": "<string>",
         "display_name": "<optional>",
-        "phone": "<optional>",
-        "auth_user_id": "<optional uuid>"
+        "phone": "<optional>"
       }
-
-    Notes:
-    - If auth_user_id is provided, it will link provider_user_id to that auth user.
-    - If auth_user_id is omitted, it will upsert without linking (legacy behavior).
     """
     body = request.get_json(silent=True) or {}
     provider = (body.get("provider") or "").strip().lower()
     provider_user_id = (body.get("provider_user_id") or "").strip()
-    display_name = body.get("display_name")
-    phone = body.get("phone")
-    auth_user_id = (body.get("auth_user_id") or "").strip() or None
+    display_name = (body.get("display_name") or "").strip() or None
+    phone = (body.get("phone") or "").strip() or None
 
-    if provider not in ("wa", "tg"):
-        return jsonify({"ok": False, "error": "provider must be wa or tg"}), 400
-    if not provider_user_id:
-        return jsonify({"ok": False, "error": "provider_user_id required"}), 400
+    res = upsert_account(
+        provider=provider,
+        provider_user_id=provider_user_id,
+        display_name=display_name,
+        phone=phone,
+    )
+    if not res.get("ok"):
+        return _bad(res.get("error") or "Failed")
 
-    try:
-        result = upsert_account(
-            provider=provider,
-            provider_user_id=provider_user_id,
-            display_name=display_name,
-            phone=phone,
-            auth_user_id=auth_user_id,
-        )
-    except Exception as e:
-        return jsonify({"ok": False, "error": f"Failed: {str(e)}"}), 500
+    return jsonify({"ok": True, "account": res.get("account")})
 
-    status = 200 if result.get("ok") else 400
-    return jsonify(result), status
+
+@bp.get("/accounts/lookup")
+def account_lookup_get():
+    """
+    GET /api/accounts/lookup?provider=wa&provider_user_id=234...
+    Returns auth mapping if linked.
+    """
+    provider = (request.args.get("provider") or "").strip().lower()
+    provider_user_id = (request.args.get("provider_user_id") or "").strip()
+
+    res = lookup_account(provider=provider, provider_user_id=provider_user_id)
+    if not res.get("ok"):
+        return _bad(res.get("error") or "Lookup failed")
+
+    # Standard response
+    return jsonify(
+        {
+            "ok": True,
+            "provider": provider,
+            "provider_user_id": provider_user_id,
+            "found": res.get("found", False),
+            "linked": res.get("linked", False),
+            "auth_user_id": res.get("auth_user_id"),
+            "account": res.get("account"),
+        }
+    )
+
+
+@bp.post("/accounts/lookup")
+def account_lookup_post():
+    """
+    POST /api/accounts/lookup
+    Body:
+      {
+        "provider": "wa" | "tg",
+        "provider_user_id": "<string>"
+      }
+    """
+    body = request.get_json(silent=True) or {}
+    provider = (body.get("provider") or "").strip().lower()
+    provider_user_id = (body.get("provider_user_id") or "").strip()
+
+    res = lookup_account(provider=provider, provider_user_id=provider_user_id)
+    if not res.get("ok"):
+        return _bad(res.get("error") or "Lookup failed")
+
+    return jsonify(
+        {
+            "ok": True,
+            "provider": provider,
+            "provider_user_id": provider_user_id,
+            "found": res.get("found", False),
+            "linked": res.get("linked", False),
+            "auth_user_id": res.get("auth_user_id"),
+            "account": res.get("account"),
+        }
+    )
