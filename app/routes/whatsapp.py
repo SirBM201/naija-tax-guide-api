@@ -6,106 +6,111 @@ import logging
 import requests
 from flask import Blueprint, request, jsonify
 
-from app.services.channel_linking_service import extract_code, consume_and_link
+from app.services.accounts_service import upsert_account, lookup_account
 
 bp = Blueprint("whatsapp", __name__)
 
-WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "naija-tax-guide-verify").strip()
-WHATSAPP_ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "").strip()
-WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "").strip()
+WA_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "").strip()
+WA_ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "").strip()
+WA_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "").strip()
 
-log = logging.getLogger(__name__)
+API_BASE = f"https://graph.facebook.com/v20.0/{WA_PHONE_NUMBER_ID}/messages"
 
 
-def _wa_send_text(to: str, text: str) -> None:
-    if not WHATSAPP_ACCESS_TOKEN or not WHATSAPP_PHONE_NUMBER_ID:
-        log.warning("WHATSAPP_ACCESS_TOKEN / WHATSAPP_PHONE_NUMBER_ID not set; cannot send reply")
+def _wa_send_text(to_phone: str, text: str) -> None:
+    if not (WA_ACCESS_TOKEN and WA_PHONE_NUMBER_ID):
+        logging.warning("WhatsApp env not set (WHATSAPP_ACCESS_TOKEN/WHATSAPP_PHONE_NUMBER_ID)")
         return
 
-    url = f"https://graph.facebook.com/v19.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
-    headers = {"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}", "Content-Type": "application/json"}
-    payload = {"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": text}}
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to_phone,
+        "type": "text",
+        "text": {"preview_url": False, "body": text},
+    }
+    headers = {
+        "Authorization": f"Bearer {WA_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
 
     try:
-        requests.post(url, headers=headers, json=payload, timeout=10)
+        r = requests.post(API_BASE, json=payload, headers=headers, timeout=15)
+        if r.status_code >= 300:
+            logging.warning("WA send failed: %s %s", r.status_code, r.text)
     except Exception as e:
-        log.warning("Failed to send WA message: %s", e)
+        logging.exception("WA send exception: %s", e)
 
 
 @bp.get("/whatsapp/webhook")
-def whatsapp_verify():
-    mode = (request.args.get("hub.mode") or "").strip()
-    token = (request.args.get("hub.verify_token") or "").strip()
+def wa_webhook_verify():
+    """
+    Meta webhook verification:
+    GET ?hub.mode=subscribe&hub.verify_token=...&hub.challenge=...
+    """
+    mode = request.args.get("hub.mode")
+    token = request.args.get("hub.verify_token")
     challenge = request.args.get("hub.challenge")
 
-    if mode == "subscribe" and token == WHATSAPP_VERIFY_TOKEN and challenge is not None:
-        return str(challenge), 200
-
-    return jsonify({"ok": False, "error": "Verification failed"}), 403
+    if mode == "subscribe" and token and WA_VERIFY_TOKEN and token == WA_VERIFY_TOKEN:
+        return (challenge or ""), 200
+    return "Forbidden", 403
 
 
 @bp.post("/whatsapp/webhook")
-def whatsapp_webhook():
-    payload = request.get_json(silent=True) or {}
+def wa_webhook_receive():
+    """
+    Receives WhatsApp messages.
+    - creates/updates account shell
+    - if not linked, asks user to link by sending the 8-char code
+    - if linked, you can forward to your /ask endpoint later
+    """
+    body = request.get_json(silent=True) or {}
 
     try:
-        entry = (payload.get("entry") or [None])[0] or {}
+        entry = (body.get("entry") or [None])[0] or {}
         changes = (entry.get("changes") or [None])[0] or {}
         value = changes.get("value") or {}
-
         messages = value.get("messages") or []
         if not messages:
-            return jsonify({"ok": True})
+            return jsonify({"ok": True, "ignored": True})
 
         msg = messages[0]
-        from_id = (msg.get("from") or "").strip()
-        mtype = (msg.get("type") or "").strip()
-
+        from_phone = (msg.get("from") or "").strip()  # sender WA id (phone)
+        msg_type = msg.get("type")
         text = ""
-        if mtype == "text":
+        if msg_type == "text":
             text = ((msg.get("text") or {}).get("body") or "").strip()
 
-        contacts = value.get("contacts") or []
-        display_name = None
-        if contacts:
-            profile = (contacts[0].get("profile") or {})
-            display_name = (profile.get("name") or "").strip() or None
-
-        if not from_id:
-            return jsonify({"ok": True})
-
-        code = extract_code(text)
-
-        # If no valid code, guide the user
-        if not code:
-            low = (text or "").lower()
-            if "link" in low or "code" in low or "start" in low or low.strip() == "":
-                _wa_send_text(
-                    from_id,
-                    "To link your WhatsApp, send your 8-character code here.\nExample: 7K3M9Q2H",
-                )
-            return jsonify({"ok": True})
-
-        result = consume_and_link(
+        # create/update account shell
+        upsert_account(
             provider="wa",
-            code=code,
-            provider_user_id=from_id,
-            display_name=display_name,
-            phone=from_id,
+            provider_user_id=from_phone,
+            display_name=None,
+            phone=from_phone,
         )
 
-        if result.get("ok"):
-            _wa_send_text(from_id, "✅ Linked successfully!\nYour WhatsApp is now connected to your Naija Tax Guide account.")
-        else:
-            # show specific reason if available
-            reason = result.get("error") or "invalid_or_expired_code"
-            _wa_send_text(
-                from_id,
-                f"❌ Link failed.\nReason: {reason}\nGenerate a NEW code and try again.",
-            )
+        # lookup link status
+        lk = lookup_account(provider="wa", provider_user_id=from_phone)
+        if not lk.get("ok"):
+            _wa_send_text(from_phone, "System error. Please try again.")
+            return jsonify({"ok": True})
 
-        return jsonify({"ok": True})
+        if not lk.get("linked"):
+            _wa_send_text(
+                from_phone,
+                "Your WhatsApp is not linked yet.\n"
+                "Please login on the website and generate your LINK CODE, then reply here with the 8-character code.\n"
+                "Example: 7K9M2H8P",
+            )
+            return jsonify({"ok": True, "linked": False})
+
+        # If user sends a code, you can call /api/link-tokens/consume from frontend.
+        # For now, just acknowledge (you can wire /ask later).
+        if text:
+            _wa_send_text(from_phone, f"Received: {text}\n(Linked ✅)")
+
+        return jsonify({"ok": True, "linked": True})
 
     except Exception as e:
-        log.exception("WA webhook error: %s", e)
-        return jsonify({"ok": True})
+        logging.exception("WA webhook error: %s", e)
+        return jsonify({"ok": True})  # don't make Meta retry forever
