@@ -11,9 +11,11 @@ bp = Blueprint("link_tokens", __name__)
 
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
 
-# Non-ambiguous: 23456789 + A..Z without I,O,L
-CODE_RE = re.compile(r"^[23456789ABCDEFGHJKMNPQRSTUVWXYZ]{8}$")
+# Non-ambiguous, uppercase letters + digits (no spaces). We generate 8 by default.
+# Accept 6-12 so old tokens still work if any exist.
+CODE_RE = re.compile(r"^[A-Z0-9]{6,12}$")
 
+# Omni-channel providers (web is NOT linked by token; it’s your site login)
 ALLOWED_PROVIDERS = ("wa", "tg", "msgr", "ig", "email")
 
 
@@ -43,6 +45,8 @@ def create_link_token_api():
     body = request.get_json(silent=True) or {}
     provider = (body.get("provider") or "").strip().lower()
     ttl_minutes = int(body.get("ttl_minutes") or 30)
+
+    # required field
     auth_user_id = (body.get("auth_user_id") or "").strip()
 
     if provider not in ALLOWED_PROVIDERS:
@@ -57,7 +61,11 @@ def create_link_token_api():
     try:
         res = supabase().rpc(
             "create_link_token",
-            {"p_provider": provider, "p_auth_user_id": auth_user_id, "p_ttl_minutes": ttl_minutes},
+            {
+                "p_provider": provider,
+                "p_auth_user_id": auth_user_id,
+                "p_ttl_minutes": ttl_minutes,
+            },
         ).execute()
     except Exception as e:
         return _bad(f"RPC error: {str(e)}", 500)
@@ -80,7 +88,7 @@ def create_link_token_api():
 @bp.post("/link-tokens/consume")
 def consume_link_token_api():
     """
-    Consumes token (RPC) then links account mapping (safe).
+    Consumes token (RPC) then links account mapping.
     """
     body = request.get_json(silent=True) or {}
     provider = (body.get("provider") or "").strip().lower()
@@ -93,22 +101,25 @@ def consume_link_token_api():
     if provider not in ALLOWED_PROVIDERS:
         return _bad(f"provider must be one of {ALLOWED_PROVIDERS}")
     if not code or not CODE_RE.match(code):
-        return _bad("Invalid code format (must be 8 chars non-ambiguous)")
+        return _bad("Invalid code format")
     if not provider_user_id:
         return _bad("provider_user_id required")
 
     try:
         res = supabase().rpc(
             "consume_link_token",
-            {"p_provider": provider, "p_code": code, "p_provider_user_id": provider_user_id},
+            {
+                "p_provider": provider,
+                "p_code": code,
+                "p_provider_user_id": provider_user_id,
+            },
         ).execute()
     except Exception as e:
         return _bad(f"RPC error: {str(e)}", 500)
 
     row = (res.data or [None])[0]
     if not row or not row.get("ok"):
-        msg = (row or {}).get("message") if isinstance(row, dict) else None
-        return jsonify({"ok": False, "provider": provider, "message": msg or "Invalid or expired code"}), 400
+        return jsonify({"ok": False, "provider": provider, "message": "Invalid or expired code"}), 400
 
     auth_user_id = row.get("auth_user_id")
     token_id = row.get("token_id")
@@ -126,14 +137,17 @@ def consume_link_token_api():
     )
 
     if not link.get("ok"):
-        return jsonify(
-            {
-                "ok": False,
-                "provider": provider,
-                "message": link.get("error") or "Failed to link channel",
-                "reason": link.get("reason"),
-            }
-        ), 409
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "provider": provider,
+                    "message": link.get("error") or "Failed to link channel",
+                    "reason": link.get("reason"),
+                }
+            ),
+            409,
+        )
 
     return jsonify(
         {
