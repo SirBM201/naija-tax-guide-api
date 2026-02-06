@@ -46,7 +46,7 @@ def create_or_get_account():
 def account_lookup_get():
     """
     GET /api/accounts/lookup?provider=wa&provider_user_id=234...
-    Returns auth mapping if linked + plan status.
+    Returns auth mapping if linked + plan_status.
     """
     provider = (request.args.get("provider") or "").strip().lower()
     provider_user_id = (request.args.get("provider_user_id") or "").strip()
@@ -56,7 +56,9 @@ def account_lookup_get():
         return _bad(res.get("error") or "Lookup failed")
 
     auth_user_id = res.get("auth_user_id")
-    plan_status = get_plan_status(auth_user_id) if auth_user_id else {"ok": True, "known": False, "is_active": False}
+    plan_status = get_plan_status(auth_user_id) if auth_user_id else {
+        "ok": True, "known": False, "is_active": False, "plan": None, "status": None, "plan_expiry": None
+    }
 
     return jsonify(
         {
@@ -81,7 +83,7 @@ def account_lookup_post():
         "provider": "wa" | "tg",
         "provider_user_id": "<string>"
       }
-    Returns auth mapping if linked + plan status.
+    Returns auth mapping if linked + plan_status.
     """
     body = request.get_json(silent=True) or {}
     provider = (body.get("provider") or "").strip().lower()
@@ -92,7 +94,9 @@ def account_lookup_post():
         return _bad(res.get("error") or "Lookup failed")
 
     auth_user_id = res.get("auth_user_id")
-    plan_status = get_plan_status(auth_user_id) if auth_user_id else {"ok": True, "known": False, "is_active": False}
+    plan_status = get_plan_status(auth_user_id) if auth_user_id else {
+        "ok": True, "known": False, "is_active": False, "plan": None, "status": None, "plan_expiry": None
+    }
 
     return jsonify(
         {
