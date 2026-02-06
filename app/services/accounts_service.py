@@ -1,5 +1,56 @@
+from __future__ import annotations
+
 from typing import Optional, Dict, Any
+from datetime import datetime, timezone
+
 from app.core.supabase_client import supabase
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def upsert_account(
+    *,
+    provider: str,
+    provider_user_id: str,
+    display_name: Optional[str] = None,
+    phone: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Creates or updates an account row WITHOUT auth_user_id (pre-link state).
+    Used when a message arrives before linking.
+    """
+    provider = (provider or "").strip().lower()
+    provider_user_id = (provider_user_id or "").strip()
+
+    if provider not in ("wa", "tg"):
+        return {"ok": False, "error": "provider must be wa or tg"}
+    if not provider_user_id:
+        return {"ok": False, "error": "provider_user_id required"}
+
+    payload = {
+        "provider": provider,
+        "provider_user_id": provider_user_id,
+        "display_name": display_name,
+        "phone": phone,
+        "updated_at": _now_iso(),
+    }
+
+    try:
+        # NOTE: requires a UNIQUE constraint on (provider, provider_user_id)
+        res = (
+            supabase()
+            .table("accounts")
+            .upsert(payload, on_conflict="provider,provider_user_id")
+            .select("*")
+            .execute()
+        )
+    except Exception as e:
+        return {"ok": False, "error": f"DB error: {str(e)}"}
+
+    row = (res.data or [None])[0]
+    return {"ok": True, "account": row}
 
 
 def upsert_account_link(
@@ -11,116 +62,83 @@ def upsert_account_link(
     phone: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Ensures provider_user_id is linked to auth_user_id.
-    Multi-channel supported: same auth_user_id can link multiple providers.
-    Safety:
-      - A provider_user_id cannot be linked to two different auth users.
+    Upserts an account row AND binds it to auth_user_id (linked state).
+    Called after consume_link_token succeeds.
     """
     provider = (provider or "").strip().lower()
     provider_user_id = (provider_user_id or "").strip()
     auth_user_id = (auth_user_id or "").strip()
 
-    if not provider or not provider_user_id or not auth_user_id:
-        return {"ok": False, "error": "provider/provider_user_id/auth_user_id required"}
+    if provider not in ("wa", "tg"):
+        return {"ok": False, "error": "provider must be wa or tg"}
+    if not provider_user_id:
+        return {"ok": False, "error": "provider_user_id required"}
+    if not auth_user_id:
+        return {"ok": False, "error": "auth_user_id required"}
 
-    # 1) Does this provider_user_id already exist?
-    existing = (
-        supabase()
-        .table("accounts")
-        .select("id, provider, provider_user_id, auth_user_id, display_name, phone")
-        .eq("provider", provider)
-        .eq("provider_user_id", provider_user_id)
-        .limit(1)
-        .execute()
-    )
-
-    row = (existing.data or [None])[0]
-
-    # 2) If already linked to a DIFFERENT auth_user_id => block
-    if row and row.get("auth_user_id") and row.get("auth_user_id") != auth_user_id:
-        return {
-            "ok": False,
-            "error": "This channel is already linked to another account.",
-            "reason": "channel_already_linked",
-        }
-
-    payload: Dict[str, Any] = {
+    payload = {
         "provider": provider,
         "provider_user_id": provider_user_id,
         "auth_user_id": auth_user_id,
+        "display_name": display_name,
+        "phone": phone,
+        "updated_at": _now_iso(),
     }
-    if display_name is not None:
-        payload["display_name"] = display_name
-    if phone is not None:
-        payload["phone"] = phone
 
-    # 3) Upsert on (provider, provider_user_id)
-    # IMPORTANT: Your DB should have a unique constraint on (provider, provider_user_id)
-    res = (
-        supabase()
-        .table("accounts")
-        .upsert(payload, on_conflict="provider,provider_user_id")
-        .select("*")
-        .execute()
-    )
+    try:
+        # NOTE: requires a UNIQUE constraint on (provider, provider_user_id)
+        res = (
+            supabase()
+            .table("accounts")
+            .upsert(payload, on_conflict="provider,provider_user_id")
+            .select("*")
+            .execute()
+        )
+    except Exception as e:
+        return {"ok": False, "error": f"DB error: {str(e)}"}
 
-    saved = (res.data or [None])[0]
-    if not saved:
-        return {"ok": False, "error": "Failed to link channel"}
-
-    return {"ok": True, "account": saved}
+    row = (res.data or [None])[0]
+    return {"ok": True, "account": row}
 
 
-# -------------------------------------------------------------------
-# BACKWARD COMPATIBILITY (to stop ImportError in app/routes/accounts.py)
-# -------------------------------------------------------------------
-def upsert_account(
+def lookup_account(
     *,
     provider: str,
     provider_user_id: str,
-    display_name: Optional[str] = None,
-    phone: Optional[str] = None,
-    auth_user_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Compatibility wrapper for older code expecting upsert_account().
-    If auth_user_id is provided: do a real link.
-    If auth_user_id is missing: create/update a record without linking (not recommended),
-    but keeps the endpoint usable.
+    Returns mapping from (provider, provider_user_id) -> auth_user_id (if linked)
     """
     provider = (provider or "").strip().lower()
     provider_user_id = (provider_user_id or "").strip()
 
-    if not provider or not provider_user_id:
-        return {"ok": False, "error": "provider and provider_user_id required"}
+    if provider not in ("wa", "tg"):
+        return {"ok": False, "error": "provider must be wa or tg"}
+    if not provider_user_id:
+        return {"ok": False, "error": "provider_user_id required"}
 
-    # If auth_user_id exists -> use the strict safe linker
-    if auth_user_id:
-        return upsert_account_link(
-            provider=provider,
-            provider_user_id=provider_user_id,
-            auth_user_id=auth_user_id,
-            display_name=display_name,
-            phone=phone,
+    try:
+        res = (
+            supabase()
+            .table("accounts")
+            .select("provider,provider_user_id,auth_user_id,display_name,phone,updated_at,created_at")
+            .eq("provider", provider)
+            .eq("provider_user_id", provider_user_id)
+            .limit(1)
+            .execute()
         )
+    except Exception as e:
+        return {"ok": False, "error": f"DB error: {str(e)}"}
 
-    # Fallback: upsert without auth_user_id (keeps legacy flows alive)
-    payload: Dict[str, Any] = {"provider": provider, "provider_user_id": provider_user_id}
-    if display_name is not None:
-        payload["display_name"] = display_name
-    if phone is not None:
-        payload["phone"] = phone
+    row = (res.data or [None])[0]
+    if not row:
+        return {"ok": True, "found": False, "linked": False, "account": None}
 
-    res = (
-        supabase()
-        .table("accounts")
-        .upsert(payload, on_conflict="provider,provider_user_id")
-        .select("*")
-        .execute()
-    )
-
-    saved = (res.data or [None])[0]
-    if not saved:
-        return {"ok": False, "error": "Failed to upsert account"}
-
-    return {"ok": True, "account": saved}
+    auth_user_id = row.get("auth_user_id")
+    return {
+        "ok": True,
+        "found": True,
+        "linked": bool(auth_user_id),
+        "auth_user_id": auth_user_id,
+        "account": row,
+    }
