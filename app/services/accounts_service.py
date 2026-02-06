@@ -76,6 +76,49 @@ def upsert_account(
     return {"ok": True, "account": row}
 
 
+def lookup_account(
+    *,
+    provider: str,
+    provider_user_id: str,
+) -> Dict[str, Any]:
+    """
+    Returns mapping from (provider, provider_user_id) -> auth_user_id (if linked)
+    """
+    provider = (provider or "").strip().lower()
+    provider_user_id = (provider_user_id or "").strip()
+
+    if provider not in ("wa", "tg"):
+        return {"ok": False, "error": "provider must be wa or tg"}
+    if not provider_user_id:
+        return {"ok": False, "error": "provider_user_id required"}
+
+    try:
+        res = (
+            supabase()
+            .table("accounts")
+            .select("provider,provider_user_id,auth_user_id,display_name,phone,updated_at,created_at")
+            .eq("provider", provider)
+            .eq("provider_user_id", provider_user_id)
+            .limit(1)
+            .execute()
+        )
+    except Exception as e:
+        return {"ok": False, "error": f"DB error: {str(e)}"}
+
+    row = (res.data or [None])[0]
+    if not row:
+        return {"ok": True, "found": False, "linked": False, "account": None}
+
+    auth_user_id = row.get("auth_user_id")
+    return {
+        "ok": True,
+        "found": True,
+        "linked": bool(auth_user_id),
+        "auth_user_id": auth_user_id,
+        "account": row,
+    }
+
+
 def upsert_account_link(
     *,
     provider: str,
@@ -137,51 +180,8 @@ def upsert_account_link(
     return {"ok": True, "account": row}
 
 
-def lookup_account(
-    *,
-    provider: str,
-    provider_user_id: str,
-) -> Dict[str, Any]:
-    """
-    Returns mapping from (provider, provider_user_id) -> auth_user_id (if linked)
-    """
-    provider = (provider or "").strip().lower()
-    provider_user_id = (provider_user_id or "").strip()
-
-    if provider not in ("wa", "tg"):
-        return {"ok": False, "error": "provider must be wa or tg"}
-    if not provider_user_id:
-        return {"ok": False, "error": "provider_user_id required"}
-
-    try:
-        res = (
-            supabase()
-            .table("accounts")
-            .select("provider,provider_user_id,auth_user_id,display_name,phone,updated_at,created_at")
-            .eq("provider", provider)
-            .eq("provider_user_id", provider_user_id)
-            .limit(1)
-            .execute()
-        )
-    except Exception as e:
-        return {"ok": False, "error": f"DB error: {str(e)}"}
-
-    row = (res.data or [None])[0]
-    if not row:
-        return {"ok": True, "found": False, "linked": False, "account": None}
-
-    auth_user_id = row.get("auth_user_id")
-    return {
-        "ok": True,
-        "found": True,
-        "linked": bool(auth_user_id),
-        "auth_user_id": auth_user_id,
-        "account": row,
-    }
-
-
 # ---------------------------------------------------------
-# Plan status: BEST PRACTICE LOOKUP (YOUR DB FIX)
+# Plan status: YOUR DB (public.subscriptions) FIRST
 # ---------------------------------------------------------
 def _plan_from_subscriptions_table(auth_user_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """
@@ -207,10 +207,10 @@ def _plan_from_subscriptions_table(auth_user_id: str) -> Tuple[Optional[Dict[str
         return None, None
 
     end_dt = _parse_dt(row.get("end_at"))
-    active = False
     status = (row.get("status") or "").strip().lower() or None
 
-    # Active decision: end_at in future OR status says active
+    # Active decision: end_at in future OR status says active-ish
+    active = False
     if end_dt and end_dt > datetime.now(timezone.utc):
         active = True
     elif status in ("active", "paid", "success"):
@@ -234,6 +234,9 @@ def _try_fetch_plan_from_table_guess(table_name: str, auth_user_id: str) -> Tupl
     Best-effort fallback for other possible tables if you create them later.
     Tries BOTH auth_user_id and user_id columns.
     """
+    auth_err = None
+    user_err = None
+
     # try auth_user_id first
     try:
         res = (
@@ -265,10 +268,8 @@ def _try_fetch_plan_from_table_guess(table_name: str, auth_user_id: str) -> Tupl
                 },
                 None,
             )
-    except Exception as e_auth:
-        auth_err = str(e_auth)
-    else:
-        auth_err = None
+    except Exception as e:
+        auth_err = str(e)
 
     # then try user_id
     try:
@@ -296,14 +297,11 @@ def _try_fetch_plan_from_table_guess(table_name: str, auth_user_id: str) -> Tupl
                 },
                 None,
             )
-    except Exception as e_user:
-        user_err = str(e_user)
-    else:
-        user_err = None
+    except Exception as e:
+        user_err = str(e)
 
     # if both failed, return error summary
-    err = auth_err or user_err
-    return None, err
+    return None, (auth_err or user_err)
 
 
 def get_plan_status(auth_user_id: Optional[str]) -> Dict[str, Any]:
@@ -321,6 +319,7 @@ def get_plan_status(auth_user_id: Optional[str]) -> Dict[str, Any]:
     plan_obj, err = _plan_from_subscriptions_table(auth_user_id)
     if err is None and plan_obj:
         return {"ok": True, **plan_obj}
+
     debug_errors = []
     if err:
         debug_errors.append({"table": "subscriptions", "error": err})
