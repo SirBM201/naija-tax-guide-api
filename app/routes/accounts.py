@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from flask import Blueprint, jsonify, request
 
-from app.services.accounts_service import upsert_account, lookup_account
+from app.services.accounts_service import upsert_account, lookup_account, get_plan_status
 
 bp = Blueprint("accounts", __name__)
 
@@ -45,7 +45,7 @@ def create_or_get_account():
 def account_lookup_get():
     """
     GET /api/accounts/lookup?provider=wa&provider_user_id=234...
-    Returns auth mapping if linked.
+    Returns auth mapping if linked + plan status.
     """
     provider = (request.args.get("provider") or "").strip().lower()
     provider_user_id = (request.args.get("provider_user_id") or "").strip()
@@ -54,7 +54,9 @@ def account_lookup_get():
     if not res.get("ok"):
         return _bad(res.get("error") or "Lookup failed")
 
-    # Standard response
+    auth_user_id = res.get("auth_user_id")
+    plan_status = get_plan_status(auth_user_id) if auth_user_id else {"known": False, "is_active": False}
+
     return jsonify(
         {
             "ok": True,
@@ -62,8 +64,9 @@ def account_lookup_get():
             "provider_user_id": provider_user_id,
             "found": res.get("found", False),
             "linked": res.get("linked", False),
-            "auth_user_id": res.get("auth_user_id"),
+            "auth_user_id": auth_user_id,
             "account": res.get("account"),
+            "plan_status": plan_status,
         }
     )
 
@@ -77,6 +80,7 @@ def account_lookup_post():
         "provider": "wa" | "tg",
         "provider_user_id": "<string>"
       }
+    Returns auth mapping if linked + plan status.
     """
     body = request.get_json(silent=True) or {}
     provider = (body.get("provider") or "").strip().lower()
@@ -86,6 +90,9 @@ def account_lookup_post():
     if not res.get("ok"):
         return _bad(res.get("error") or "Lookup failed")
 
+    auth_user_id = res.get("auth_user_id")
+    plan_status = get_plan_status(auth_user_id) if auth_user_id else {"known": False, "is_active": False}
+
     return jsonify(
         {
             "ok": True,
@@ -93,7 +100,8 @@ def account_lookup_post():
             "provider_user_id": provider_user_id,
             "found": res.get("found", False),
             "linked": res.get("linked", False),
-            "auth_user_id": res.get("auth_user_id"),
+            "auth_user_id": auth_user_id,
             "account": res.get("account"),
+            "plan_status": plan_status,
         }
     )
