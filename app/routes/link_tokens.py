@@ -1,3 +1,4 @@
+# app/routes/link_tokens.py
 from flask import Blueprint, jsonify, request
 import os
 import re
@@ -72,18 +73,13 @@ def create_link_token_api():
 @bp.post("/link-tokens/consume")
 def consume_link_token_api():
     """
-    D + E:
-      - consumes token (RPC)
-      - auto-links/creates account mapping
-      - idempotent if same auth_user_id already linked
-      - blocks if channel already linked to another auth_user_id
+    Consumes token (RPC) then links account mapping (safe).
     """
     body = request.get_json(silent=True) or {}
     provider = (body.get("provider") or "").strip().lower()
     code = (body.get("code") or "").strip().upper()
     provider_user_id = (body.get("provider_user_id") or "").strip()
 
-    # optional metadata (can be supplied by WA/TG handlers later)
     display_name = body.get("display_name")
     phone = body.get("phone")
 
@@ -94,7 +90,6 @@ def consume_link_token_api():
     if not provider_user_id:
         return _bad("provider_user_id required")
 
-    # 1) Consume token via RPC
     try:
         res = supabase().rpc(
             "consume_link_token",
@@ -114,20 +109,15 @@ def consume_link_token_api():
     if not auth_user_id:
         return _bad("consume_link_token returned no auth_user_id", 500)
 
-    # 2) Auto-link account record (D + E)
-    try:
-        link = upsert_account_link(
-            provider=provider,
-            provider_user_id=provider_user_id,
-            auth_user_id=auth_user_id,
-            display_name=display_name,
-            phone=phone,
-        )
-    except Exception as e:
-        return _bad(f"Account link error: {str(e)}", 500)
+    link = upsert_account_link(
+        provider=provider,
+        provider_user_id=provider_user_id,
+        auth_user_id=auth_user_id,
+        display_name=display_name,
+        phone=phone,
+    )
 
     if not link.get("ok"):
-        # Token is consumed already; still return clear error to user/admin
         return jsonify(
             {
                 "ok": False,
