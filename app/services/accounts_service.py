@@ -1,3 +1,4 @@
+# app/services/accounts_service.py
 from __future__ import annotations
 
 from typing import Optional, Dict, Any, Tuple
@@ -11,19 +12,12 @@ def _now_iso() -> str:
 
 
 def _parse_dt(value: Any) -> Optional[datetime]:
-    """
-    Best-effort parse for timestamps that might come as:
-    - ISO string
-    - datetime
-    - None
-    """
     if value is None:
         return None
     if isinstance(value, datetime):
         return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
     if isinstance(value, str):
         try:
-            # Handles: "2026-02-06T14:03:31.703289+00:00"
             dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
             return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
         except Exception:
@@ -37,6 +31,9 @@ def _is_active_from_expiry(expiry: Optional[datetime]) -> bool:
     return expiry > datetime.now(timezone.utc)
 
 
+# ---------------------------------------------------------
+# Accounts: upsert / link / lookup
+# ---------------------------------------------------------
 def upsert_account(
     *,
     provider: str,
@@ -89,7 +86,10 @@ def upsert_account_link(
 ) -> Dict[str, Any]:
     """
     Upserts an account row AND binds it to auth_user_id (linked state).
-    Called after consume_link_token succeeds.
+
+    Safety rule:
+    - If the channel is already linked to ANOTHER auth_user_id, block.
+    - If linked to SAME auth_user_id, idempotent OK.
     """
     provider = (provider or "").strip().lower()
     provider_user_id = (provider_user_id or "").strip()
@@ -101,6 +101,17 @@ def upsert_account_link(
         return {"ok": False, "error": "provider_user_id required"}
     if not auth_user_id:
         return {"ok": False, "error": "auth_user_id required"}
+
+    # Guard: do not overwrite existing link to another user
+    existing = lookup_account(provider=provider, provider_user_id=provider_user_id)
+    if existing.get("ok") and existing.get("found"):
+        old = (existing.get("auth_user_id") or "").strip()
+        if old and old != auth_user_id:
+            return {
+                "ok": False,
+                "error": "This channel is already linked to another account.",
+                "reason": "channel_already_linked",
+            }
 
     payload = {
         "provider": provider,
@@ -169,18 +180,22 @@ def lookup_account(
     }
 
 
-def _try_fetch_plan_from_table(table_name: str, auth_user_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+# ---------------------------------------------------------
+# Plan status: BEST PRACTICE LOOKUP (YOUR DB FIX)
+# ---------------------------------------------------------
+def _plan_from_subscriptions_table(auth_user_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """
-    Tries to load the newest subscription record for a user from a given table.
-    Returns (plan_dict, error_string).
+    Your actual table: public.subscriptions
+    Columns seen:
+      user_id, plan, status, start_at, end_at, paystack_ref, amount_kobo, currency, updated_at ...
     """
     try:
         res = (
             supabase()
-            .table(table_name)
-            .select("*")
-            .eq("auth_user_id", auth_user_id)
-            .order("created_at", desc=True)
+            .table("subscriptions")
+            .select("user_id,plan,status,start_at,end_at,updated_at,id")
+            .eq("user_id", auth_user_id)
+            .order("updated_at", desc=True)
             .limit(1)
             .execute()
         )
@@ -191,68 +206,133 @@ def _try_fetch_plan_from_table(table_name: str, auth_user_id: str) -> Tuple[Opti
     if not row:
         return None, None
 
-    # Normalize possible column names
-    plan = row.get("plan") or row.get("tier") or row.get("plan_code") or row.get("subscription_plan")
-    status = row.get("status") or row.get("subscription_status") or row.get("state")
+    end_dt = _parse_dt(row.get("end_at"))
+    active = False
+    status = (row.get("status") or "").strip().lower() or None
 
-    expiry_raw = (
-        row.get("plan_expiry")
-        or row.get("plan_expiry_at")
-        or row.get("expires_at")
-        or row.get("expiry_at")
-        or row.get("current_period_end")
-        or row.get("period_end")
-    )
-    expiry_dt = _parse_dt(expiry_raw)
-    is_active = row.get("is_active")
-    if isinstance(is_active, bool):
-        active = is_active
-    else:
-        active = _is_active_from_expiry(expiry_dt)
+    # Active decision: end_at in future OR status says active
+    if end_dt and end_dt > datetime.now(timezone.utc):
+        active = True
+    elif status in ("active", "paid", "success"):
+        active = True
 
     return (
         {
             "known": True,
-            "source": table_name,
-            "plan": plan,
-            "status": status,
-            "plan_expiry": expiry_dt.isoformat() if expiry_dt else None,
+            "source": "subscriptions",
+            "plan": row.get("plan"),
+            "status": row.get("status"),
+            "plan_expiry": end_dt.isoformat() if end_dt else None,
             "is_active": bool(active),
-            "raw": row,
         },
         None,
     )
 
 
+def _try_fetch_plan_from_table_guess(table_name: str, auth_user_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """
+    Best-effort fallback for other possible tables if you create them later.
+    Tries BOTH auth_user_id and user_id columns.
+    """
+    # try auth_user_id first
+    try:
+        res = (
+            supabase()
+            .table(table_name)
+            .select("*")
+            .eq("auth_user_id", auth_user_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        row = (res.data or [None])[0]
+        if row:
+            expiry_dt = _parse_dt(
+                row.get("end_at")
+                or row.get("plan_expiry")
+                or row.get("expires_at")
+                or row.get("current_period_end")
+            )
+            active = bool(row.get("is_active")) if isinstance(row.get("is_active"), bool) else _is_active_from_expiry(expiry_dt)
+            return (
+                {
+                    "known": True,
+                    "source": table_name,
+                    "plan": row.get("plan") or row.get("tier") or row.get("plan_code"),
+                    "status": row.get("status"),
+                    "plan_expiry": expiry_dt.isoformat() if expiry_dt else None,
+                    "is_active": bool(active),
+                },
+                None,
+            )
+    except Exception as e_auth:
+        auth_err = str(e_auth)
+    else:
+        auth_err = None
+
+    # then try user_id
+    try:
+        res2 = (
+            supabase()
+            .table(table_name)
+            .select("*")
+            .eq("user_id", auth_user_id)
+            .order("updated_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        row2 = (res2.data or [None])[0]
+        if row2:
+            expiry_dt = _parse_dt(row2.get("end_at") or row2.get("expires_at") or row2.get("plan_expiry"))
+            active = _is_active_from_expiry(expiry_dt)
+            return (
+                {
+                    "known": True,
+                    "source": table_name,
+                    "plan": row2.get("plan") or row2.get("tier") or row2.get("plan_code"),
+                    "status": row2.get("status"),
+                    "plan_expiry": expiry_dt.isoformat() if expiry_dt else None,
+                    "is_active": bool(active),
+                },
+                None,
+            )
+    except Exception as e_user:
+        user_err = str(e_user)
+    else:
+        user_err = None
+
+    # if both failed, return error summary
+    err = auth_err or user_err
+    return None, err
+
+
 def get_plan_status(auth_user_id: Optional[str]) -> Dict[str, Any]:
     """
-    Best-effort subscription status lookup.
-    - DOES NOT FAIL the caller if subscription tables differ/missing.
-    - Returns {known:false} if nothing found.
+    Best-practice plan status lookup for your current DB.
+    - First checks: public.subscriptions(user_id,...)
+    - Then tries: user_subscriptions / user_plans / plans (future compatibility)
+    - NEVER breaks your API if tables/columns differ.
     """
     auth_user_id = (auth_user_id or "").strip()
     if not auth_user_id:
-        return {"known": False, "is_active": False, "plan": None, "status": None, "plan_expiry": None}
+        return {"ok": True, "known": False, "is_active": False, "plan": None, "status": None, "plan_expiry": None}
 
-    # Try common table names in order of likelihood.
-    # You can add/remove names here without touching API routes.
-    candidates = [
-        "subscriptions",
-        "user_subscriptions",
-        "user_plans",
-        "plans",
-    ]
+    # 1) Your actual table first
+    plan_obj, err = _plan_from_subscriptions_table(auth_user_id)
+    if err is None and plan_obj:
+        return {"ok": True, **plan_obj}
+    debug_errors = []
+    if err:
+        debug_errors.append({"table": "subscriptions", "error": err})
 
-    last_errors = []
+    # 2) Fallback tables (safe)
+    candidates = ["user_subscriptions", "user_plans", "plans"]
     for t in candidates:
-        plan_obj, err = _try_fetch_plan_from_table(t, auth_user_id)
-        if err:
-            last_errors.append({"table": t, "error": err})
-            continue
-        if plan_obj:
-            # Hide raw row if you don’t want it returned publicly
-            # (keeping it is useful while you’re still validating schema)
-            return {"ok": True, **plan_obj}
+        obj, e = _try_fetch_plan_from_table_guess(t, auth_user_id)
+        if obj:
+            return {"ok": True, **obj}
+        if e:
+            debug_errors.append({"table": t, "error": e})
 
     return {
         "ok": True,
@@ -261,6 +341,6 @@ def get_plan_status(auth_user_id: Optional[str]) -> Dict[str, Any]:
         "plan": None,
         "status": None,
         "plan_expiry": None,
-        "notes": "No subscription record found (or tables not present).",
-        "debug_errors": last_errors[:2],  # keep small; prevents huge responses
+        "notes": "No subscription record found.",
+        "debug_errors": debug_errors[:2],
     }
