@@ -10,7 +10,11 @@ from app.services.accounts_service import upsert_account_link
 bp = Blueprint("link_tokens", __name__)
 
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
-CODE_RE = re.compile(r"^[A-Z0-9]{6,12}$")
+
+# Non-ambiguous: 23456789 + A..Z without I,O,L
+CODE_RE = re.compile(r"^[23456789ABCDEFGHJKMNPQRSTUVWXYZ]{8}$")
+
+ALLOWED_PROVIDERS = ("wa", "tg", "msgr", "ig", "email")
 
 
 def _bad(msg: str, status: int = 400):
@@ -39,12 +43,10 @@ def create_link_token_api():
     body = request.get_json(silent=True) or {}
     provider = (body.get("provider") or "").strip().lower()
     ttl_minutes = int(body.get("ttl_minutes") or 30)
-
-    # request field is auth_user_id
     auth_user_id = (body.get("auth_user_id") or "").strip()
 
-    if provider not in ("wa", "tg"):
-        return _bad("provider must be wa or tg")
+    if provider not in ALLOWED_PROVIDERS:
+        return _bad(f"provider must be one of {ALLOWED_PROVIDERS}")
     if ttl_minutes < 5 or ttl_minutes > 1440:
         return _bad("ttl_minutes must be between 5 and 1440")
     if not auth_user_id:
@@ -88,10 +90,10 @@ def consume_link_token_api():
     display_name = body.get("display_name")
     phone = body.get("phone")
 
-    if provider not in ("wa", "tg"):
-        return _bad("provider must be wa or tg")
+    if provider not in ALLOWED_PROVIDERS:
+        return _bad(f"provider must be one of {ALLOWED_PROVIDERS}")
     if not code or not CODE_RE.match(code):
-        return _bad("Invalid code format")
+        return _bad("Invalid code format (must be 8 chars non-ambiguous)")
     if not provider_user_id:
         return _bad("provider_user_id required")
 
@@ -105,7 +107,8 @@ def consume_link_token_api():
 
     row = (res.data or [None])[0]
     if not row or not row.get("ok"):
-        return jsonify({"ok": False, "provider": provider, "message": "Invalid or expired code"}), 400
+        msg = (row or {}).get("message") if isinstance(row, dict) else None
+        return jsonify({"ok": False, "provider": provider, "message": msg or "Invalid or expired code"}), 400
 
     auth_user_id = row.get("auth_user_id")
     token_id = row.get("token_id")
