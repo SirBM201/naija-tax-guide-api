@@ -17,6 +17,7 @@ from app.routes.admin_link_tokens import bp as admin_link_tokens_bp
 from app.routes.debug_routes import bp as debug_routes_bp
 from app.routes.accounts_admin import bp as accounts_admin_bp
 from app.routes.meta import bp as meta_bp
+from app.routes.email_link import bp as email_link_bp
 
 # Paystack
 from app.routes.paystack import paystack_bp
@@ -58,7 +59,8 @@ def create_app() -> Flask:
     app.register_blueprint(debug_routes_bp, url_prefix="/api")
     app.register_blueprint(accounts_admin_bp, url_prefix="/api")
     app.register_blueprint(meta_bp, url_prefix="/api")
-
+    app.register_blueprint(email_link_bp, url_prefix="/api")
+    
     # Paystack routes
     app.register_blueprint(paystack_bp, url_prefix=api_prefix)
     app.register_blueprint(paystack_webhook_bp, url_prefix=api_prefix)
