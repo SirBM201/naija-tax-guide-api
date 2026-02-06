@@ -42,7 +42,11 @@ def telegram_webhook():
     ).strip() or None
     username = (from_user.get("username") or "").strip() or None
 
+    # Always ACK 200 to Telegram
     if not chat_id or not tg_user_id:
+        return jsonify({"ok": True})
+
+    if not text:
         return jsonify({"ok": True})
 
     code = extract_code(text)
@@ -68,6 +72,14 @@ def telegram_webhook():
     if result.get("ok"):
         _tg_send(chat_id, "✅ Linked successfully!\n\nYour Telegram is now connected to your Naija Tax Guide account.")
     else:
-        _tg_send(chat_id, "❌ Link failed.\n\nInvalid/expired code OR already used. Generate a new code and try again.")
+        err = (result.get("error") or "").strip()
+        reason = (result.get("reason") or "").strip()
+
+        if err == "rate_limited":
+            _tg_send(chat_id, "⏳ Too many attempts. Please wait a minute and try again.")
+        elif reason == "channel_already_linked":
+            _tg_send(chat_id, "⚠️ This Telegram account is already linked to another user.")
+        else:
+            _tg_send(chat_id, "❌ Link failed.\n\nInvalid/expired code OR already used. Generate a new code and try again.")
 
     return jsonify({"ok": True})
