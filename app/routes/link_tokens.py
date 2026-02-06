@@ -2,15 +2,19 @@ from flask import Blueprint, jsonify, request
 import os
 import re
 import uuid
+
 from app.core.supabase_client import supabase
+from app.services.accounts_service import upsert_account_link
 
 bp = Blueprint("link_tokens", __name__)
 
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
 CODE_RE = re.compile(r"^[A-Z0-9]{6,12}$")
 
+
 def _bad(msg: str, status: int = 400):
     return jsonify({"ok": False, "error": msg}), status
+
 
 def _is_uuid(value: str) -> bool:
     try:
@@ -18,6 +22,7 @@ def _is_uuid(value: str) -> bool:
         return True
     except Exception:
         return False
+
 
 @bp.post("/link-tokens/create")
 def create_link_token_api():
@@ -28,6 +33,8 @@ def create_link_token_api():
     body = request.get_json(silent=True) or {}
     provider = (body.get("provider") or "").strip().lower()
     ttl_minutes = int(body.get("ttl_minutes") or 30)
+
+    # IMPORTANT: request field is auth_user_id (what you used successfully)
     auth_user_id = (body.get("auth_user_id") or "").strip()
 
     if provider not in ("wa", "tg"):
@@ -40,11 +47,10 @@ def create_link_token_api():
         return _bad("auth_user_id must be a valid uuid")
 
     try:
-        res = supabase().rpc("create_link_token", {
-            "p_provider": provider,
-            "p_auth_user_id": auth_user_id,
-            "p_ttl_minutes": ttl_minutes
-        }).execute()
+        res = supabase().rpc(
+            "create_link_token",
+            {"p_provider": provider, "p_auth_user_id": auth_user_id, "p_ttl_minutes": ttl_minutes},
+        ).execute()
     except Exception as e:
         return _bad(f"RPC error: {str(e)}", 500)
 
@@ -52,20 +58,34 @@ def create_link_token_api():
     if not row or not row.get("ok"):
         return jsonify({"ok": False, "provider": provider, "error": row or "Token creation failed"}), 400
 
-    return jsonify({
-        "ok": True,
-        "provider": provider,
-        "code": row.get("code"),
-        "token_id": row.get("token_id"),
-        "expires_at": row.get("expires_at"),
-    })
+    return jsonify(
+        {
+            "ok": True,
+            "provider": provider,
+            "code": row.get("code"),
+            "token_id": row.get("token_id"),
+            "expires_at": row.get("expires_at"),
+        }
+    )
+
 
 @bp.post("/link-tokens/consume")
 def consume_link_token_api():
+    """
+    D + E:
+      - consumes token (RPC)
+      - auto-links/creates account mapping
+      - idempotent if same auth_user_id already linked
+      - blocks if channel already linked to another auth_user_id
+    """
     body = request.get_json(silent=True) or {}
     provider = (body.get("provider") or "").strip().lower()
     code = (body.get("code") or "").strip().upper()
     provider_user_id = (body.get("provider_user_id") or "").strip()
+
+    # optional metadata (can be supplied by WA/TG handlers later)
+    display_name = body.get("display_name")
+    phone = body.get("phone")
 
     if provider not in ("wa", "tg"):
         return _bad("provider must be wa or tg")
@@ -74,12 +94,12 @@ def consume_link_token_api():
     if not provider_user_id:
         return _bad("provider_user_id required")
 
+    # 1) Consume token via RPC
     try:
-        res = supabase().rpc("consume_link_token", {
-            "p_provider": provider,
-            "p_code": code,
-            "p_provider_user_id": provider_user_id
-        }).execute()
+        res = supabase().rpc(
+            "consume_link_token",
+            {"p_provider": provider, "p_code": code, "p_provider_user_id": provider_user_id},
+        ).execute()
     except Exception as e:
         return _bad(f"RPC error: {str(e)}", 500)
 
@@ -87,10 +107,43 @@ def consume_link_token_api():
     if not row or not row.get("ok"):
         return jsonify({"ok": False, "provider": provider, "message": "Invalid or expired code"}), 400
 
-    return jsonify({
-        "ok": True,
-        "provider": provider,
-        "auth_user_id": row.get("auth_user_id"),
-        "token_id": row.get("token_id"),
-        "expires_at": row.get("expires_at"),
-    })
+    auth_user_id = row.get("auth_user_id")
+    token_id = row.get("token_id")
+    expires_at = row.get("expires_at")
+
+    if not auth_user_id:
+        return _bad("consume_link_token returned no auth_user_id", 500)
+
+    # 2) Auto-link account record (D + E)
+    try:
+        link = upsert_account_link(
+            provider=provider,
+            provider_user_id=provider_user_id,
+            auth_user_id=auth_user_id,
+            display_name=display_name,
+            phone=phone,
+        )
+    except Exception as e:
+        return _bad(f"Account link error: {str(e)}", 500)
+
+    if not link.get("ok"):
+        # Token is consumed already; still return clear error to user/admin
+        return jsonify(
+            {
+                "ok": False,
+                "provider": provider,
+                "message": link.get("error") or "Failed to link channel",
+                "reason": link.get("reason"),
+            }
+        ), 409
+
+    return jsonify(
+        {
+            "ok": True,
+            "provider": provider,
+            "auth_user_id": auth_user_id,
+            "token_id": token_id,
+            "expires_at": expires_at,
+            "account": link.get("account"),
+        }
+    )
