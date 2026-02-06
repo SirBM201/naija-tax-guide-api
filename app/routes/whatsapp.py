@@ -44,6 +44,13 @@ def whatsapp_verify():
 
 @bp.post("/whatsapp/webhook")
 def whatsapp_webhook():
+    """
+    Receives inbound WA messages.
+    - Extracts link code (6-12 chars) from text
+    - Consumes + links
+    - Replies to user
+    Always ACKs 200 to Meta to prevent retry storms.
+    """
     payload = request.get_json(silent=True) or {}
 
     try:
@@ -55,42 +62,64 @@ def whatsapp_webhook():
         if not messages:
             return jsonify({"ok": True})
 
-        msg = messages[0]
-        from_id = (msg.get("from") or "").strip()
-        mtype = (msg.get("type") or "").strip()
-
-        text = ""
-        if mtype == "text":
-            text = ((msg.get("text") or {}).get("body") or "").strip()
-
+        # Optional contact name
         contacts = value.get("contacts") or []
         display_name = None
         if contacts:
             profile = (contacts[0].get("profile") or {})
             display_name = (profile.get("name") or "").strip() or None
 
-        if not from_id or not text:
-            return jsonify({"ok": True})
+        # Process all messages (Meta can batch)
+        for msg in messages:
+            from_id = (msg.get("from") or "").strip()
+            mtype = (msg.get("type") or "").strip()
 
-        code = extract_code(text)
-        if not code:
-            low = text.lower()
-            if "link" in low or "code" in low or "start" in low:
-                _wa_send_text(from_id, "To link your WhatsApp, send your 6–12 character code here.\nExample: ABC12345")
-            return jsonify({"ok": True})
+            if not from_id:
+                continue
 
-        result = consume_and_link(
-            provider="wa",
-            code=code,
-            provider_user_id=from_id,
-            display_name=display_name,
-            phone=from_id,
-        )
+            text = ""
+            if mtype == "text":
+                text = ((msg.get("text") or {}).get("body") or "").strip()
 
-        if result.get("ok"):
-            _wa_send_text(from_id, "✅ Linked successfully!\nYour WhatsApp is now connected to your Naija Tax Guide account.")
-        else:
-            _wa_send_text(from_id, "❌ Link failed.\nYour code is invalid/expired OR already used. Generate a new code and try again.")
+            if not text:
+                continue
+
+            code = extract_code(text)
+            if not code:
+                low = text.lower()
+                if "link" in low or "code" in low or "start" in low:
+                    _wa_send_text(
+                        from_id,
+                        "To link your WhatsApp, send your 6–12 character code here.\nExample: ABC12345",
+                    )
+                continue
+
+            result = consume_and_link(
+                provider="wa",
+                code=code,
+                provider_user_id=from_id,
+                display_name=display_name,
+                phone=from_id,
+            )
+
+            if result.get("ok"):
+                _wa_send_text(
+                    from_id,
+                    "✅ Linked successfully!\nYour WhatsApp is now connected to your Naija Tax Guide account.",
+                )
+            else:
+                err = (result.get("error") or "").strip()
+                reason = (result.get("reason") or "").strip()
+
+                if err == "rate_limited":
+                    _wa_send_text(from_id, "⏳ Too many attempts. Please wait a minute and try again.")
+                elif reason == "channel_already_linked":
+                    _wa_send_text(from_id, "⚠️ This WhatsApp number is already linked to another account.")
+                else:
+                    _wa_send_text(
+                        from_id,
+                        "❌ Link failed.\nInvalid/expired code OR already used.\nGenerate a new code and try again.",
+                    )
 
         return jsonify({"ok": True})
 
