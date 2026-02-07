@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Optional, Dict, Any, Tuple
 from datetime import datetime, timezone
+import uuid
 
 from app.core.supabase_client import supabase
 
@@ -31,6 +32,52 @@ def _is_active_from_expiry(expiry: Optional[datetime]) -> bool:
     return expiry > datetime.now(timezone.utc)
 
 
+def _is_uuid(value: str) -> bool:
+    try:
+        uuid.UUID(str(value))
+        return True
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------
+# Provider normalization (must match DB constraint list)
+# ---------------------------------------------------------
+ALLOWED_PROVIDERS = {"wa", "tg", "msgr", "ig", "email", "web"}
+
+PROVIDER_ALIASES = {
+    # WhatsApp
+    "wa": "wa",
+    "whatsapp": "wa",
+    "waba": "wa",
+    # Telegram
+    "tg": "tg",
+    "telegram": "tg",
+    # Messenger
+    "msgr": "msgr",
+    "messenger": "msgr",
+    "facebook_messenger": "msgr",
+    "fb_messenger": "msgr",
+    "fb messenger": "msgr",
+    # Instagram
+    "ig": "ig",
+    "instagram": "ig",
+    "instagram_dm": "ig",
+    "insta": "ig",
+    # Email
+    "email": "email",
+    "mail": "email",
+    # Web
+    "web": "web",
+    "website": "web",
+}
+
+
+def _norm_provider(provider: str) -> str:
+    p = (provider or "").strip().lower()
+    return PROVIDER_ALIASES.get(p, p)
+
+
 # ---------------------------------------------------------
 # Accounts: upsert / link / lookup
 # ---------------------------------------------------------
@@ -45,13 +92,18 @@ def upsert_account(
     Creates or updates an account row WITHOUT auth_user_id (pre-link state).
     Used when a message arrives before linking.
     """
-    provider = (provider or "").strip().lower()
+    provider = _norm_provider(provider)
     provider_user_id = (provider_user_id or "").strip()
 
-    if provider not in ("wa", "tg"):
-        return {"ok": False, "error": "provider must be wa or tg"}
+    if provider not in ALLOWED_PROVIDERS:
+        return {"ok": False, "error": "provider must be one of: wa, tg, msgr, ig, email, web"}
     if not provider_user_id:
         return {"ok": False, "error": "provider_user_id required"}
+
+    # light validation for email
+    if provider == "email":
+        if "@" not in provider_user_id or "." not in provider_user_id:
+            return {"ok": False, "error": "provider_user_id must be a valid email address for provider=email"}
 
     payload = {
         "provider": provider,
@@ -84,11 +136,11 @@ def lookup_account(
     """
     Returns mapping from (provider, provider_user_id) -> auth_user_id (if linked)
     """
-    provider = (provider or "").strip().lower()
+    provider = _norm_provider(provider)
     provider_user_id = (provider_user_id or "").strip()
 
-    if provider not in ("wa", "tg"):
-        return {"ok": False, "error": "provider must be wa or tg"}
+    if provider not in ALLOWED_PROVIDERS:
+        return {"ok": False, "error": "provider must be one of: wa, tg, msgr, ig, email, web"}
     if not provider_user_id:
         return {"ok": False, "error": "provider_user_id required"}
 
@@ -134,16 +186,23 @@ def upsert_account_link(
     - If the channel is already linked to ANOTHER auth_user_id, block.
     - If linked to SAME auth_user_id, idempotent OK.
     """
-    provider = (provider or "").strip().lower()
+    provider = _norm_provider(provider)
     provider_user_id = (provider_user_id or "").strip()
     auth_user_id = (auth_user_id or "").strip()
 
-    if provider not in ("wa", "tg"):
-        return {"ok": False, "error": "provider must be wa or tg"}
+    if provider not in ALLOWED_PROVIDERS:
+        return {"ok": False, "error": "provider must be one of: wa, tg, msgr, ig, email, web"}
     if not provider_user_id:
         return {"ok": False, "error": "provider_user_id required"}
     if not auth_user_id:
         return {"ok": False, "error": "auth_user_id required"}
+    if not _is_uuid(auth_user_id):
+        return {"ok": False, "error": "auth_user_id must be a valid uuid"}
+
+    # light validation for email
+    if provider == "email":
+        if "@" not in provider_user_id or "." not in provider_user_id:
+            return {"ok": False, "error": "provider_user_id must be a valid email address for provider=email"}
 
     # Guard: do not overwrite existing link to another user
     existing = lookup_account(provider=provider, provider_user_id=provider_user_id)
