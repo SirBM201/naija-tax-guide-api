@@ -13,9 +13,9 @@ PAYSTACK_CALLBACK_URL = os.getenv("PAYSTACK_CALLBACK_URL", "").strip()
 
 # Amounts are in KOBO (₦3000 = 300000 kobo)
 PLAN_PRICES = {
-    "monthly": 300000,
-    "quarterly": 800000,
-    "yearly": 3000000,
+    "monthly": 330000,
+    "quarterly": 900000,
+    "yearly": 3300000,
 }
 
 @paystack_bp.post("/paystack/init")
