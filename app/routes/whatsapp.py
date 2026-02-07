@@ -8,11 +8,7 @@ import requests
 from flask import Blueprint, request, jsonify
 
 from app.core.supabase_client import supabase
-from app.services.accounts_service import (
-    upsert_account,
-    lookup_account,
-    upsert_account_link,
-)
+from app.services.accounts_service import upsert_account, lookup_account, upsert_account_link
 
 bp = Blueprint("whatsapp", __name__)
 
@@ -49,21 +45,57 @@ def _wa_send_text(to_phone: str, text: str) -> None:
         logging.exception("WA send exception: %s", e)
 
 
-def _consume_link_code(provider: str, code: str, provider_user_id: str) -> dict:
+def _extract_wa_text(body: dict) -> tuple[str, str]:
     """
-    Calls RPC: public.consume_link_token(p_provider text, p_code text, p_provider_user_id text)
-    Expected return: a row with at least:
-      ok boolean, auth_user_id uuid (when ok=true)
+    Returns (from_phone, text)
     """
-    res = supabase().rpc(
-        "consume_link_token",
-        {
-            "p_provider": provider,
-            "p_code": code,
-            "p_provider_user_id": provider_user_id,
-        },
-    ).execute()
-    return (res.data or [None])[0] or {}
+    entry = (body.get("entry") or [None])[0] or {}
+    changes = (entry.get("changes") or [None])[0] or {}
+    value = changes.get("value") or {}
+    messages = value.get("messages") or []
+    if not messages:
+        return "", ""
+
+    msg = messages[0]
+    from_phone = (msg.get("from") or "").strip()
+
+    msg_type = (msg.get("type") or "").strip().lower()
+    text = ""
+
+    if msg_type == "text":
+        text = ((msg.get("text") or {}).get("body") or "").strip()
+    # You can extend later for interactive/button replies if needed.
+
+    return from_phone, text
+
+
+def _try_consume_link_code(provider: str, provider_user_id: str, code: str) -> dict:
+    """
+    Calls Supabase RPC: consume_link_token(p_provider, p_code, p_provider_user_id)
+    Expected to return a row with at least:
+      ok:boolean, auth_user_id:uuid (when ok=true)
+    """
+    try:
+        res = supabase().rpc(
+            "consume_link_token",
+            {
+                "p_provider": provider,
+                "p_code": code,
+                "p_provider_user_id": provider_user_id,
+            },
+        ).execute()
+    except Exception as e:
+        return {"ok": False, "error": f"RPC error: {str(e)}"}
+
+    row = (res.data or [None])[0]
+    if not row:
+        return {"ok": False, "error": "No RPC row returned."}
+
+    # Normalize
+    ok = bool(row.get("ok"))
+    auth_user_id = row.get("auth_user_id")
+
+    return {"ok": ok, "auth_user_id": auth_user_id, "raw": row}
 
 
 @bp.get("/whatsapp/webhook")
@@ -85,32 +117,24 @@ def wa_webhook_verify():
 def wa_webhook_receive():
     """
     Receives WhatsApp messages.
-    Flow:
-      1) Upsert "shell" account row for (wa, provider_user_id)
-      2) If not linked:
-           - If message is 8-char code: consume RPC + upsert auth_user_id link
-           - Else: ask user to send code
-      3) If linked: acknowledge (later you can forward to /ask)
+
+    Behavior:
+    1) Upsert account shell
+    2) If linked -> acknowledge
+    3) If not linked:
+       - If text is 8-char code -> consume_link_token RPC, then upsert_account_link
+       - Else -> tell user how to link
     """
     body = request.get_json(silent=True) or {}
 
     try:
-        entry = (body.get("entry") or [None])[0] or {}
-        changes = (entry.get("changes") or [None])[0] or {}
-        value = changes.get("value") or {}
-        messages = value.get("messages") or []
-        if not messages:
+        from_phone, text = _extract_wa_text(body)
+
+        # Always ACK quickly (Meta retries if you error)
+        if not from_phone:
             return jsonify({"ok": True, "ignored": True})
 
-        msg = messages[0]
-        from_phone = (msg.get("from") or "").strip()  # sender WA id (phone)
-        msg_type = msg.get("type")
-
-        text = ""
-        if msg_type == "text":
-            text = ((msg.get("text") or {}).get("body") or "").strip()
-
-        # Create/update account shell
+        # 1) create/update account shell
         upsert_account(
             provider="wa",
             provider_user_id=from_phone,
@@ -118,55 +142,61 @@ def wa_webhook_receive():
             phone=from_phone,
         )
 
-        # Lookup link status
+        # 2) lookup link status
         lk = lookup_account(provider="wa", provider_user_id=from_phone)
         if not lk.get("ok"):
             _wa_send_text(from_phone, "System error. Please try again.")
             return jsonify({"ok": True})
 
-        # If NOT linked, try to consume code (if user sent one)
-        if not lk.get("linked"):
-            candidate = (text or "").upper().strip()
-            if candidate and LINK_CODE_RE.match(candidate):
-                try:
-                    out = _consume_link_code("wa", candidate, from_phone)
-                    if out.get("ok") is True and out.get("auth_user_id"):
-                        upsert_account_link(
-                            provider="wa",
-                            provider_user_id=from_phone,
-                            auth_user_id=str(out.get("auth_user_id")),
-                            display_name=None,
-                            phone=from_phone,
-                        )
-                        _wa_send_text(from_phone, "Linked ✅. You can now ask your question here anytime.")
-                        return jsonify({"ok": True, "linked": True, "just_linked": True})
+        if lk.get("linked"):
+            if text:
+                _wa_send_text(from_phone, f"Received: {text}\n(Linked ✅)")
+            else:
+                _wa_send_text(from_phone, "Linked ✅")
+            return jsonify({"ok": True, "linked": True})
 
+        # 3) Not linked -> if user sent code, try to link
+        code = (text or "").strip().upper()
+        if code and LINK_CODE_RE.match(code):
+            consume = _try_consume_link_code("wa", from_phone, code)
+            if consume.get("ok") and consume.get("auth_user_id"):
+                auth_user_id = str(consume["auth_user_id"])
+
+                # Write the binding into accounts table
+                link_res = upsert_account_link(
+                    provider="wa",
+                    provider_user_id=from_phone,
+                    auth_user_id=auth_user_id,
+                    display_name=None,
+                    phone=from_phone,
+                )
+                if link_res.get("ok"):
                     _wa_send_text(
                         from_phone,
-                        "Invalid or expired code.\n"
-                        "Please login on the website and generate a NEW LINK CODE, then send it here.",
+                        "✅ Linked successfully!\nYou can now send your questions here anytime.",
                     )
-                    return jsonify({"ok": True, "linked": False})
-                except Exception as e:
-                    logging.exception("WA consume_link_token failed: %s", e)
-                    _wa_send_text(from_phone, "System error while linking. Please try again.")
-                    return jsonify({"ok": True, "linked": False})
+                    return jsonify({"ok": True, "linked": True})
+
+                _wa_send_text(from_phone, "Link succeeded but saving failed. Please try again.")
+                return jsonify({"ok": True, "linked": False})
 
             _wa_send_text(
                 from_phone,
-                "Your WhatsApp is not linked yet.\n"
-                "Please login on the website and generate your LINK CODE, then reply here with the 8-character code.\n"
+                "❌ Invalid or expired LINK CODE.\n"
+                "Please login on the website and generate a NEW LINK CODE, then send it here.\n"
                 "Example: 7K9M2H8P",
             )
             return jsonify({"ok": True, "linked": False})
 
-        # Linked path (later: forward to /ask)
-        if text:
-            _wa_send_text(from_phone, f"Received: {text}\n(Linked ✅)")
-
-        return jsonify({"ok": True, "linked": True})
+        # Otherwise: instruct linking
+        _wa_send_text(
+            from_phone,
+            "Your WhatsApp is not linked yet.\n"
+            "Please login on the website and generate your LINK CODE, then reply here with the 8-character code.\n"
+            "Example: 7K9M2H8P",
+        )
+        return jsonify({"ok": True, "linked": False})
 
     except Exception as e:
         logging.exception("WA webhook error: %s", e)
-        # Don't make Meta retry forever.
-        return jsonify({"ok": True})
+        return jsonify({"ok": True})  # don't make Meta retry forever
