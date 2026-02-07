@@ -1,6 +1,10 @@
 # app/routes/whatsapp.py
 from __future__ import annotations
 
+import re
+from app.core.supabase_client import supabase
+from app.services.accounts_service import upsert_account, lookup_account, upsert_account_link
+
 import os
 import logging
 import requests
