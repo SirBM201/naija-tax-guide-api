@@ -1,161 +1,145 @@
 # app/routes/link_tokens.py
-from flask import Blueprint, jsonify, request
+
 import os
-import re
-import uuid
+import secrets
+import string
+from datetime import datetime, timedelta, timezone
 
-from app.core.supabase_client import supabase
-from app.services.accounts_service import upsert_account_link
+from flask import Blueprint, request, jsonify
+from supabase import create_client
 
-bp = Blueprint("link_tokens", __name__)
+# --------------------------------------------------
+# ENV / SUPABASE
+# --------------------------------------------------
 
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
-# Non-ambiguous, uppercase letters + digits (no spaces). We generate 8 by default.
-# Accept 6-12 so old tokens still work if any exist.
-CODE_RE = re.compile(r"^[A-Z0-9]{6,12}$")
+if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+    raise RuntimeError("SUPABASE env vars missing")
 
-# Omni-channel providers (web is NOT linked by token; it’s your site login)
-ALLOWED_PROVIDERS = ("wa", "tg", "msgr", "ig", "email")
+sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
-
-def _bad(msg: str, status: int = 400):
-    return jsonify({"ok": False, "error": msg}), status
-
-
-def _is_uuid(value: str) -> bool:
-    try:
-        uuid.UUID(str(value))
-        return True
-    except Exception:
-        return False
+bp = Blueprint("link_tokens", __name__, url_prefix="/link")
 
 
-@bp.get("/link-tokens/health")
-def link_tokens_health():
-    return jsonify({"ok": True, "service": "link_tokens"})
+# --------------------------------------------------
+# CONFIG
+# --------------------------------------------------
+
+TOKEN_LENGTH = 8
+TOKEN_EXPIRY_MINUTES = 30
 
 
-@bp.post("/link-tokens/create")
-def create_link_token_api():
-    admin_key = (request.headers.get("X-Admin-Key") or "").strip()
-    if not ADMIN_API_KEY or admin_key != ADMIN_API_KEY:
-        return _bad("Unauthorized", 401)
+def generate_code(length: int = TOKEN_LENGTH) -> str:
+    alphabet = string.ascii_uppercase + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+# --------------------------------------------------
+# 1️⃣ GENERATE LINK CODE (Website side)
+# --------------------------------------------------
+
+@bp.post("/generate")
+def generate_link_code():
+    """
+    Body:
+    {
+        "auth_user_id": "<uuid>",
+        "provider": "wa" | "tg"
+    }
+    """
 
     body = request.get_json(silent=True) or {}
-    provider = (body.get("provider") or "").strip().lower()
-    ttl_minutes = int(body.get("ttl_minutes") or 30)
 
-    # required field
-    auth_user_id = (body.get("auth_user_id") or "").strip()
+    auth_user_id = body.get("auth_user_id")
+    provider = (body.get("provider") or "").lower()
 
-    if provider not in ALLOWED_PROVIDERS:
-        return _bad(f"provider must be one of {ALLOWED_PROVIDERS}")
-    if ttl_minutes < 5 or ttl_minutes > 1440:
-        return _bad("ttl_minutes must be between 5 and 1440")
-    if not auth_user_id:
-        return _bad("auth_user_id required (uuid)")
-    if not _is_uuid(auth_user_id):
-        return _bad("auth_user_id must be a valid uuid")
+    if not auth_user_id or provider not in ("wa", "tg"):
+        return jsonify({"ok": False, "error": "Invalid request"}), 400
 
-    try:
-        res = supabase().rpc(
-            "create_link_token",
-            {
-                "p_provider": provider,
-                "p_auth_user_id": auth_user_id,
-                "p_ttl_minutes": ttl_minutes,
-            },
-        ).execute()
-    except Exception as e:
-        return _bad(f"RPC error: {str(e)}", 500)
+    code = generate_code()
 
-    row = (res.data or [None])[0]
-    if not row or not row.get("ok"):
-        return jsonify({"ok": False, "provider": provider, "error": row or "Token creation failed"}), 400
-
-    return jsonify(
-        {
-            "ok": True,
-            "provider": provider,
-            "code": row.get("code"),
-            "token_id": row.get("token_id"),
-            "expires_at": row.get("expires_at"),
-        }
+    expires_at = datetime.now(timezone.utc) + timedelta(
+        minutes=TOKEN_EXPIRY_MINUTES
     )
 
+    # Insert token
+    sb.table("link_tokens").insert({
+        "code": code,
+        "auth_user_id": auth_user_id,
+        "provider": provider,
+        "expires_at": expires_at.isoformat(),
+        "used": False
+    }).execute()
 
-@bp.post("/link-tokens/consume")
-def consume_link_token_api():
+    return jsonify({
+        "ok": True,
+        "code": code,
+        "expires_in_minutes": TOKEN_EXPIRY_MINUTES
+    })
+
+
+# --------------------------------------------------
+# 2️⃣ CONSUME LINK CODE (Chat side)
+# --------------------------------------------------
+
+@bp.post("/consume")
+def consume_link_code():
     """
-    Consumes token (RPC) then links account mapping.
+    Body:
+    {
+        "code": "<8-char>",
+        "provider": "wa" | "tg",
+        "provider_user_id": "<chat id>"
+    }
     """
+
     body = request.get_json(silent=True) or {}
-    provider = (body.get("provider") or "").strip().lower()
-    code = (body.get("code") or "").strip().upper()
-    provider_user_id = (body.get("provider_user_id") or "").strip()
 
-    display_name = body.get("display_name")
-    phone = body.get("phone")
+    code = (body.get("code") or "").upper()
+    provider = (body.get("provider") or "").lower()
+    provider_user_id = body.get("provider_user_id")
 
-    if provider not in ALLOWED_PROVIDERS:
-        return _bad(f"provider must be one of {ALLOWED_PROVIDERS}")
-    if not code or not CODE_RE.match(code):
-        return _bad("Invalid code format")
-    if not provider_user_id:
-        return _bad("provider_user_id required")
+    if not code or provider not in ("wa", "tg") or not provider_user_id:
+        return jsonify({"ok": False, "error": "Invalid request"}), 400
 
-    try:
-        res = supabase().rpc(
-            "consume_link_token",
-            {
-                "p_provider": provider,
-                "p_code": code,
-                "p_provider_user_id": provider_user_id,
-            },
-        ).execute()
-    except Exception as e:
-        return _bad(f"RPC error: {str(e)}", 500)
+    # Fetch token
+    res = sb.table("link_tokens") \
+        .select("*") \
+        .eq("code", code) \
+        .eq("provider", provider) \
+        .single() \
+        .execute()
 
-    row = (res.data or [None])[0]
-    if not row or not row.get("ok"):
-        return jsonify({"ok": False, "provider": provider, "message": "Invalid or expired code"}), 400
+    token = res.data
 
-    auth_user_id = row.get("auth_user_id")
-    token_id = row.get("token_id")
-    expires_at = row.get("expires_at")
+    if not token:
+        return jsonify({"ok": False, "error": "Invalid code"}), 404
 
-    if not auth_user_id:
-        return _bad("consume_link_token returned no auth_user_id", 500)
+    if token["used"]:
+        return jsonify({"ok": False, "error": "Code already used"}), 400
 
-    link = upsert_account_link(
-        provider=provider,
-        provider_user_id=provider_user_id,
-        auth_user_id=auth_user_id,
-        display_name=display_name,
-        phone=phone,
-    )
+    if datetime.fromisoformat(token["expires_at"]) < datetime.now(timezone.utc):
+        return jsonify({"ok": False, "error": "Code expired"}), 400
 
-    if not link.get("ok"):
-        return (
-            jsonify(
-                {
-                    "ok": False,
-                    "provider": provider,
-                    "message": link.get("error") or "Failed to link channel",
-                    "reason": link.get("reason"),
-                }
-            ),
-            409,
-        )
+    auth_user_id = token["auth_user_id"]
 
-    return jsonify(
-        {
-            "ok": True,
-            "provider": provider,
-            "auth_user_id": auth_user_id,
-            "token_id": token_id,
-            "expires_at": expires_at,
-            "account": link.get("account"),
-        }
-    )
+    # Link account
+    sb.table("accounts").upsert({
+        "provider": provider,
+        "provider_user_id": provider_user_id,
+        "auth_user_id": auth_user_id,
+        "updated_at": datetime.now(timezone.utc).isoformat()
+    }).execute()
+
+    # Mark token used
+    sb.table("link_tokens") \
+        .update({"used": True}) \
+        .eq("code", code) \
+        .execute()
+
+    return jsonify({
+        "ok": True,
+        "linked": True
+    })
