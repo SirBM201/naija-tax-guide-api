@@ -458,3 +458,52 @@ def handle_payment_success(payload: Dict[str, Any]) -> Dict[str, Any]:
         pass
 
     return {"ok": True, "mode": "activated", "subscription": row}
+
+
+# -----------------------------
+# Expiry maintenance (Cron job)
+# -----------------------------
+def expire_overdue_subscriptions(*, batch_limit: int = 1000) -> Dict[str, Any]:
+    """
+    Best-effort maintenance job:
+    - Finds subscriptions where is_active=True but expires_at is in the past
+    - Marks them expired (is_active=False, status='expired')
+    - Returns how many were expired in this run
+
+    This keeps DB state consistent and makes paywall lock/unlock reliable.
+    """
+
+    db = supabase()
+    now_iso = _iso(_now_utc())
+
+    # Find overdue active subscriptions (batch)
+    res = (
+        db.table("user_subscriptions")
+        .select("id")
+        .eq("is_active", True)
+        .lt("expires_at", now_iso)
+        .limit(int(batch_limit))
+        .execute()
+    )
+
+    ids = [r.get("id") for r in (res.data or []) if r.get("id")]
+    if not ids:
+        return {"ok": True, "expired": 0}
+
+    try:
+        db.table("user_subscriptions").update(
+            {
+                "is_active": False,
+                "status": "expired",
+                "updated_at": now_iso,
+            }
+        ).in_("id", ids).execute()
+    except Exception:
+        # fallback: minimal update
+        try:
+            db.table("user_subscriptions").update({"is_active": False}).in_("id", ids).execute()
+        except Exception:
+            return {"ok": False, "expired": 0, "error": "update_failed"}
+
+    return {"ok": True, "expired": len(ids)}
+
