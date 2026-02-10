@@ -18,7 +18,7 @@ def create_or_get_account():
     Create or update an account shell (pre-link).
     Body:
       {
-        "provider": "wa" | "tg",
+        "provider": "wa" | "tg" | "msgr" | "ig" | "email" | "web",
         "provider_user_id": "<string>",
         "display_name": "<optional>",
         "phone": "<optional>"
@@ -39,7 +39,9 @@ def create_or_get_account():
     if not res.get("ok"):
         return _bad(res.get("error") or "Failed")
 
-    return jsonify({"ok": True, "account": res.get("account")})
+    # ✅ Always return account_id (frontend needs this)
+    account = res.get("account")
+    return jsonify({"ok": True, "account_id": res.get("account_id") or (account or {}).get("id"), "account": account})
 
 
 @bp.get("/accounts/lookup")
@@ -68,6 +70,7 @@ def account_lookup_get():
             "found": res.get("found", False),
             "linked": res.get("linked", False),
             "auth_user_id": auth_user_id,
+            "account_id": res.get("account_id"),
             "account": res.get("account"),
             "plan_status": plan_status,
         }
@@ -80,7 +83,7 @@ def account_lookup_post():
     POST /api/accounts/lookup
     Body:
       {
-        "provider": "wa" | "tg",
+        "provider": "wa" | "tg" | "msgr" | "ig" | "email" | "web",
         "provider_user_id": "<string>"
       }
     Returns auth mapping if linked + plan_status.
@@ -106,6 +109,7 @@ def account_lookup_post():
             "found": res.get("found", False),
             "linked": res.get("linked", False),
             "auth_user_id": auth_user_id,
+            "account_id": res.get("account_id"),
             "account": res.get("account"),
             "plan_status": plan_status,
         }
