@@ -1,4 +1,3 @@
-# app/routes/accounts.py
 from __future__ import annotations
 
 from flask import Blueprint, jsonify, request
@@ -39,9 +38,8 @@ def create_or_get_account():
     if not res.get("ok"):
         return _bad(res.get("error") or "Failed")
 
-    # ✅ Always return account_id (frontend needs this)
-    account = res.get("account")
-    return jsonify({"ok": True, "account_id": res.get("account_id") or (account or {}).get("id"), "account": account})
+    acct = res.get("account") or {}
+    return jsonify({"ok": True, "account": acct, "account_id": acct.get("id")})
 
 
 @bp.get("/accounts/lookup")
@@ -70,8 +68,8 @@ def account_lookup_get():
             "found": res.get("found", False),
             "linked": res.get("linked", False),
             "auth_user_id": auth_user_id,
-            "account_id": res.get("account_id"),
             "account": res.get("account"),
+            "account_id": (res.get("account") or {}).get("id"),
             "plan_status": plan_status,
         }
     )
@@ -109,8 +107,8 @@ def account_lookup_post():
             "found": res.get("found", False),
             "linked": res.get("linked", False),
             "auth_user_id": auth_user_id,
-            "account_id": res.get("account_id"),
             "account": res.get("account"),
+            "account_id": (res.get("account") or {}).get("id"),
             "plan_status": plan_status,
         }
     )
