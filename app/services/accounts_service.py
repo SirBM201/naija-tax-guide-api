@@ -1,3 +1,7 @@
+print("BOOT CHECK accounts_service:", __file__)
+print("BOOT CHECK has upsert_account:", "upsert_account" in globals())
+
+
 from __future__ import annotations
 
 from typing import Optional, Dict, Any, Tuple, List
