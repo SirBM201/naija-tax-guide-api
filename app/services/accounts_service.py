@@ -1,7 +1,3 @@
-print("BOOT CHECK accounts_service:", __file__)
-print("BOOT CHECK has upsert_account:", "upsert_account" in globals())
-
-
 from __future__ import annotations
 
 from typing import Optional, Dict, Any, Tuple, List
@@ -134,6 +130,7 @@ def upsert_account(
     }
 
     try:
+        # returning="representation" ensures we get row data back on supported versions.
         res = supabase().table("accounts").upsert(
             payload,
             on_conflict="provider,provider_user_id",
@@ -215,6 +212,7 @@ def upsert_account_link(
     if not _is_uuid(auth_user_id):
         return {"ok": False, "error": "auth_user_id must be a valid uuid"}
 
+    # Guard: do not overwrite existing link to another user
     existing = lookup_account(provider=provider, provider_user_id=provider_user_id)
     if existing.get("ok") and existing.get("found"):
         old = (existing.get("auth_user_id") or "").strip()
@@ -296,9 +294,14 @@ def _plan_from_subscriptions_table(auth_user_id: str) -> Tuple[Optional[Dict[str
 
 
 def _try_fetch_plan_from_table_guess(table_name: str, auth_user_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """
+    Best-effort fallback for other possible tables if you create them later.
+    Tries BOTH auth_user_id and user_id columns.
+    """
     auth_err = None
     user_err = None
 
+    # try auth_user_id first
     try:
         res = (
             supabase()
@@ -332,6 +335,7 @@ def _try_fetch_plan_from_table_guess(table_name: str, auth_user_id: str) -> Tupl
     except Exception as e:
         auth_err = str(e)
 
+    # then try user_id
     try:
         res2 = (
             supabase()
@@ -368,6 +372,7 @@ def get_plan_status(auth_user_id: Optional[str]) -> Dict[str, Any]:
     Best-practice plan status lookup for your current DB.
     - First checks: public.subscriptions(user_id,...)
     - Then tries: user_subscriptions / user_plans / plans (future compatibility)
+    - NEVER breaks your API if tables/columns differ.
     """
     auth_user_id = (auth_user_id or "").strip()
     if not auth_user_id:
@@ -398,6 +403,4 @@ def get_plan_status(auth_user_id: Optional[str]) -> Dict[str, Any]:
         "plan_expiry": None,
         "notes": "No subscription record found.",
         "debug_errors": debug_errors[:2],
-        print("BOOT CHECK: accounts_service loaded, has upsert_account =", "upsert_account" in globals())
-
     }
