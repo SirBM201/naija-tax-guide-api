@@ -1,7 +1,6 @@
-# app/services/accounts_service.py
 from __future__ import annotations
 
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 from datetime import datetime, timezone
 import uuid
 
@@ -11,13 +10,12 @@ from app.core.supabase_client import supabase
 # ---------------------------------------------------------
 # Time helpers
 # ---------------------------------------------------------
-def _now_dt() -> datetime:
+def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
 def _now_iso() -> str:
-    # Always return Z-formatted UTC
-    return _now_dt().isoformat().replace("+00:00", "Z")
+    return _now_utc().isoformat()
 
 
 def _parse_dt(value: Any) -> Optional[datetime]:
@@ -37,7 +35,7 @@ def _parse_dt(value: Any) -> Optional[datetime]:
 def _is_active_from_expiry(expiry: Optional[datetime]) -> bool:
     if not expiry:
         return False
-    return expiry > _now_dt()
+    return expiry > _now_utc()
 
 
 def _is_uuid(value: str) -> bool:
@@ -67,6 +65,7 @@ PROVIDER_ALIASES = {
     "facebook_messenger": "msgr",
     "fb_messenger": "msgr",
     "fb messenger": "msgr",
+    "facebook messenger": "msgr",
     # Instagram
     "ig": "ig",
     "instagram": "ig",
@@ -86,18 +85,18 @@ def _norm_provider(provider: str) -> str:
     return PROVIDER_ALIASES.get(p, p)
 
 
-# ---------------------------------------------------------
-# Small validators
-# ---------------------------------------------------------
 def _validate_provider_and_id(provider: str, provider_user_id: str) -> Optional[str]:
+    provider = _norm_provider(provider)
     if provider not in ALLOWED_PROVIDERS:
         return "provider must be one of: wa, tg, msgr, ig, email, web"
     if not provider_user_id:
         return "provider_user_id required"
+
     if provider == "email":
-        # light validation
-        if "@" not in provider_user_id or "." not in provider_user_id:
+        v = provider_user_id.strip().lower()
+        if "@" not in v or "." not in v:
             return "provider_user_id must be a valid email address for provider=email"
+
     return None
 
 
@@ -114,10 +113,6 @@ def upsert_account(
     """
     Creates or updates an account row WITHOUT auth_user_id (pre-link state).
     Used when a message arrives before linking.
-
-    Important:
-    - Do NOT chain .select() after .upsert() (some supabase clients do not support that).
-    - We return a stable shape including account_id.
     """
     provider = _norm_provider(provider)
     provider_user_id = (provider_user_id or "").strip()
@@ -129,38 +124,24 @@ def upsert_account(
     payload = {
         "provider": provider,
         "provider_user_id": provider_user_id,
-        "display_name": display_name,
-        "phone": phone,
+        "display_name": (display_name or None),
+        "phone": (phone or None),
         "updated_at": _now_iso(),
     }
 
-    db = supabase()
-
-    # 1) upsert (no chained select)
     try:
-        res = db.table("accounts").upsert(payload, on_conflict="provider,provider_user_id").execute()
+        # IMPORTANT: Do NOT chain .select() after upsert (breaks on some supabase/postgrest versions).
+        # returning="representation" ensures we get row data back on supported versions.
+        res = supabase().table("accounts").upsert(
+            payload,
+            on_conflict="provider,provider_user_id",
+            returning="representation",
+        ).execute()
     except Exception as e:
         return {"ok": False, "error": f"DB error: {str(e)}"}
 
-    # 2) if API returned row(s), use it
-    if isinstance(getattr(res, "data", None), list) and res.data:
-        row = res.data[0]
-        return {"ok": True, "account": row, "account_id": row.get("id")}
-
-    # 3) fallback: fetch the row we just upserted
-    try:
-        got = (
-            db.table("accounts")
-            .select("*")
-            .eq("provider", provider)
-            .eq("provider_user_id", provider_user_id)
-            .limit(1)
-            .execute()
-        )
-        row = (got.data or [None])[0]
-        return {"ok": True, "account": row, "account_id": (row or {}).get("id")}
-    except Exception as e:
-        return {"ok": False, "error": f"DB error: {str(e)}"}
+    row = (res.data or [None])[0]
+    return {"ok": True, "account": row}
 
 
 def lookup_account(
@@ -202,7 +183,6 @@ def lookup_account(
         "linked": bool(auth_user_id),
         "auth_user_id": auth_user_id,
         "account": row,
-        "account_id": row.get("id"),
     }
 
 
@@ -228,7 +208,6 @@ def upsert_account_link(
     err = _validate_provider_and_id(provider, provider_user_id)
     if err:
         return {"ok": False, "error": err}
-
     if not auth_user_id:
         return {"ok": False, "error": "auth_user_id required"}
     if not _is_uuid(auth_user_id):
@@ -249,38 +228,22 @@ def upsert_account_link(
         "provider": provider,
         "provider_user_id": provider_user_id,
         "auth_user_id": auth_user_id,
-        "display_name": display_name,
-        "phone": phone,
+        "display_name": (display_name or None),
+        "phone": (phone or None),
         "updated_at": _now_iso(),
     }
 
-    db = supabase()
-
-    # 1) upsert link (no chained select)
     try:
-        res = db.table("accounts").upsert(payload, on_conflict="provider,provider_user_id").execute()
+        res = supabase().table("accounts").upsert(
+            payload,
+            on_conflict="provider,provider_user_id",
+            returning="representation",
+        ).execute()
     except Exception as e:
         return {"ok": False, "error": f"DB error: {str(e)}"}
 
-    # 2) if representation is returned
-    if isinstance(getattr(res, "data", None), list) and res.data:
-        row = res.data[0]
-        return {"ok": True, "account": row, "account_id": row.get("id")}
-
-    # 3) fallback fetch
-    try:
-        got = (
-            db.table("accounts")
-            .select("*")
-            .eq("provider", provider)
-            .eq("provider_user_id", provider_user_id)
-            .limit(1)
-            .execute()
-        )
-        row = (got.data or [None])[0]
-        return {"ok": True, "account": row, "account_id": (row or {}).get("id")}
-    except Exception as e:
-        return {"ok": False, "error": f"DB error: {str(e)}"}
+    row = (res.data or [None])[0]
+    return {"ok": True, "account": row}
 
 
 # ---------------------------------------------------------
@@ -313,7 +276,7 @@ def _plan_from_subscriptions_table(auth_user_id: str) -> Tuple[Optional[Dict[str
     status = (row.get("status") or "").strip().lower() or None
 
     active = False
-    if end_dt and end_dt > _now_dt():
+    if end_dt and end_dt > _now_utc():
         active = True
     elif status in ("active", "paid", "success"):
         active = True
@@ -324,7 +287,7 @@ def _plan_from_subscriptions_table(auth_user_id: str) -> Tuple[Optional[Dict[str
             "source": "subscriptions",
             "plan": row.get("plan"),
             "status": row.get("status"),
-            "plan_expiry": end_dt.isoformat().replace("+00:00", "Z") if end_dt else None,
+            "plan_expiry": end_dt.isoformat() if end_dt else None,
             "is_active": bool(active),
         },
         None,
@@ -365,7 +328,7 @@ def _try_fetch_plan_from_table_guess(table_name: str, auth_user_id: str) -> Tupl
                     "source": table_name,
                     "plan": row.get("plan") or row.get("tier") or row.get("plan_code"),
                     "status": row.get("status"),
-                    "plan_expiry": expiry_dt.isoformat().replace("+00:00", "Z") if expiry_dt else None,
+                    "plan_expiry": expiry_dt.isoformat() if expiry_dt else None,
                     "is_active": bool(active),
                 },
                 None,
@@ -394,7 +357,7 @@ def _try_fetch_plan_from_table_guess(table_name: str, auth_user_id: str) -> Tupl
                     "source": table_name,
                     "plan": row2.get("plan") or row2.get("tier") or row2.get("plan_code"),
                     "status": row2.get("status"),
-                    "plan_expiry": expiry_dt.isoformat().replace("+00:00", "Z") if expiry_dt else None,
+                    "plan_expiry": expiry_dt.isoformat() if expiry_dt else None,
                     "is_active": bool(active),
                 },
                 None,
@@ -420,7 +383,7 @@ def get_plan_status(auth_user_id: Optional[str]) -> Dict[str, Any]:
     if err is None and plan_obj:
         return {"ok": True, **plan_obj}
 
-    debug_errors = []
+    debug_errors: List[Dict[str, str]] = []
     if err:
         debug_errors.append({"table": "subscriptions", "error": err})
 
