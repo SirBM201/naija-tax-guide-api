@@ -8,8 +8,16 @@ import uuid
 from app.core.supabase_client import supabase
 
 
+# ---------------------------------------------------------
+# Time helpers
+# ---------------------------------------------------------
+def _now_dt() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    # Always return Z-formatted UTC
+    return _now_dt().isoformat().replace("+00:00", "Z")
 
 
 def _parse_dt(value: Any) -> Optional[datetime]:
@@ -29,7 +37,7 @@ def _parse_dt(value: Any) -> Optional[datetime]:
 def _is_active_from_expiry(expiry: Optional[datetime]) -> bool:
     if not expiry:
         return False
-    return expiry > datetime.now(timezone.utc)
+    return expiry > _now_dt()
 
 
 def _is_uuid(value: str) -> bool:
@@ -79,6 +87,21 @@ def _norm_provider(provider: str) -> str:
 
 
 # ---------------------------------------------------------
+# Small validators
+# ---------------------------------------------------------
+def _validate_provider_and_id(provider: str, provider_user_id: str) -> Optional[str]:
+    if provider not in ALLOWED_PROVIDERS:
+        return "provider must be one of: wa, tg, msgr, ig, email, web"
+    if not provider_user_id:
+        return "provider_user_id required"
+    if provider == "email":
+        # light validation
+        if "@" not in provider_user_id or "." not in provider_user_id:
+            return "provider_user_id must be a valid email address for provider=email"
+    return None
+
+
+# ---------------------------------------------------------
 # Accounts: upsert / link / lookup
 # ---------------------------------------------------------
 def upsert_account(
@@ -91,19 +114,17 @@ def upsert_account(
     """
     Creates or updates an account row WITHOUT auth_user_id (pre-link state).
     Used when a message arrives before linking.
+
+    Important:
+    - Do NOT chain .select() after .upsert() (some supabase clients do not support that).
+    - We return a stable shape including account_id.
     """
     provider = _norm_provider(provider)
     provider_user_id = (provider_user_id or "").strip()
 
-    if provider not in ALLOWED_PROVIDERS:
-        return {"ok": False, "error": "provider must be one of: wa, tg, msgr, ig, email, web"}
-    if not provider_user_id:
-        return {"ok": False, "error": "provider_user_id required"}
-
-    # light validation for email
-    if provider == "email":
-        if "@" not in provider_user_id or "." not in provider_user_id:
-            return {"ok": False, "error": "provider_user_id must be a valid email address for provider=email"}
+    err = _validate_provider_and_id(provider, provider_user_id)
+    if err:
+        return {"ok": False, "error": err}
 
     payload = {
         "provider": provider,
@@ -113,19 +134,33 @@ def upsert_account(
         "updated_at": _now_iso(),
     }
 
+    db = supabase()
+
+    # 1) upsert (no chained select)
     try:
-        res = (
-            supabase()
-            .table("accounts")
-            .upsert(payload, on_conflict="provider,provider_user_id")
-            .select("*")
-            .execute()
-        )
+        res = db.table("accounts").upsert(payload, on_conflict="provider,provider_user_id").execute()
     except Exception as e:
         return {"ok": False, "error": f"DB error: {str(e)}"}
 
-    row = (res.data or [None])[0]
-    return {"ok": True, "account": row}
+    # 2) if API returned row(s), use it
+    if isinstance(getattr(res, "data", None), list) and res.data:
+        row = res.data[0]
+        return {"ok": True, "account": row, "account_id": row.get("id")}
+
+    # 3) fallback: fetch the row we just upserted
+    try:
+        got = (
+            db.table("accounts")
+            .select("*")
+            .eq("provider", provider)
+            .eq("provider_user_id", provider_user_id)
+            .limit(1)
+            .execute()
+        )
+        row = (got.data or [None])[0]
+        return {"ok": True, "account": row, "account_id": (row or {}).get("id")}
+    except Exception as e:
+        return {"ok": False, "error": f"DB error: {str(e)}"}
 
 
 def lookup_account(
@@ -139,16 +174,15 @@ def lookup_account(
     provider = _norm_provider(provider)
     provider_user_id = (provider_user_id or "").strip()
 
-    if provider not in ALLOWED_PROVIDERS:
-        return {"ok": False, "error": "provider must be one of: wa, tg, msgr, ig, email, web"}
-    if not provider_user_id:
-        return {"ok": False, "error": "provider_user_id required"}
+    err = _validate_provider_and_id(provider, provider_user_id)
+    if err:
+        return {"ok": False, "error": err}
 
     try:
         res = (
             supabase()
             .table("accounts")
-            .select("provider,provider_user_id,auth_user_id,display_name,phone,updated_at,created_at")
+            .select("id,provider,provider_user_id,auth_user_id,display_name,phone,updated_at,created_at")
             .eq("provider", provider)
             .eq("provider_user_id", provider_user_id)
             .limit(1)
@@ -159,7 +193,7 @@ def lookup_account(
 
     row = (res.data or [None])[0]
     if not row:
-        return {"ok": True, "found": False, "linked": False, "account": None}
+        return {"ok": True, "found": False, "linked": False, "auth_user_id": None, "account": None}
 
     auth_user_id = row.get("auth_user_id")
     return {
@@ -168,6 +202,7 @@ def lookup_account(
         "linked": bool(auth_user_id),
         "auth_user_id": auth_user_id,
         "account": row,
+        "account_id": row.get("id"),
     }
 
 
@@ -190,19 +225,14 @@ def upsert_account_link(
     provider_user_id = (provider_user_id or "").strip()
     auth_user_id = (auth_user_id or "").strip()
 
-    if provider not in ALLOWED_PROVIDERS:
-        return {"ok": False, "error": "provider must be one of: wa, tg, msgr, ig, email, web"}
-    if not provider_user_id:
-        return {"ok": False, "error": "provider_user_id required"}
+    err = _validate_provider_and_id(provider, provider_user_id)
+    if err:
+        return {"ok": False, "error": err}
+
     if not auth_user_id:
         return {"ok": False, "error": "auth_user_id required"}
     if not _is_uuid(auth_user_id):
         return {"ok": False, "error": "auth_user_id must be a valid uuid"}
-
-    # light validation for email
-    if provider == "email":
-        if "@" not in provider_user_id or "." not in provider_user_id:
-            return {"ok": False, "error": "provider_user_id must be a valid email address for provider=email"}
 
     # Guard: do not overwrite existing link to another user
     existing = lookup_account(provider=provider, provider_user_id=provider_user_id)
@@ -224,19 +254,33 @@ def upsert_account_link(
         "updated_at": _now_iso(),
     }
 
+    db = supabase()
+
+    # 1) upsert link (no chained select)
     try:
-        res = (
-            supabase()
-            .table("accounts")
-            .upsert(payload, on_conflict="provider,provider_user_id")
-            .select("*")
-            .execute()
-        )
+        res = db.table("accounts").upsert(payload, on_conflict="provider,provider_user_id").execute()
     except Exception as e:
         return {"ok": False, "error": f"DB error: {str(e)}"}
 
-    row = (res.data or [None])[0]
-    return {"ok": True, "account": row}
+    # 2) if representation is returned
+    if isinstance(getattr(res, "data", None), list) and res.data:
+        row = res.data[0]
+        return {"ok": True, "account": row, "account_id": row.get("id")}
+
+    # 3) fallback fetch
+    try:
+        got = (
+            db.table("accounts")
+            .select("*")
+            .eq("provider", provider)
+            .eq("provider_user_id", provider_user_id)
+            .limit(1)
+            .execute()
+        )
+        row = (got.data or [None])[0]
+        return {"ok": True, "account": row, "account_id": (row or {}).get("id")}
+    except Exception as e:
+        return {"ok": False, "error": f"DB error: {str(e)}"}
 
 
 # ---------------------------------------------------------
@@ -268,9 +312,8 @@ def _plan_from_subscriptions_table(auth_user_id: str) -> Tuple[Optional[Dict[str
     end_dt = _parse_dt(row.get("end_at"))
     status = (row.get("status") or "").strip().lower() or None
 
-    # Active decision: end_at in future OR status says active-ish
     active = False
-    if end_dt and end_dt > datetime.now(timezone.utc):
+    if end_dt and end_dt > _now_dt():
         active = True
     elif status in ("active", "paid", "success"):
         active = True
@@ -281,7 +324,7 @@ def _plan_from_subscriptions_table(auth_user_id: str) -> Tuple[Optional[Dict[str
             "source": "subscriptions",
             "plan": row.get("plan"),
             "status": row.get("status"),
-            "plan_expiry": end_dt.isoformat() if end_dt else None,
+            "plan_expiry": end_dt.isoformat().replace("+00:00", "Z") if end_dt else None,
             "is_active": bool(active),
         },
         None,
@@ -322,7 +365,7 @@ def _try_fetch_plan_from_table_guess(table_name: str, auth_user_id: str) -> Tupl
                     "source": table_name,
                     "plan": row.get("plan") or row.get("tier") or row.get("plan_code"),
                     "status": row.get("status"),
-                    "plan_expiry": expiry_dt.isoformat() if expiry_dt else None,
+                    "plan_expiry": expiry_dt.isoformat().replace("+00:00", "Z") if expiry_dt else None,
                     "is_active": bool(active),
                 },
                 None,
@@ -351,7 +394,7 @@ def _try_fetch_plan_from_table_guess(table_name: str, auth_user_id: str) -> Tupl
                     "source": table_name,
                     "plan": row2.get("plan") or row2.get("tier") or row2.get("plan_code"),
                     "status": row2.get("status"),
-                    "plan_expiry": expiry_dt.isoformat() if expiry_dt else None,
+                    "plan_expiry": expiry_dt.isoformat().replace("+00:00", "Z") if expiry_dt else None,
                     "is_active": bool(active),
                 },
                 None,
@@ -359,7 +402,6 @@ def _try_fetch_plan_from_table_guess(table_name: str, auth_user_id: str) -> Tupl
     except Exception as e:
         user_err = str(e)
 
-    # if both failed, return error summary
     return None, (auth_err or user_err)
 
 
@@ -374,7 +416,6 @@ def get_plan_status(auth_user_id: Optional[str]) -> Dict[str, Any]:
     if not auth_user_id:
         return {"ok": True, "known": False, "is_active": False, "plan": None, "status": None, "plan_expiry": None}
 
-    # 1) Your actual table first
     plan_obj, err = _plan_from_subscriptions_table(auth_user_id)
     if err is None and plan_obj:
         return {"ok": True, **plan_obj}
@@ -383,7 +424,6 @@ def get_plan_status(auth_user_id: Optional[str]) -> Dict[str, Any]:
     if err:
         debug_errors.append({"table": "subscriptions", "error": err})
 
-    # 2) Fallback tables (safe)
     candidates = ["user_subscriptions", "user_plans", "plans"]
     for t in candidates:
         obj, e = _try_fetch_plan_from_table_guess(t, auth_user_id)
