@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from flask import Blueprint, jsonify, request
 
-from app.services.accounts_service import upsert_account, lookup_account, get_plan_status
+# SAFE import: avoids "cannot import name ..." boot crash
+from app.services import accounts_service as acct
 
 bp = Blueprint("accounts", __name__)
 
@@ -29,7 +30,10 @@ def create_or_get_account():
     display_name = (body.get("display_name") or "").strip() or None
     phone = (body.get("phone") or "").strip() or None
 
-    res = upsert_account(
+    if not hasattr(acct, "upsert_account"):
+        return _bad("Server misconfigured: upsert_account missing", 500)
+
+    res = acct.upsert_account(
         provider=provider,
         provider_user_id=provider_user_id,
         display_name=display_name,
@@ -38,8 +42,8 @@ def create_or_get_account():
     if not res.get("ok"):
         return _bad(res.get("error") or "Failed")
 
-    acct = res.get("account") or {}
-    return jsonify({"ok": True, "account": acct, "account_id": acct.get("id")})
+    account = res.get("account") or {}
+    return jsonify({"ok": True, "account": account, "account_id": account.get("id")})
 
 
 @bp.get("/accounts/lookup")
@@ -51,14 +55,18 @@ def account_lookup_get():
     provider = (request.args.get("provider") or "").strip().lower()
     provider_user_id = (request.args.get("provider_user_id") or "").strip()
 
-    res = lookup_account(provider=provider, provider_user_id=provider_user_id)
+    if not hasattr(acct, "lookup_account"):
+        return _bad("Server misconfigured: lookup_account missing", 500)
+
+    res = acct.lookup_account(provider=provider, provider_user_id=provider_user_id)
     if not res.get("ok"):
         return _bad(res.get("error") or "Lookup failed")
 
     auth_user_id = res.get("auth_user_id")
-    plan_status = get_plan_status(auth_user_id) if auth_user_id else {
-        "ok": True, "known": False, "is_active": False, "plan": None, "status": None, "plan_expiry": None
-    }
+    if auth_user_id and hasattr(acct, "get_plan_status"):
+        plan_status = acct.get_plan_status(auth_user_id)
+    else:
+        plan_status = {"ok": True, "known": False, "is_active": False, "plan": None, "status": None, "plan_expiry": None}
 
     return jsonify(
         {
@@ -90,14 +98,18 @@ def account_lookup_post():
     provider = (body.get("provider") or "").strip().lower()
     provider_user_id = (body.get("provider_user_id") or "").strip()
 
-    res = lookup_account(provider=provider, provider_user_id=provider_user_id)
+    if not hasattr(acct, "lookup_account"):
+        return _bad("Server misconfigured: lookup_account missing", 500)
+
+    res = acct.lookup_account(provider=provider, provider_user_id=provider_user_id)
     if not res.get("ok"):
         return _bad(res.get("error") or "Lookup failed")
 
     auth_user_id = res.get("auth_user_id")
-    plan_status = get_plan_status(auth_user_id) if auth_user_id else {
-        "ok": True, "known": False, "is_active": False, "plan": None, "status": None, "plan_expiry": None
-    }
+    if auth_user_id and hasattr(acct, "get_plan_status"):
+        plan_status = acct.get_plan_status(auth_user_id)
+    else:
+        plan_status = {"ok": True, "known": False, "is_active": False, "plan": None, "status": None, "plan_expiry": None}
 
     return jsonify(
         {
