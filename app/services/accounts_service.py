@@ -394,4 +394,6 @@ def get_plan_status(auth_user_id: Optional[str]) -> Dict[str, Any]:
         "plan_expiry": None,
         "notes": "No subscription record found.",
         "debug_errors": debug_errors[:2],
+        print("BOOT CHECK: accounts_service loaded, has upsert_account =", "upsert_account" in globals())
+
     }
