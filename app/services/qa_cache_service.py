@@ -14,9 +14,14 @@ def _now_utc() -> datetime:
 
 def find_cached_answer(normalized_question: str, lang: str, *, max_results: int = 1) -> Optional[Dict[str, Any]]:
     """
-    Returns a single best cached row or None.
-    Also ignores poisoned cache answers (AI failures).
+    Returns the best cached row or None.
+    Ignores poisoned cache answers (AI failures).
     """
+    normalized_question = (normalized_question or "").strip()
+    lang = (lang or "en").strip().lower()
+    if not normalized_question:
+        return None
+
     try:
         res = (
             supabase()
@@ -35,7 +40,6 @@ def find_cached_answer(normalized_question: str, lang: str, *, max_results: int 
             ans = (row.get("answer") or "").strip()
             if not ans:
                 return None
-            # IMPORTANT: ignore poisoned cache entries
             if looks_like_ai_failure(ans):
                 return None
             return row
@@ -45,6 +49,7 @@ def find_cached_answer(normalized_question: str, lang: str, *, max_results: int 
 
 
 def touch_cache_best_effort(row_id: str) -> None:
+    row_id = (row_id or "").strip()
     if not row_id:
         return
 
@@ -55,12 +60,13 @@ def touch_cache_best_effort(row_id: str) -> None:
     except Exception:
         pass
 
-    # fallback (best effort)
+    # fallback
     try:
         got = supabase().table("qa_cache").select("use_count").eq("id", row_id).limit(1).execute()
         cur = 0
         if got.data:
             cur = int(got.data[0].get("use_count") or 0)
+
         supabase().table("qa_cache").update(
             {"use_count": cur + 1, "last_used_at": _now_utc().isoformat()}
         ).eq("id", row_id).execute()
