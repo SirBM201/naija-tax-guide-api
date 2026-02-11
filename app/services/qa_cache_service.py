@@ -14,12 +14,12 @@ def _now_utc() -> datetime:
 
 def find_cached_answer(normalized_question: str, lang: str, *, max_results: int = 1) -> Optional[Dict[str, Any]]:
     """
-    Returns the best cached row or None.
-    Ignores poisoned cache answers (AI failures).
+    Returns a single best cached row or None.
+    Also ignores poisoned cache answers (AI failures).
     """
-    normalized_question = (normalized_question or "").strip()
-    lang = (lang or "en").strip().lower()
-    if not normalized_question:
+    nq = (normalized_question or "").strip()
+    l = (lang or "en").strip().lower()
+    if not nq:
         return None
 
     try:
@@ -27,8 +27,8 @@ def find_cached_answer(normalized_question: str, lang: str, *, max_results: int 
             supabase()
             .table("qa_cache")
             .select("id,answer,source,priority,lang,enabled,last_used_at")
-            .eq("normalized_question", normalized_question)
-            .eq("lang", lang)
+            .eq("normalized_question", nq)
+            .eq("lang", l)
             .eq("enabled", True)
             .order("priority", desc=True)
             .order("last_used_at", desc=True)
@@ -49,27 +49,27 @@ def find_cached_answer(normalized_question: str, lang: str, *, max_results: int 
 
 
 def touch_cache_best_effort(row_id: str) -> None:
-    row_id = (row_id or "").strip()
-    if not row_id:
+    rid = (row_id or "").strip()
+    if not rid:
         return
 
     # Prefer atomic RPC if present
     try:
-        supabase().rpc("touch_qa_cache", {"p_id": row_id}).execute()
+        supabase().rpc("touch_qa_cache", {"p_id": rid}).execute()
         return
     except Exception:
         pass
 
-    # fallback
+    # fallback (best effort)
     try:
-        got = supabase().table("qa_cache").select("use_count").eq("id", row_id).limit(1).execute()
+        got = supabase().table("qa_cache").select("use_count").eq("id", rid).limit(1).execute()
         cur = 0
         if got.data:
             cur = int(got.data[0].get("use_count") or 0)
 
         supabase().table("qa_cache").update(
             {"use_count": cur + 1, "last_used_at": _now_utc().isoformat()}
-        ).eq("id", row_id).execute()
+        ).eq("id", rid).execute()
     except Exception:
         pass
 
@@ -78,13 +78,13 @@ def upsert_ai_answer_to_cache_best_effort(normalized_question: str, answer: str,
     """
     Writes ONLY good answers. If answer looks like failure => don't cache.
     """
-    normalized_question = (normalized_question or "").strip()
-    answer = (answer or "").strip()
-    lang = (lang or "en").strip().lower()
+    nq = (normalized_question or "").strip()
+    ans = (answer or "").strip()
+    l = (lang or "en").strip().lower()
 
-    if not normalized_question or not answer:
+    if not nq or not ans:
         return
-    if looks_like_ai_failure(answer):
+    if looks_like_ai_failure(ans):
         return
 
     now_iso = _now_utc().isoformat()
@@ -94,8 +94,8 @@ def upsert_ai_answer_to_cache_best_effort(normalized_question: str, answer: str,
             supabase()
             .table("qa_cache")
             .select("id")
-            .eq("normalized_question", normalized_question)
-            .eq("lang", lang)
+            .eq("normalized_question", nq)
+            .eq("lang", l)
             .limit(1)
             .execute()
         )
@@ -104,7 +104,7 @@ def upsert_ai_answer_to_cache_best_effort(normalized_question: str, answer: str,
             row_id = existing.data[0]["id"]
             supabase().table("qa_cache").update(
                 {
-                    "answer": answer,
+                    "answer": ans,
                     "source": "ai",
                     "enabled": True,
                     "last_used_at": now_iso,
@@ -114,8 +114,8 @@ def upsert_ai_answer_to_cache_best_effort(normalized_question: str, answer: str,
 
         supabase().table("qa_cache").insert(
             {
-                "normalized_question": normalized_question,
-                "answer": answer,
+                "normalized_question": nq,
+                "answer": ans,
                 "tags": [],
                 "use_count": 0,
                 "last_used_at": now_iso,
@@ -123,7 +123,7 @@ def upsert_ai_answer_to_cache_best_effort(normalized_question: str, answer: str,
                 "source": "ai",
                 "enabled": True,
                 "priority": 0,
-                "lang": lang,
+                "lang": l,
             }
         ).execute()
     except Exception:
