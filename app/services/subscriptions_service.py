@@ -17,7 +17,7 @@ def _now_utc() -> datetime:
 
 def _parse_iso(value: str) -> Optional[datetime]:
     try:
-        v = value.replace("Z", "+00:00")
+        v = (value or "").replace("Z", "+00:00")
         return datetime.fromisoformat(v)
     except Exception:
         return None
@@ -30,7 +30,11 @@ def _iso(dt: datetime) -> str:
 # -----------------------------
 # Lookups
 # -----------------------------
-def _find_account_id(account_id: Optional[str], provider: Optional[str], provider_user_id: Optional[str]) -> Optional[str]:
+def _find_account_id(
+    account_id: Optional[str],
+    provider: Optional[str],
+    provider_user_id: Optional[str],
+) -> Optional[str]:
     if account_id:
         return account_id.strip() or None
 
@@ -91,6 +95,10 @@ def _get_active_sub_row(account_id: str) -> Optional[Dict[str, Any]]:
 # Access computation
 # -----------------------------
 def _compute_access_state(sub_row: Dict[str, Any]) -> Tuple[str, Optional[str]]:
+    """
+    Returns: (state, expires_at_iso)
+      state: "active" | "expired"
+    """
     expires_at = sub_row.get("expires_at")
     is_active_flag = bool(sub_row.get("is_active"))
 
@@ -110,7 +118,22 @@ def _compute_access_state(sub_row: Dict[str, Any]) -> Tuple[str, Optional[str]]:
 # -----------------------------
 # Public API
 # -----------------------------
-def get_subscription_status(account_id: Optional[str], provider: Optional[str], provider_user_id: Optional[str]) -> Dict[str, Any]:
+def get_subscription_status(
+    account_id: Optional[str],
+    provider: Optional[str],
+    provider_user_id: Optional[str],
+) -> Dict[str, Any]:
+    """
+    Standard status shape (frontend-safe):
+      {
+        active: bool,
+        state: "none"|"active"|"expired",
+        account_id: str|None,
+        plan_code: str|None,
+        expires_at: str|None,   # ISO Z
+        reason: str
+      }
+    """
     aid = _find_account_id(account_id, provider, provider_user_id)
     if not aid:
         return {
@@ -307,7 +330,7 @@ def start_trial_if_eligible(account_id: str, trial_plan_code: str = "trial") -> 
 
 
 # -----------------------------
-# Manual activation (THIS is what your route imports)
+# Manual activation (route imports)
 # -----------------------------
 def manual_activate_subscription(account_id: str, plan_code: Optional[str], expires_at: Optional[str]) -> Dict[str, Any]:
     account_id = (account_id or "").strip()
@@ -343,17 +366,27 @@ def manual_activate_subscription(account_id: str, plan_code: Optional[str], expi
 
 
 # -----------------------------
-# Payment success handler (called by Paystack webhook)
+# Payment success handler (Paystack webhook)
 # -----------------------------
 _REF_AMOUNTS_KOBO = {1: 400 * 100, 2: 200 * 100, 3: 100 * 100}
 
 
 def _get_referrer_level1(referred_account_id: str) -> Optional[str]:
+    referred_account_id = (referred_account_id or "").strip()
+    if not referred_account_id:
+        return None
+
     db = supabase()
     try:
-        r = db.table("referrals").select("referrer_id").eq("referred_id", referred_account_id).limit(1).execute()
+        r = (
+            db.table("referrals")
+            .select("referrer_id")
+            .eq("referred_id", referred_account_id)
+            .limit(1)
+            .execute()
+        )
         if r.data:
-            return r.data[0].get("referrer_id")
+            return (r.data[0].get("referrer_id") or "").strip() or None
     except Exception:
         pass
     return None
@@ -367,6 +400,11 @@ def _build_ref_chain(referred_account_id: str) -> Dict[int, Optional[str]]:
 
 
 def _create_referral_earnings_best_effort(referred_account_id: str, plan_code: str, reference: Optional[str]) -> None:
+    """
+    Inserts 3-level referral earnings as pending.
+    NOTE: Strongly recommended to add a UNIQUE constraint later to enforce idempotency:
+      unique(referrer_account_id, referred_account_id, plan_code, level, reference)
+    """
     db = supabase()
     chain = _build_ref_chain(referred_account_id)
     now_iso = _iso(_now_utc())
@@ -387,7 +425,6 @@ def _create_referral_earnings_best_effort(referred_account_id: str, plan_code: s
             "level": level,
         }
 
-        # Best effort insert (idempotency should be enforced by a DB unique constraint if you add one)
         try:
             db.table("referral_earnings").insert(row).execute()
         except Exception:
@@ -419,9 +456,9 @@ def handle_payment_success(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     now_iso = _iso(_now_utc())
 
-    # payments: upsert success (only if we have required fields)
+    # payments: upsert success
     try:
-        if reference and wa_phone:
+        if reference:
             db.table("payments").upsert(
                 {
                     "reference": reference,
@@ -446,10 +483,15 @@ def handle_payment_success(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     # subscription apply
     if upgrade_mode == "at_expiry":
-        row = schedule_plan_change_at_expiry(account_id, plan_code)
-        return {"ok": True, "mode": "scheduled", "subscription": row}
+        sub = schedule_plan_change_at_expiry(account_id, plan_code)
+        return {
+            "ok": True,
+            "mode": "scheduled",
+            "subscription": sub,
+            "plan_expiry": sub.get("expires_at"),
+        }
 
-    row = activate_subscription_now(account_id, plan_code, status="active")
+    sub = activate_subscription_now(account_id, plan_code, status="active")
 
     # referral earnings (best-effort)
     try:
@@ -457,7 +499,12 @@ def handle_payment_success(payload: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         pass
 
-    return {"ok": True, "mode": "activated", "subscription": row}
+    return {
+        "ok": True,
+        "mode": "activated",
+        "subscription": sub,
+        "plan_expiry": sub.get("expires_at"),
+    }
 
 
 # -----------------------------
@@ -468,18 +515,13 @@ def expire_overdue_subscriptions(*, batch_limit: int = 1000) -> Dict[str, Any]:
     Best-effort maintenance job:
     - Finds subscriptions where is_active=True but expires_at is in the past
     - Marks them expired (is_active=False, status='expired')
-    - Returns how many were expired in this run
-
-    This keeps DB state consistent and makes paywall lock/unlock reliable.
     """
-
     db = supabase()
     now_iso = _iso(_now_utc())
 
-    # Find overdue active subscriptions (batch)
     res = (
         db.table("user_subscriptions")
-        .select("id")
+        .select("id,expires_at")
         .eq("is_active", True)
         .lt("expires_at", now_iso)
         .limit(int(batch_limit))
@@ -492,18 +534,12 @@ def expire_overdue_subscriptions(*, batch_limit: int = 1000) -> Dict[str, Any]:
 
     try:
         db.table("user_subscriptions").update(
-            {
-                "is_active": False,
-                "status": "expired",
-                "updated_at": now_iso,
-            }
+            {"is_active": False, "status": "expired", "updated_at": now_iso}
         ).in_("id", ids).execute()
     except Exception:
-        # fallback: minimal update
         try:
             db.table("user_subscriptions").update({"is_active": False}).in_("id", ids).execute()
         except Exception:
             return {"ok": False, "expired": 0, "error": "update_failed"}
 
     return {"ok": True, "expired": len(ids)}
-
