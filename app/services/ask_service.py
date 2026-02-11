@@ -1,5 +1,4 @@
 # app/services/ask_service.py
-
 from __future__ import annotations
 
 import os
@@ -17,7 +16,7 @@ from ..services.subscriptions_service import get_subscription_status
 # Paid plan total daily limit (cache + AI)
 PAID_DAILY_LIMIT = int((os.getenv("PAID_DAILY_LIMIT", "300") or "300").strip())
 
-# Free (no active plan) limits
+# Free (no active plan) limits: 20 cache/day + 1 AI/day
 FREE_CACHE_DAILY_LIMIT = int((os.getenv("FREE_CACHE_DAILY_LIMIT", "20") or "20").strip())
 FREE_AI_DAILY_LIMIT = int((os.getenv("FREE_AI_DAILY_LIMIT", "1") or "1").strip())
 
@@ -52,8 +51,8 @@ def _normalize_lang(lang: Optional[str]) -> str:
 
 def _normalize_question_for_cache(question: str) -> str:
     q = (question or "").strip().lower()
-    q = re.sub(r"[^\w\s]", " ", q)      # remove punctuation
-    q = re.sub(r"\s+", " ", q).strip()  # collapse spaces
+    q = re.sub(r"[^\w\s]", " ", q)       # remove punctuation
+    q = re.sub(r"\s+", " ", q).strip()   # collapse spaces
     return q
 
 
@@ -69,7 +68,7 @@ def _today_utc_date_str() -> str:
 # Costs
 # ------------------------------------------------------------
 def _cost_for_mode(mode: str) -> int:
-    # Only charged when AI credits are used (paid users)
+    # Only charged when PAID users hit AI credits ledger
     return 3 if mode == "voice" else 1
 
 
@@ -199,6 +198,7 @@ def _check_and_increment_paid_daily_usage(account_id: str, limit_per_day: int) -
             "bump_daily_question_usage",
             {"p_account_id": account_id, "p_day": day.isoformat(), "p_limit": int(limit_per_day)},
         ).execute()
+
         data = res.data or {}
         if isinstance(data, list):
             data = data[0] if data else {}
@@ -238,7 +238,7 @@ def _check_and_increment_paid_daily_usage(account_id: str, limit_per_day: int) -
         ).execute()
         return True, 1
     except Exception:
-        # do not block if table misbehaves
+        # fail open
         return True, 0
 
 
@@ -273,8 +273,7 @@ def _bump_free_counter(account_id: str, which: str) -> Tuple[int, int]:
     """
     day_str = _today_utc_date_str()
 
-    # Prefer atomic RPCs if you later add them
-    # bump_daily_question_counters(p_account_id, p_day, p_kind) -> {cache_used, ai_used}
+    # Optional future RPC
     try:
         res = supabase().rpc(
             "bump_daily_question_counters",
@@ -288,7 +287,7 @@ def _bump_free_counter(account_id: str, which: str) -> Tuple[int, int]:
     except Exception:
         pass
 
-    # Fallback: upsert row then increment (best effort)
+    # Fallback: read then update/insert (best effort)
     try:
         got = (
             supabase()
@@ -317,7 +316,6 @@ def _bump_free_counter(account_id: str, which: str) -> Tuple[int, int]:
             ).eq("account_id", account_id).eq("day", day_str).execute()
             return cache_used, ai_used
 
-        # create new row
         cache_used = 1 if which == "cache" else 0
         ai_used = 1 if which == "ai" else 0
         supabase().table("daily_question_counters").insert(
@@ -345,11 +343,7 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": False, "reason": "missing_question", "message": "Question is required.", "plan_expiry": None}
 
     # Resolve subscription/account info (even if inactive we still want account_id)
-    status = get_subscription_status(
-        account_id=account_id,
-        provider=provider,
-        provider_user_id=provider_user_id,
-    )
+    status = get_subscription_status(account_id=account_id, provider=provider, provider_user_id=provider_user_id)
 
     aid = (status.get("account_id") or account_id or "").strip() or None
     if not aid:
@@ -358,12 +352,12 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
     normalized_q = _normalize_question_for_cache(question)
 
     # ============================================================
-    # FREE USERS (no active plan): 20 cache hits/day + 1 AI/day
+    # FREE USERS (no active plan): 20 cache/day + 1 AI/day
     # ============================================================
     if not status.get("active"):
         cached = _find_cached_answer(normalized_q, lang)
 
-        # 1) Cache hit path (counts toward free cache limit)
+        # Cache hit path (counts toward free cache limit)
         if cached and cached.get("answer"):
             cache_used, ai_used = _get_free_counters(aid)
             if cache_used >= FREE_CACHE_DAILY_LIMIT:
@@ -395,7 +389,7 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
                 "daily_limit": FREE_CACHE_DAILY_LIMIT + FREE_AI_DAILY_LIMIT,
             }
 
-        # 2) Cache miss => allow max 1 AI/day (no ledger for free)
+        # Cache miss => allow max 1 AI/day (NO ledger for free)
         cache_used, ai_used = _get_free_counters(aid)
         if ai_used >= FREE_AI_DAILY_LIMIT:
             return {
@@ -477,9 +471,10 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
     # Cache miss => deduct credits => AI
     cost = _cost_for_mode(mode)
 
+    spend_data: Any = {"ok": False, "reason": "ledger_error"}
     try:
-        spend = supabase().rpc("consume_ai_credits", {"p_account_id": aid, "p_cost": cost}).execute()
-        spend_data: Any = spend.data or {}
+        spend = supabase().rpc("consume_ai_credits", {"p_account_id": aid, "p_cost": int(cost)}).execute()
+        spend_data = spend.data or {}
         if isinstance(spend_data, list):
             spend_data = spend_data[0] if spend_data else {}
     except Exception:
@@ -523,7 +518,7 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
     # If AI failed, refund credit (best effort)
     if not answer or "AI service not configured" in (answer or ""):
         try:
-            supabase().rpc("refund_ai_credits", {"p_account_id": aid, "p_cost": cost}).execute()
+            supabase().rpc("refund_ai_credits", {"p_account_id": aid, "p_cost": int(cost)}).execute()
         except Exception:
             pass
         return {
