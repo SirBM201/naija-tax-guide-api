@@ -1,85 +1,84 @@
 # app/services/outbound_service.py
+
+from __future__ import annotations
+
 import os
 import logging
-from typing import Optional, Dict, Any
-
 import requests
+from typing import Optional
 
-log = logging.getLogger(__name__)
-
-# ---------------------------
+# -----------------------------
 # WhatsApp (Meta Cloud API)
-# ---------------------------
-WHATSAPP_ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "").strip()
-WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "").strip()
-WHATSAPP_VERSION = os.getenv("WHATSAPP_VERSION", "v20.0").strip()
-META_GRAPH_BASE = os.getenv("META_GRAPH_BASE", "https://graph.facebook.com").strip()
-
-# ---------------------------
-# Telegram
-# ---------------------------
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+# -----------------------------
+WA_ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "").strip()
+WA_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "").strip()
+WA_API_BASE = f"https://graph.facebook.com/v20.0/{WA_PHONE_NUMBER_ID}/messages"
 
 
-def send_whatsapp_text(to_wa_id: str, text: str) -> Dict[str, Any]:
+def send_whatsapp_text(to_phone: str, text: str, *, preview_url: bool = False) -> bool:
     """
-    Sends a WhatsApp text message via Meta Cloud API.
-    Requires:
-      WHATSAPP_ACCESS_TOKEN
-      WHATSAPP_PHONE_NUMBER_ID
+    Sends a WhatsApp text message.
+    Returns True on success, False on failure.
     """
-    to_wa_id = (to_wa_id or "").strip()
-    text = (text or "").strip()
-    if not to_wa_id or not text:
-        return {"ok": False, "error": "missing_to_or_text"}
+    to_phone = (to_phone or "").strip()
+    if not to_phone or not text:
+        return False
 
-    if not WHATSAPP_ACCESS_TOKEN or not WHATSAPP_PHONE_NUMBER_ID:
-        return {"ok": False, "error": "missing_whatsapp_env_vars"}
+    if not (WA_ACCESS_TOKEN and WA_PHONE_NUMBER_ID):
+        logging.warning("WhatsApp env not set (WHATSAPP_ACCESS_TOKEN/WHATSAPP_PHONE_NUMBER_ID)")
+        return False
 
-    url = f"{META_GRAPH_BASE}/{WHATSAPP_VERSION}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
-    headers = {
-        "Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}",
-        "Content-Type": "application/json",
-    }
     payload = {
         "messaging_product": "whatsapp",
-        "to": to_wa_id,
+        "to": to_phone,
         "type": "text",
-        "text": {"body": text},
+        "text": {"preview_url": bool(preview_url), "body": str(text)},
+    }
+    headers = {
+        "Authorization": f"Bearer {WA_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
     }
 
     try:
-        r = requests.post(url, headers=headers, json=payload, timeout=20)
-        if r.status_code >= 200 and r.status_code < 300:
-            return {"ok": True, "status": r.status_code, "data": r.json()}
-        return {"ok": False, "status": r.status_code, "error": r.text}
+        r = requests.post(WA_API_BASE, json=payload, headers=headers, timeout=20)
+        if r.status_code >= 300:
+            logging.warning("WA send failed: %s %s", r.status_code, r.text)
+            return False
+        return True
     except Exception as e:
-        log.exception("send_whatsapp_text failed: %s", e)
-        return {"ok": False, "error": str(e)}
+        logging.exception("WA send exception: %s", e)
+        return False
 
 
-def send_telegram_text(chat_id: str, text: str) -> Dict[str, Any]:
+# -----------------------------
+# Telegram
+# -----------------------------
+TG_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TG_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
+
+
+def send_telegram_text(chat_id: str | int, text: str) -> bool:
     """
-    Sends a Telegram message via Bot API.
-    Requires:
-      TELEGRAM_BOT_TOKEN
+    Sends a Telegram message.
+    Returns True on success, False on failure.
     """
-    chat_id = (chat_id or "").strip()
-    text = (text or "").strip()
-    if not chat_id or not text:
-        return {"ok": False, "error": "missing_chat_id_or_text"}
+    if not TG_BOT_TOKEN:
+        logging.warning("Telegram env not set (TELEGRAM_BOT_TOKEN)")
+        return False
 
-    if not TELEGRAM_BOT_TOKEN:
-        return {"ok": False, "error": "missing_telegram_bot_token"}
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text}
+    if chat_id is None or not str(chat_id).strip() or not text:
+        return False
 
     try:
-        r = requests.post(url, json=payload, timeout=20)
-        if r.status_code >= 200 and r.status_code < 300:
-            return {"ok": True, "status": r.status_code, "data": r.json()}
-        return {"ok": False, "status": r.status_code, "error": r.text}
+        r = requests.post(
+            f"{TG_API}/sendMessage",
+            json={"chat_id": chat_id, "text": str(text)},
+            timeout=20,
+        )
+        if r.status_code >= 300:
+            logging.warning("TG send failed: %s %s", r.status_code, r.text)
+            return False
+        return True
     except Exception as e:
-        log.exception("send_telegram_text failed: %s", e)
-        return {"ok": False, "error": str(e)}
+        logging.exception("TG send exception: %s", e)
+        return False
