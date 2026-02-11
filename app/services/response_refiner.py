@@ -31,19 +31,10 @@ def looks_like_ai_failure(text: str) -> bool:
 
 
 def refine_answer(raw: str, *, lang: str = "en", source: str = "ai") -> Optional[str]:
-    """
-    Return a clean answer or None if it's an AI failure / empty.
-    Minimal changes (safe for production).
-    """
     txt = (raw or "").strip()
     if not txt:
         return None
-
     if looks_like_ai_failure(txt):
         return None
-
-    # Optional: small cleanup (no heavy formatting)
-    # Remove repeated whitespace
     txt = "\n".join([line.rstrip() for line in txt.splitlines()]).strip()
-
     return txt or None
