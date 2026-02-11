@@ -4,13 +4,14 @@ from __future__ import annotations
 import os
 import logging
 import requests
+from typing import Optional
 
+# ----------------------------
+# WhatsApp (Meta Cloud API)
+# ----------------------------
+WA_ACCESS_TOKEN = (os.getenv("WHATSAPP_ACCESS_TOKEN") or "").strip()
+WA_PHONE_NUMBER_ID = (os.getenv("WHATSAPP_PHONE_NUMBER_ID") or "").strip()
 
-# -------------------------
-# WhatsApp (Meta Cloud)
-# -------------------------
-WA_ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "").strip()
-WA_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "").strip()
 WA_API_BASE = f"https://graph.facebook.com/v20.0/{WA_PHONE_NUMBER_ID}/messages"
 
 
@@ -30,7 +31,10 @@ def send_whatsapp_text(to_phone: str, text: str) -> bool:
         "type": "text",
         "text": {"preview_url": False, "body": text},
     }
-    headers = {"Authorization": f"Bearer {WA_ACCESS_TOKEN}", "Content-Type": "application/json"}
+    headers = {
+        "Authorization": f"Bearer {WA_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
 
     try:
         r = requests.post(WA_API_BASE, json=payload, headers=headers, timeout=15)
@@ -43,15 +47,15 @@ def send_whatsapp_text(to_phone: str, text: str) -> bool:
         return False
 
 
-# -------------------------
+# ----------------------------
 # Telegram
-# -------------------------
-TG_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+# ----------------------------
+TG_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 TG_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
 
 def send_telegram_text(chat_id: str, text: str) -> bool:
-    chat_id = str(chat_id or "").strip()
+    chat_id = (chat_id or "").strip()
     text = (text or "").strip()
     if not chat_id or not text:
         return False
