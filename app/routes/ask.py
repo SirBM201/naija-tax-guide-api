@@ -19,28 +19,19 @@ def ask():
       "account_id": "<uuid>"  OR
       "provider": "wa|tg|web",
       "provider_user_id": "<id>",
-
       "question": "<text>",
       "lang": "en|pcm|yo|ig|ha" (optional)
     }
     """
-
     body = request.get_json(silent=True) or {}
 
     question = (body.get("question") or "").strip()
     if not question:
-        return jsonify({
-            "ok": False,
-            "error": "question is required"
-        }), 400
+        return jsonify({"ok": False, "error": "question is required"}), 400
 
     try:
         resp = ask_guarded(body)
-        return jsonify(resp)
-
-    except Exception as e:
-        return jsonify({
-            "ok": False,
-            "error": "ask_failed",
-            "details": str(e)
-        }), 500
+        return jsonify(resp), (200 if resp.get("ok") else 200)
+    except Exception:
+        # Keep response safe (no stack traces / secrets)
+        return jsonify({"ok": False, "error": "ask_failed"}), 500
