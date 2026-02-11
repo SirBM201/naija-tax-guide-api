@@ -7,7 +7,7 @@ from datetime import datetime, timezone, date
 from typing import Any, Dict, Optional, Tuple
 
 from ..core.supabase_client import supabase
-from ..services.ai_service import ask_ai
+from ..services.ai_service import ask_ai, ai_ready, get_last_ai_error
 from ..services.subscriptions_service import get_subscription_status
 from ..services.qa_cache_service import (
     find_cached_answer,
@@ -16,16 +16,17 @@ from ..services.qa_cache_service import (
 )
 from ..services.response_refiner import refine_answer
 
+
 # ------------------------------------------------------------
 # ENV / Config
 # ------------------------------------------------------------
 PAID_CACHE_DAILY_LIMIT = int((os.getenv("PAID_CACHE_DAILY_LIMIT", "1000") or "1000").strip())
 HARD_DAILY_MAX = int((os.getenv("HARD_DAILY_MAX", "1500") or "1500").strip())
-
 FREE_CACHE_DAILY_LIMIT = int((os.getenv("FREE_CACHE_DAILY_LIMIT", "20") or "20").strip())
 FREE_AI_DAILY_LIMIT = int((os.getenv("FREE_AI_DAILY_LIMIT", "1") or "1").strip())
-
 CACHE_MAX_RESULTS = int((os.getenv("CACHE_MAX_RESULTS", "1") or "1").strip())
+
+ENV = (os.getenv("ENV", "prod") or "prod").strip().lower()
 
 
 # ------------------------------------------------------------
@@ -133,7 +134,7 @@ def _bump_total_used_today_best_effort(account_id: str, hard_limit: int) -> int:
     except Exception:
         pass
 
-    # Fallback (best-effort)
+    # Fallback
     try:
         got = (
             supabase()
@@ -196,7 +197,7 @@ def _bump_counter(account_id: str, which: str) -> Tuple[int, int]:
     except Exception:
         pass
 
-    # Fallback (best-effort)
+    # Fallback
     try:
         got = (
             supabase()
@@ -271,10 +272,15 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": False, "reason": "missing_question", "message": "Question is required.", "plan_expiry": None}
 
     status = get_subscription_status(account_id=account_id, provider=provider, provider_user_id=provider_user_id)
-
     aid = (status.get("account_id") or account_id or "").strip() or None
+
     if not aid:
-        return {"ok": False, "reason": "account_not_found", "message": "Account not found.", "plan_expiry": status.get("expires_at")}
+        return {
+            "ok": False,
+            "reason": "account_not_found",
+            "message": "Account not found.",
+            "plan_expiry": status.get("expires_at"),
+        }
 
     normalized_q = _normalize_question_for_cache(question)
 
@@ -291,7 +297,7 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     # ============================================================
-    # CACHE FIRST (ALWAYS) — also ignores poisoned cache entries
+    # CACHE FIRST (ALWAYS)
     # ============================================================
     cached = find_cached_answer(normalized_q, lang, max_results=CACHE_MAX_RESULTS)
 
@@ -311,7 +317,7 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
                     "daily_limit": FREE_CACHE_DAILY_LIMIT + FREE_AI_DAILY_LIMIT,
                 }
 
-            ans = cached["answer"]
+            ans = (cached["answer"] or "").strip()
             touch_cache_best_effort(cached.get("id") or "")
             cache_used2, ai_used2 = _bump_counter(aid, "cache")
             new_total = _bump_total_used_today_best_effort(aid, HARD_DAILY_MAX)
@@ -345,6 +351,19 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
                 "daily_limit": FREE_CACHE_DAILY_LIMIT + FREE_AI_DAILY_LIMIT,
             }
 
+        # Block early if OpenAI is not connected
+        ready, why = ai_ready()
+        if not ready:
+            return {
+                "ok": False,
+                "reason": "ask_failed",
+                "message": "AI replies are enabled, but OpenAI is not connected yet.",
+                "plan_expiry": None,
+                "daily_used": total_used,
+                "daily_limit": HARD_DAILY_MAX,
+                "debug": why if ENV != "prod" else None,
+            }
+
         raw = ask_ai(question, lang=lang)
         refined = refine_answer(raw or "", lang=lang, source="ai")
 
@@ -356,12 +375,12 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
                 "plan_expiry": None,
                 "daily_used": total_used,
                 "daily_limit": HARD_DAILY_MAX,
+                "debug": (get_last_ai_error() if ENV != "prod" else None),
             }
 
         cache_used2, ai_used2 = _bump_counter(aid, "ai")
         new_total = _bump_total_used_today_best_effort(aid, HARD_DAILY_MAX)
 
-        # Cache ONLY refined success answers
         upsert_ai_answer_to_cache_best_effort(normalized_q, refined, lang)
         _log_usage_best_effort(aid, question, refined)
 
@@ -398,7 +417,7 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
                 "cache_limit": PAID_CACHE_DAILY_LIMIT,
             }
 
-        ans = cached["answer"]
+        ans = (cached["answer"] or "").strip()
         touch_cache_best_effort(cached.get("id") or "")
         cache_used2 = _bump_paid_cache_used(aid)
         new_total = _bump_total_used_today_best_effort(aid, HARD_DAILY_MAX)
@@ -420,7 +439,21 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
             "cache_limit": PAID_CACHE_DAILY_LIMIT,
         }
 
-    # Cache miss => AI with credit ledger
+    # PAID: Cache miss => AI with credit ledger
+    # Block early if OpenAI is not connected (avoid burning credits)
+    ready, why = ai_ready()
+    if not ready:
+        return {
+            "ok": False,
+            "reason": "ask_failed",
+            "message": "AI replies are enabled, but OpenAI is not connected yet.",
+            "plan_expiry": status.get("expires_at"),
+            "daily_used": total_used,
+            "daily_limit": HARD_DAILY_MAX,
+            "cache_limit": PAID_CACHE_DAILY_LIMIT,
+            "debug": why if ENV != "prod" else None,
+        }
+
     cost = _cost_for_mode(mode)
 
     try:
@@ -471,25 +504,9 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
             "daily_used": total_used,
             "daily_limit": HARD_DAILY_MAX,
             "cache_limit": PAID_CACHE_DAILY_LIMIT,
+            "debug": (get_last_ai_error() if ENV != "prod" else None),
         }
 
     new_total = _bump_total_used_today_best_effort(aid, HARD_DAILY_MAX)
 
-    # Cache ONLY refined success answers
     upsert_ai_answer_to_cache_best_effort(normalized_q, refined, lang)
-    _log_usage_best_effort(aid, question, refined)
-
-    return {
-        "ok": True,
-        "answer": refined,
-        "audio_url": None,
-        "mode": mode,
-        "used_cache": False,
-        "ai_hit": True,
-        "cost": cost,
-        "credits_remaining": spend_data.get("credits_remaining"),
-        "plan_expiry": status.get("expires_at"),
-        "daily_used": new_total,
-        "daily_limit": HARD_DAILY_MAX,
-        "cache_limit": PAID_CACHE_DAILY_LIMIT,
-    }
