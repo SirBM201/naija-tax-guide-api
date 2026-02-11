@@ -1,12 +1,8 @@
 # app/services/ai_service.py
-
 from __future__ import annotations
 
 import os
-from typing import Optional, Tuple
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()
+from typing import Optional
 
 SYSTEM_PROMPT = """
 You are Naija Tax AI — a professional Nigerian tax assistant.
@@ -24,8 +20,8 @@ Be concise, accurate, and practical.
 """.strip()
 
 _ai_client = None
-_openai_import_error: Optional[str] = None
 _last_error: Optional[str] = None
+_openai_import_error: Optional[str] = None
 
 
 def _set_last_error(msg: str) -> None:
@@ -37,13 +33,23 @@ def get_last_ai_error() -> Optional[str]:
     return _last_error
 
 
+def _env(name: str, default: str = "") -> str:
+    return (os.getenv(name, default) or "").strip()
+
+
 def _get_client():
+    """
+    Create a singleton OpenAI client.
+    IMPORTANT: reads OPENAI_API_KEY at runtime (not only at import time)
+    so deploy env changes work without code changes.
+    """
     global _ai_client, _openai_import_error
 
     if _ai_client is not None:
         return _ai_client
 
-    if not OPENAI_API_KEY:
+    api_key = _env("OPENAI_API_KEY")
+    if not api_key:
         _openai_import_error = "OPENAI_API_KEY not set"
         _set_last_error(_openai_import_error)
         return None
@@ -51,16 +57,16 @@ def _get_client():
     try:
         from openai import OpenAI
     except Exception as e:
-        _openai_import_error = f"openai import failed: {e}"
-        _set_last_error(_openai_import_error)
+        _openai_import_error = f"openai import failed"
+        _set_last_error(f"openai import failed: {type(e).__name__}")
         return None
 
     try:
-        _ai_client = OpenAI(api_key=OPENAI_API_KEY)
+        _ai_client = OpenAI(api_key=api_key)
         return _ai_client
     except Exception as e:
-        _openai_import_error = f"OpenAI client init failed: {e}"
-        _set_last_error(_openai_import_error)
+        _openai_import_error = "OpenAI client init failed"
+        _set_last_error(f"OpenAI client init failed: {type(e).__name__}")
         return None
 
 
@@ -72,18 +78,21 @@ def ask_ai(question: str, lang: str = "en") -> Optional[str]:
     """
     q = (question or "").strip()
     if not q:
+        _set_last_error("empty question")
         return None
 
     client = _get_client()
     if client is None:
-        _set_last_error("AI not configured")
+        # last_error already set inside _get_client()
         return None
+
+    model = _env("OPENAI_MODEL", "gpt-4.1-mini")
 
     try:
         user_msg = f"[Language: {lang}] {q}" if lang else q
 
         resp = client.responses.create(
-            model=OPENAI_MODEL,
+            model=model,
             input=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_msg},
@@ -91,15 +100,17 @@ def ask_ai(question: str, lang: str = "en") -> Optional[str]:
             temperature=0.3,
         )
 
-        if not getattr(resp, "output", None):
+        # Extract output_text
+        out = getattr(resp, "output", None)
+        if not out:
             _set_last_error("No output from model")
             return None
 
-        for item in resp.output:
+        for item in out:
             if getattr(item, "type", None) == "message":
-                for c in (item.content or []):
+                for c in (getattr(item, "content", None) or []):
                     if getattr(c, "type", None) == "output_text":
-                        text = (c.text or "").strip()
+                        text = (getattr(c, "text", "") or "").strip()
                         if text:
                             _set_last_error("")
                             return text
@@ -108,6 +119,20 @@ def ask_ai(question: str, lang: str = "en") -> Optional[str]:
         return None
 
     except Exception as e:
-        # IMPORTANT: do not return raw exception text to users and do not allow it into cache
-        _set_last_error(str(e))
+        # Try to classify common OpenAI errors without leaking secrets
+        msg = str(e).lower()
+
+        if "401" in msg or "unauthorized" in msg or "invalid_api_key" in msg:
+            _set_last_error("OpenAI 401 Unauthorized (check OPENAI_API_KEY in Koyeb env vars)")
+            return None
+
+        if "429" in msg or "rate limit" in msg or "quota" in msg:
+            _set_last_error("OpenAI rate/quota limit reached (429). Try again later.")
+            return None
+
+        if "timeout" in msg:
+            _set_last_error("OpenAI request timed out. Try again.")
+            return None
+
+        _set_last_error(f"OpenAI request failed: {type(e).__name__}")
         return None
