@@ -1,5 +1,4 @@
 # app/services/ask_service.py
-
 from __future__ import annotations
 
 import os
@@ -120,6 +119,7 @@ def _bump_total_used_today_best_effort(account_id: str, hard_limit: int) -> int:
     day_str = _today_utc_date_str()
     day = date.fromisoformat(day_str)
 
+    # Prefer RPC (atomic)
     try:
         res = supabase().rpc(
             "bump_daily_question_usage",
@@ -133,6 +133,7 @@ def _bump_total_used_today_best_effort(account_id: str, hard_limit: int) -> int:
     except Exception:
         pass
 
+    # Fallback (best-effort)
     try:
         got = (
             supabase()
@@ -181,6 +182,7 @@ def _get_free_counters(account_id: str) -> Tuple[int, int]:
 def _bump_counter(account_id: str, which: str) -> Tuple[int, int]:
     day_str = _today_utc_date_str()
 
+    # Prefer RPC (atomic)
     try:
         res = supabase().rpc(
             "bump_daily_question_counters",
@@ -194,6 +196,7 @@ def _bump_counter(account_id: str, which: str) -> Tuple[int, int]:
     except Exception:
         pass
 
+    # Fallback (best-effort)
     try:
         got = (
             supabase()
@@ -288,7 +291,7 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     # ============================================================
-    # 1) CACHE FIRST (ALWAYS)
+    # CACHE FIRST (ALWAYS) — also ignores poisoned cache entries
     # ============================================================
     cached = find_cached_answer(normalized_q, lang, max_results=CACHE_MAX_RESULTS)
 
@@ -343,7 +346,8 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
             }
 
         raw = ask_ai(question, lang=lang)
-        refined = refine_answer(raw or "", lang=lang, source="ai") if raw else None
+        refined = refine_answer(raw or "", lang=lang, source="ai")
+
         if not refined:
             return {
                 "ok": False,
@@ -429,7 +433,6 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
 
     if not spend_data.get("ok"):
         reason = spend_data.get("reason") or "out_of_credits"
-
         if reason in ("insufficient_credits", "out_of_credits"):
             return {
                 "ok": False,
@@ -441,7 +444,6 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
                 "daily_limit": HARD_DAILY_MAX,
                 "cache_limit": PAID_CACHE_DAILY_LIMIT,
             }
-
         return {
             "ok": False,
             "reason": reason,
@@ -453,7 +455,7 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     raw = ask_ai(question, lang=lang)
-    refined = refine_answer(raw or "", lang=lang, source="ai") if raw else None
+    refined = refine_answer(raw or "", lang=lang, source="ai")
 
     # AI failed => refund credits, do NOT cache
     if not refined:
@@ -486,4 +488,8 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
         "ai_hit": True,
         "cost": cost,
         "credits_remaining": spend_data.get("credits_remaining"),
-        "plan_exp_
+        "plan_expiry": status.get("expires_at"),
+        "daily_used": new_total,
+        "daily_limit": HARD_DAILY_MAX,
+        "cache_limit": PAID_CACHE_DAILY_LIMIT,
+    }
