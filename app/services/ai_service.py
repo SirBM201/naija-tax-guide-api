@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import os
-from typing import Optional
+from typing import Optional, Tuple
 
 SYSTEM_PROMPT = """
 You are Naija Tax AI — a professional Nigerian tax assistant.
@@ -21,7 +21,6 @@ Be concise, accurate, and practical.
 
 _ai_client = None
 _last_error: Optional[str] = None
-_openai_import_error: Optional[str] = None
 
 
 def _set_last_error(msg: str) -> None:
@@ -39,35 +38,45 @@ def _env(name: str, default: str = "") -> str:
 
 def _get_client():
     """
-    Create a singleton OpenAI client.
-    IMPORTANT: reads OPENAI_API_KEY at runtime (not only at import time)
-    so deploy env changes work without code changes.
+    Singleton OpenAI client.
+    IMPORTANT: reads OPENAI_API_KEY at runtime (so env updates work).
     """
-    global _ai_client, _openai_import_error
+    global _ai_client
 
     if _ai_client is not None:
         return _ai_client
 
     api_key = _env("OPENAI_API_KEY")
     if not api_key:
-        _openai_import_error = "OPENAI_API_KEY not set"
-        _set_last_error(_openai_import_error)
+        _set_last_error("OPENAI_API_KEY not set")
         return None
 
     try:
         from openai import OpenAI
     except Exception as e:
-        _openai_import_error = f"openai import failed"
         _set_last_error(f"openai import failed: {type(e).__name__}")
         return None
 
     try:
         _ai_client = OpenAI(api_key=api_key)
+        _set_last_error("")
         return _ai_client
     except Exception as e:
-        _openai_import_error = "OpenAI client init failed"
         _set_last_error(f"OpenAI client init failed: {type(e).__name__}")
         return None
+
+
+def ai_ready() -> Tuple[bool, str]:
+    """
+    Lets ask_service block early (before spending credits) when AI is not configured.
+    """
+    api_key = _env("OPENAI_API_KEY")
+    if not api_key:
+        return False, "OPENAI_API_KEY not set"
+    c = _get_client()
+    if c is None:
+        return False, (get_last_ai_error() or "AI client not ready")
+    return True, ""
 
 
 def ask_ai(question: str, lang: str = "en") -> Optional[str]:
@@ -83,7 +92,7 @@ def ask_ai(question: str, lang: str = "en") -> Optional[str]:
 
     client = _get_client()
     if client is None:
-        # last_error already set inside _get_client()
+        # last_error already set
         return None
 
     model = _env("OPENAI_MODEL", "gpt-4.1-mini")
@@ -100,7 +109,6 @@ def ask_ai(question: str, lang: str = "en") -> Optional[str]:
             temperature=0.3,
         )
 
-        # Extract output_text
         out = getattr(resp, "output", None)
         if not out:
             _set_last_error("No output from model")
@@ -119,7 +127,6 @@ def ask_ai(question: str, lang: str = "en") -> Optional[str]:
         return None
 
     except Exception as e:
-        # Try to classify common OpenAI errors without leaking secrets
         msg = str(e).lower()
 
         if "401" in msg or "unauthorized" in msg or "invalid_api_key" in msg:
