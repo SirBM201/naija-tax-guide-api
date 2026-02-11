@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from typing import Optional
+from typing import Optional, Tuple
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()
@@ -23,14 +23,20 @@ You help with:
 Be concise, accurate, and practical.
 """.strip()
 
-# Lazy client cache
 _ai_client = None
 _openai_import_error: Optional[str] = None
+_last_error: Optional[str] = None
 
 
-# -------------------------------------------------
-# Lazy OpenAI client loader
-# -------------------------------------------------
+def _set_last_error(msg: str) -> None:
+    global _last_error
+    _last_error = (msg or "").strip()[:4000] or None
+
+
+def get_last_ai_error() -> Optional[str]:
+    return _last_error
+
+
 def _get_client():
     global _ai_client, _openai_import_error
 
@@ -39,12 +45,14 @@ def _get_client():
 
     if not OPENAI_API_KEY:
         _openai_import_error = "OPENAI_API_KEY not set"
+        _set_last_error(_openai_import_error)
         return None
 
     try:
-        from openai import OpenAI  # v1 SDK
+        from openai import OpenAI
     except Exception as e:
         _openai_import_error = f"openai import failed: {e}"
+        _set_last_error(_openai_import_error)
         return None
 
     try:
@@ -52,25 +60,24 @@ def _get_client():
         return _ai_client
     except Exception as e:
         _openai_import_error = f"OpenAI client init failed: {e}"
+        _set_last_error(_openai_import_error)
         return None
 
 
-# -------------------------------------------------
-# AI Ask Function
-# -------------------------------------------------
-def ask_ai(question: str, lang: str = "en") -> str:
+def ask_ai(question: str, lang: str = "en") -> Optional[str]:
     """
-    Sends question to OpenAI and returns answer text.
-    Safe fallback if AI not configured.
+    Returns:
+      - answer text (str) on success
+      - None on failure (so ask_service can refund credits + NOT cache)
     """
-
     q = (question or "").strip()
     if not q:
-        return "Please provide a question."
+        return None
 
     client = _get_client()
     if client is None:
-        return "AI service not configured yet. Please contact support or try again later."
+        _set_last_error("AI not configured")
+        return None
 
     try:
         user_msg = f"[Language: {lang}] {q}" if lang else q
@@ -78,30 +85,29 @@ def ask_ai(question: str, lang: str = "en") -> str:
         resp = client.responses.create(
             model=OPENAI_MODEL,
             input=[
-                {
-                    "role": "system",
-                    "content": SYSTEM_PROMPT,
-                },
-                {
-                    "role": "user",
-                    "content": user_msg,
-                },
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg},
             ],
             temperature=0.3,
         )
 
-        # Extract text safely
-        if not resp.output:
-            return "No answer generated."
+        if not getattr(resp, "output", None):
+            _set_last_error("No output from model")
+            return None
 
-        # responses API returns structured output
         for item in resp.output:
-            if item.type == "message":
-                for c in item.content:
-                    if c.type == "output_text":
-                        return c.text
+            if getattr(item, "type", None) == "message":
+                for c in (item.content or []):
+                    if getattr(c, "type", None) == "output_text":
+                        text = (c.text or "").strip()
+                        if text:
+                            _set_last_error("")
+                            return text
 
-        return "No answer generated."
+        _set_last_error("No output_text content found")
+        return None
 
     except Exception as e:
-        return f"AI temporarily unavailable. ({str(e)})"
+        # IMPORTANT: do not return raw exception text to users and do not allow it into cache
+        _set_last_error(str(e))
+        return None
