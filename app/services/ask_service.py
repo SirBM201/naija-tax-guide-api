@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import os
-import re
 from datetime import datetime, timezone, date
 from typing import Any, Dict, Optional, Tuple
 
@@ -44,25 +43,31 @@ def _normalize_provider(provider: Optional[str]) -> Optional[str]:
         return "web"
     return p
 
+
 def _normalize_mode(mode: Optional[str]) -> str:
     m = (mode or "text").strip().lower()
     return m if m in ("text", "voice") else "text"
+
 
 def _normalize_lang(lang: Optional[str]) -> str:
     l = (lang or "en").strip().lower()
     return l or "en"
 
+
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
+
 def _today_utc_date_str() -> str:
     return _now_utc().date().isoformat()
+
 
 # ------------------------------------------------------------
 # Costs (AI credits only)
 # ------------------------------------------------------------
 def _cost_for_mode(mode: str) -> int:
     return 3 if mode == "voice" else 1
+
 
 # ------------------------------------------------------------
 # Logging
@@ -79,6 +84,7 @@ def _log_usage_best_effort(account_id: str, question: str, answer: str) -> None:
         ).execute()
     except Exception:
         pass
+
 
 # ------------------------------------------------------------
 # HARD DAILY MAX
@@ -100,6 +106,7 @@ def _get_total_used_today(account_id: str) -> int:
     except Exception:
         pass
     return 0
+
 
 def _bump_total_used_today_best_effort(account_id: str, hard_limit: int) -> int:
     day_str = _today_utc_date_str()
@@ -141,6 +148,7 @@ def _bump_total_used_today_best_effort(account_id: str, hard_limit: int) -> int:
     except Exception:
         return _get_total_used_today(account_id)
 
+
 # ------------------------------------------------------------
 # daily_question_counters (free + cache tracking)
 # ------------------------------------------------------------
@@ -162,6 +170,7 @@ def _get_free_counters(account_id: str) -> Tuple[int, int]:
     except Exception:
         pass
     return 0, 0
+
 
 def _bump_counter(account_id: str, which: str) -> Tuple[int, int]:
     day_str = _today_utc_date_str()
@@ -214,6 +223,7 @@ def _bump_counter(account_id: str, which: str) -> Tuple[int, int]:
     except Exception:
         return 0, 0
 
+
 def _get_paid_cache_used(account_id: str) -> int:
     day_str = _today_utc_date_str()
     try:
@@ -232,9 +242,11 @@ def _get_paid_cache_used(account_id: str) -> int:
         pass
     return 0
 
+
 def _bump_paid_cache_used(account_id: str) -> int:
     cache_used, _ = _bump_counter(account_id, "cache")
     return int(cache_used or 0)
+
 
 # ------------------------------------------------------------
 # Main
@@ -302,7 +314,12 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
     # ============================================================
     # 2) CACHE NEXT (free + paid)
     # ============================================================
-    cached = find_cached_answer(canonical_key=ckey, normalized_question=normalized_q, lang=lang, max_results=CACHE_MAX_RESULTS)
+    cached = find_cached_answer(
+        canonical_key=ckey,
+        normalized_question=normalized_q,
+        lang=lang,
+        max_results=CACHE_MAX_RESULTS,
+    )
 
     # ----------------------------
     # FREE USERS
