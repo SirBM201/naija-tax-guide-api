@@ -1,8 +1,8 @@
 # app/services/response_refiner.py
 from __future__ import annotations
 
+import re
 from typing import Optional
-
 
 _BAD_PATTERNS = [
     "ai temporarily unavailable",
@@ -10,25 +10,18 @@ _BAD_PATTERNS = [
     "openai_api_key not set",
     "invalid_api_key",
     "incorrect api key",
-    "unauthorized",
-    "401",
     "quota",
     "rate limit",
-    "429",
     "request timed out",
-    "timeout",
     "no answer generated",
     "openai import failed",
     "client init failed",
     "something went wrong",
-    "request blocked",
+    "unauthorized",
+    "401",
 ]
 
-
 def looks_like_ai_failure(text: str) -> bool:
-    """
-    Detects provider/system error text that must never be cached or shown as a real answer.
-    """
     t = (text or "").strip().lower()
     if not t:
         return True
@@ -38,38 +31,60 @@ def looks_like_ai_failure(text: str) -> bool:
     return False
 
 
-def _normalize_whitespace(txt: str) -> str:
-    # trim trailing spaces per line, collapse excessive blank lines
-    lines = [line.rstrip() for line in (txt or "").splitlines()]
-    out: list[str] = []
-    blank = 0
-    for line in lines:
-        if not line.strip():
-            blank += 1
-            if blank <= 1:
-                out.append("")
-            continue
-        blank = 0
-        out.append(line)
-    return "\n".join(out).strip()
+def _cleanup_whitespace(txt: str) -> str:
+    txt = (txt or "").strip()
+    txt = "\n".join([line.rstrip() for line in txt.splitlines()])
+    txt = re.sub(r"\n{3,}", "\n\n", txt).strip()
+    return txt
 
 
-def refine_answer(raw: str, *, lang: str = "en", source: str = "ai") -> Optional[str]:
+def _ensure_sentence_case_first_line(txt: str) -> str:
+    lines = txt.splitlines()
+    if not lines:
+        return txt
+    first = lines[0].strip()
+    if first and first[0].isalpha():
+        first = first[0].upper() + first[1:]
+    lines[0] = first
+    return "\n".join(lines).strip()
+
+
+def _web_markdown_polish(txt: str) -> str:
+    # keep markdown, just clean spacing
+    return _ensure_sentence_case_first_line(_cleanup_whitespace(txt))
+
+
+def _wa_tg_polish(txt: str) -> str:
     """
-    Returns refined text or None.
-    - rejects AI/system failure strings
-    - normalizes whitespace
-    - keeps library/cached wording intact (light cleanup only)
+    WhatsApp/Telegram-safe:
+    - Avoid heavy markdown (**bold**) because WA uses *bold*
+    - Keep bullets clean
     """
+    txt = _cleanup_whitespace(txt)
+
+    # Convert markdown bold **x** -> *x*
+    txt = re.sub(r"\*\*(.+?)\*\*", r"*\1*", txt)
+
+    # Convert headings like "Key points:" into WA-friendly emphasis
+    txt = re.sub(r"(?m)^(key points|next steps|summary|important)\s*:\s*$", r"*\1:*", txt, flags=re.I)
+
+    # Normalize bullets
+    txt = re.sub(r"(?m)^\s*[-•]\s+", "- ", txt)
+
+    return _ensure_sentence_case_first_line(txt)
+
+
+def refine_answer(raw: str, *, lang: str = "en", source: str = "ai", provider: str = "web") -> Optional[str]:
     txt = (raw or "").strip()
     if not txt:
         return None
+    if looks_like_ai_failure(txt):
+        return None
 
-    # For AI responses, reject failure-like output.
-    if source in ("ai",):
-        if looks_like_ai_failure(txt):
-            return None
+    provider = (provider or "web").strip().lower()
+    if provider in ("wa", "whatsapp", "tg", "telegram"):
+        txt = _wa_tg_polish(txt)
+    else:
+        txt = _web_markdown_polish(txt)
 
-    # For all sources, normalize whitespace
-    txt = _normalize_whitespace(txt)
     return txt or None
