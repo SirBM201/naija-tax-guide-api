@@ -4,58 +4,55 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 from ..core.supabase_client import supabase
-from .response_refiner import looks_like_ai_failure
 
 
-def find_library_answer(normalized_question: str, lang: str = "en") -> Optional[Dict[str, Any]]:
+def find_library_answer(*, canonical_key: str, normalized_question: str, lang: str) -> Optional[Dict[str, Any]]:
     """
-    Returns a single best qa_library row or None.
-
-    IMPORTANT:
-    - We do NOT write qa_library answers into qa_cache (space conservation).
-    - We try to filter by lang/enabled if those columns exist, but gracefully fall back if not.
+    Priority:
+      1) canonical_key + lang
+      2) normalized_question + lang
     """
-    nq = (normalized_question or "").strip()
-    if not nq:
-        return None
-
     db = supabase()
+    canonical_key = (canonical_key or "").strip()
+    normalized_question = (normalized_question or "").strip()
+    lang = (lang or "en").strip().lower()
 
-    # Try the most specific query first (if columns exist)
-    try:
-        res = (
-            db.table("qa_library")
-            .select("id,answer,question,normalized_question,category,lang,enabled,updated_at,created_at")
-            .eq("normalized_question", nq)
-            .eq("lang", (lang or "en").strip().lower())
-            .eq("enabled", True)
-            .limit(1)
-            .execute()
-        )
-        if res.data:
-            row = res.data[0]
-            ans = (row.get("answer") or "").strip()
-            if ans and not looks_like_ai_failure(ans):
-                return row
-            return None
-    except Exception:
-        pass
+    # 1) canonical match
+    if canonical_key:
+        try:
+            res = (
+                db.table("qa_library")
+                .select("id,answer,category,lang,normalized_question,canonical_key")
+                .eq("canonical_key", canonical_key)
+                .eq("lang", lang)
+                .limit(1)
+                .execute()
+            )
+            if res.data:
+                row = res.data[0]
+                ans = (row.get("answer") or "").strip()
+                if ans:
+                    return row
+        except Exception:
+            pass
 
-    # Fall back: ignore lang/enabled (for schemas without those fields)
-    try:
-        res = (
-            db.table("qa_library")
-            .select("id,answer,question,normalized_question,category,updated_at,created_at")
-            .eq("normalized_question", nq)
-            .limit(1)
-            .execute()
-        )
-        if res.data:
-            row = res.data[0]
-            ans = (row.get("answer") or "").strip()
-            if ans and not looks_like_ai_failure(ans):
-                return row
-    except Exception:
-        pass
+    # 2) fallback normalized match
+    if normalized_question:
+        try:
+            res = (
+                db.table("qa_library")
+                .select("id,answer,category,lang,normalized_question,canonical_key")
+                .eq("normalized_question", normalized_question)
+                .eq("lang", lang)
+                .limit(1)
+                .execute()
+            )
+            if res.data:
+                row = res.data[0]
+                ans = (row.get("answer") or "").strip()
+                if ans:
+                    return row
+        except Exception:
+            pass
 
     return None
