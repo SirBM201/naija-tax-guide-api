@@ -1,39 +1,44 @@
 # app/services/text_keys.py
 from __future__ import annotations
 import re
+import unicodedata
 from typing import Optional
 
-_CURRENCY_RE = re.compile(r"(?i)\b(₦|ngn|\$|usd|eur|£)\s?\d[\d,]*(\.\d+)?\b")
-_NUMBER_RE = re.compile(r"\b\d[\d,]*(\.\d+)?\b")
-_WS_RE = re.compile(r"\s+")
+_WS = re.compile(r"\s+")
+_PUNCT = re.compile(r"[^\w\s₦$€£]", flags=re.UNICODE)
 
-def normalize_question(q: str) -> str:
-    s = (q or "").strip().lower()
-    s = s.replace("’", "'").replace("“", '"').replace("”", '"')
-    s = _WS_RE.sub(" ", s)
-    return s
+# Very conservative amount normalizer:
+# - Converts "₦100,000" / "$10,000" to "<money>"
+# - Only when a currency symbol is present (prevents breaking normal numbers like "2025")
+_MONEY = re.compile(r"(₦|\$|€|£)\s*\d[\d,]*(\.\d+)?", flags=re.IGNORECASE)
 
-def canonicalize_question(q: str, *, lang: str = "en") -> str:
+def _nfkc(s: str) -> str:
+    return unicodedata.normalize("NFKC", s)
+
+def canonicalize_question(q: str, *, lang: Optional[str] = None) -> str:
     """
-    Canonical key: cheap, deterministic, semantic-ish.
-    Removes volatile parts: amounts, refs, dates-ish tokens, currencies.
+    Produces a stable canonical key for meaning-equivalent questions.
+
+    IMPORTANT:
+    - Does NOT translate (keeps cost low).
+    - Does NOT aggressively stem (reduces wrong matches).
     """
-    s = normalize_question(q)
+    s = (q or "").strip()
+    s = _nfkc(s)
+    s = s.lower()
 
-    # remove common ref markers
-    s = re.sub(r"(?i)\bref\b[:\s]*[a-z0-9\-_/]+\b", " ", s)
+    # money normalization (safe only when currency symbol exists)
+    s = _MONEY.sub("<money>", s)
 
-    # remove currency+amount and raw numbers
-    s = _CURRENCY_RE.sub(" ", s)
-    s = _NUMBER_RE.sub(" ", s)
+    # remove punctuation noise but keep words/numbers/underscore
+    s = _PUNCT.sub(" ", s)
 
-    # remove month names (optional cheap)
-    s = re.sub(r"(?i)\b(jan|january|feb|february|mar|march|apr|april|may|jun|june|jul|july|aug|august|sep|sept|september|oct|october|nov|november|dec|december)\b", " ", s)
+    # collapse whitespace
+    s = _WS.sub(" ", s).strip()
 
-    # remove punctuation except apostrophes in words
-    s = re.sub(r"[^\w\s']+", " ", s)
-    s = _WS_RE.sub(" ", s).strip()
+    # optional: tag language to reduce cross-language collisions
+    # (keeps your UNIQUE(canonical_key, lang) strong)
+    if lang:
+        s = f"{lang}:{s}"
 
-    # include lang to avoid cross-language collisions if desired
-    # (but you already have (canonical_key, lang) unique in qa_cache)
     return s
