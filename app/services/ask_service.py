@@ -9,13 +9,14 @@ from typing import Any, Dict, Optional, Tuple
 from ..core.supabase_client import supabase
 from ..services.ai_service import ask_ai
 from ..services.subscriptions_service import get_subscription_status
-from ..services.qa_library_service import find_library_answer
 from ..services.qa_cache_service import (
     find_cached_answer,
     touch_cache_best_effort,
     upsert_ai_answer_to_cache_best_effort,
 )
+from ..services.qa_library_service import find_library_answer
 from ..services.response_refiner import refine_answer
+from ..services.question_canonicalizer import basic_normalize, canonical_key
 
 # ------------------------------------------------------------
 # ENV / Config
@@ -27,7 +28,6 @@ FREE_CACHE_DAILY_LIMIT = int((os.getenv("FREE_CACHE_DAILY_LIMIT", "20") or "20")
 FREE_AI_DAILY_LIMIT = int((os.getenv("FREE_AI_DAILY_LIMIT", "1") or "1").strip())
 
 CACHE_MAX_RESULTS = int((os.getenv("CACHE_MAX_RESULTS", "1") or "1").strip())
-
 
 # ------------------------------------------------------------
 # Normalizers
@@ -44,38 +44,25 @@ def _normalize_provider(provider: Optional[str]) -> Optional[str]:
         return "web"
     return p
 
-
 def _normalize_mode(mode: Optional[str]) -> str:
     m = (mode or "text").strip().lower()
     return m if m in ("text", "voice") else "text"
-
 
 def _normalize_lang(lang: Optional[str]) -> str:
     l = (lang or "en").strip().lower()
     return l or "en"
 
-
-def _normalize_question_for_cache(question: str) -> str:
-    q = (question or "").strip().lower()
-    q = re.sub(r"[^\w\s]", " ", q)
-    q = re.sub(r"\s+", " ", q).strip()
-    return q
-
-
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
-
 def _today_utc_date_str() -> str:
     return _now_utc().date().isoformat()
-
 
 # ------------------------------------------------------------
 # Costs (AI credits only)
 # ------------------------------------------------------------
 def _cost_for_mode(mode: str) -> int:
     return 3 if mode == "voice" else 1
-
 
 # ------------------------------------------------------------
 # Logging
@@ -92,7 +79,6 @@ def _log_usage_best_effort(account_id: str, question: str, answer: str) -> None:
         ).execute()
     except Exception:
         pass
-
 
 # ------------------------------------------------------------
 # HARD DAILY MAX
@@ -114,7 +100,6 @@ def _get_total_used_today(account_id: str) -> int:
     except Exception:
         pass
     return 0
-
 
 def _bump_total_used_today_best_effort(account_id: str, hard_limit: int) -> int:
     day_str = _today_utc_date_str()
@@ -156,9 +141,8 @@ def _bump_total_used_today_best_effort(account_id: str, hard_limit: int) -> int:
     except Exception:
         return _get_total_used_today(account_id)
 
-
 # ------------------------------------------------------------
-# daily_question_counters (free + paid cache tracking)
+# daily_question_counters (free + cache tracking)
 # ------------------------------------------------------------
 def _get_free_counters(account_id: str) -> Tuple[int, int]:
     day_str = _today_utc_date_str()
@@ -178,7 +162,6 @@ def _get_free_counters(account_id: str) -> Tuple[int, int]:
     except Exception:
         pass
     return 0, 0
-
 
 def _bump_counter(account_id: str, which: str) -> Tuple[int, int]:
     day_str = _today_utc_date_str()
@@ -231,7 +214,6 @@ def _bump_counter(account_id: str, which: str) -> Tuple[int, int]:
     except Exception:
         return 0, 0
 
-
 def _get_paid_cache_used(account_id: str) -> int:
     day_str = _today_utc_date_str()
     try:
@@ -250,47 +232,9 @@ def _get_paid_cache_used(account_id: str) -> int:
         pass
     return 0
 
-
 def _bump_paid_cache_used(account_id: str) -> int:
     cache_used, _ = _bump_counter(account_id, "cache")
     return int(cache_used or 0)
-
-
-# ------------------------------------------------------------
-# Helpers: source response (library/cache)
-# ------------------------------------------------------------
-def _build_hit_response(
-    *,
-    answer: str,
-    mode: str,
-    plan_expiry: Optional[str],
-    daily_used: int,
-    daily_limit: int,
-    source: str,
-    used_cache: bool,
-    ai_hit: bool,
-    cost: int,
-    credits_remaining: Optional[int],
-    extra: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    out: Dict[str, Any] = {
-        "ok": True,
-        "answer": answer,
-        "audio_url": None,
-        "mode": mode,
-        "used_cache": used_cache,
-        "ai_hit": ai_hit,
-        "cost": cost,
-        "credits_remaining": credits_remaining,
-        "plan_expiry": plan_expiry,
-        "daily_used": daily_used,
-        "daily_limit": daily_limit,
-        "source": source,  # "library" | "cache" | "ai"
-    }
-    if extra:
-        out.update(extra)
-    return out
-
 
 # ------------------------------------------------------------
 # Main
@@ -313,9 +257,10 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
     if not aid:
         return {"ok": False, "reason": "account_not_found", "message": "Account not found.", "plan_expiry": status.get("expires_at")}
 
-    normalized_q = _normalize_question_for_cache(question)
+    normalized_q = basic_normalize(question)
+    ckey = canonical_key(question)
 
-    # HARD cap check (counts all questions)
+    # HARD cap check
     total_used = _get_total_used_today(aid)
     if total_used >= HARD_DAILY_MAX:
         return {
@@ -328,74 +273,36 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     # ============================================================
-    # 1) QA_LIBRARY FIRST (curated, NO AI, NO credits)
+    # 1) QA_LIBRARY FIRST (free + paid) — no credit cost
     # ============================================================
-    lib = find_library_answer(normalized_q, lang=lang)
+    lib = find_library_answer(canonical_key=ckey, normalized_question=normalized_q, lang=lang)
     if lib and (lib.get("answer") or "").strip():
-        ans = (lib.get("answer") or "").strip()
+        ans = (lib["answer"] or "").strip()
+        ans2 = refine_answer(ans, lang=lang, source="library", provider=provider or "web") or ans
+
         new_total = _bump_total_used_today_best_effort(aid, HARD_DAILY_MAX)
-        _log_usage_best_effort(aid, question, ans)
+        _log_usage_best_effort(aid, question, ans2)
 
-        # Treat library as "cache-like" usage for counters
-        if not status.get("active"):
-            cache_used, ai_used = _get_free_counters(aid)
-            if cache_used >= FREE_CACHE_DAILY_LIMIT:
-                return {
-                    "ok": False,
-                    "reason": "free_cache_limit_reached",
-                    "message": f"Free daily cache limit reached ({FREE_CACHE_DAILY_LIMIT}/day). Please subscribe for more access.",
-                    "plan_expiry": None,
-                    "daily_used": cache_used + ai_used,
-                    "daily_limit": FREE_CACHE_DAILY_LIMIT + FREE_AI_DAILY_LIMIT,
-                }
-            cache_used2, ai_used2 = _bump_counter(aid, "cache")
-            return _build_hit_response(
-                answer=ans,
-                mode=mode,
-                plan_expiry=None,
-                daily_used=new_total,
-                daily_limit=HARD_DAILY_MAX,
-                source="library",
-                used_cache=True,
-                ai_hit=False,
-                cost=0,
-                credits_remaining=None,
-                extra={"free_cache_used": cache_used2, "free_ai_used": ai_used2},
-            )
-
-        # Paid user
-        cache_used = _get_paid_cache_used(aid)
-        if cache_used >= PAID_CACHE_DAILY_LIMIT:
-            return {
-                "ok": False,
-                "reason": "paid_cache_limit_reached",
-                "message": f"Daily cache limit reached ({PAID_CACHE_DAILY_LIMIT}/day). Please try again tomorrow.",
-                "plan_expiry": status.get("expires_at"),
-                "daily_used": total_used,
-                "daily_limit": HARD_DAILY_MAX,
-                "cache_used": cache_used,
-                "cache_limit": PAID_CACHE_DAILY_LIMIT,
-            }
-
-        cache_used2 = _bump_paid_cache_used(aid)
-        return _build_hit_response(
-            answer=ans,
-            mode=mode,
-            plan_expiry=status.get("expires_at"),
-            daily_used=new_total,
-            daily_limit=HARD_DAILY_MAX,
-            source="library",
-            used_cache=True,
-            ai_hit=False,
-            cost=0,
-            credits_remaining=None,
-            extra={"cache_used": cache_used2, "cache_limit": PAID_CACHE_DAILY_LIMIT},
-        )
+        return {
+            "ok": True,
+            "answer": ans2,
+            "audio_url": None,
+            "mode": mode,
+            "used_cache": False,
+            "used_library": True,
+            "ai_hit": False,
+            "cost": 0,
+            "credits_remaining": None,
+            "plan_expiry": status.get("expires_at") if status.get("active") else None,
+            "daily_used": new_total,
+            "daily_limit": HARD_DAILY_MAX,
+            "canonical_key": ckey,
+        }
 
     # ============================================================
-    # 2) QA_CACHE SECOND (runtime cache, NO AI, NO credits)
+    # 2) CACHE NEXT (free + paid)
     # ============================================================
-    cached = find_cached_answer(normalized_q, lang, max_results=CACHE_MAX_RESULTS)
+    cached = find_cached_answer(canonical_key=ckey, normalized_question=normalized_q, lang=lang, max_results=CACHE_MAX_RESULTS)
 
     # ----------------------------
     # FREE USERS
@@ -413,25 +320,31 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
                     "daily_limit": FREE_CACHE_DAILY_LIMIT + FREE_AI_DAILY_LIMIT,
                 }
 
-            ans = (cached["answer"] or "").strip()
+            ans = cached["answer"]
             touch_cache_best_effort(cached.get("id") or "")
             cache_used2, ai_used2 = _bump_counter(aid, "cache")
             new_total = _bump_total_used_today_best_effort(aid, HARD_DAILY_MAX)
-            _log_usage_best_effort(aid, question, ans)
 
-            return _build_hit_response(
-                answer=ans,
-                mode=mode,
-                plan_expiry=None,
-                daily_used=new_total,
-                daily_limit=HARD_DAILY_MAX,
-                source="cache",
-                used_cache=True,
-                ai_hit=False,
-                cost=0,
-                credits_remaining=None,
-                extra={"free_cache_used": cache_used2, "free_ai_used": ai_used2},
-            )
+            ans2 = refine_answer(ans, lang=lang, source="cache", provider=provider or "web") or ans
+            _log_usage_best_effort(aid, question, ans2)
+
+            return {
+                "ok": True,
+                "answer": ans2,
+                "audio_url": None,
+                "mode": mode,
+                "used_cache": True,
+                "used_library": False,
+                "ai_hit": False,
+                "cost": 0,
+                "credits_remaining": None,
+                "plan_expiry": None,
+                "daily_used": new_total,
+                "daily_limit": HARD_DAILY_MAX,
+                "free_cache_used": cache_used2,
+                "free_ai_used": ai_used2,
+                "canonical_key": ckey,
+            }
 
         # Cache miss => free AI/day cap
         cache_used, ai_used = _get_free_counters(aid)
@@ -446,7 +359,8 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
             }
 
         raw = ask_ai(question, lang=lang)
-        refined = refine_answer(raw or "", lang=lang, source="ai")
+        refined = refine_answer(raw or "", lang=lang, source="ai", provider=provider or "web")
+
         if not refined:
             return {
                 "ok": False,
@@ -460,23 +374,33 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
         cache_used2, ai_used2 = _bump_counter(aid, "ai")
         new_total = _bump_total_used_today_best_effort(aid, HARD_DAILY_MAX)
 
-        # IMPORTANT: Save AI ONLY (NOT library). Save question+answer if possible.
-        upsert_ai_answer_to_cache_best_effort(normalized_q, refined, lang, original_question=question)
+        # Cache ONLY AI refined success answers (NOT library)
+        upsert_ai_answer_to_cache_best_effort(
+            canonical_key=ckey,
+            normalized_question=normalized_q,
+            answer=refined,
+            lang=lang,
+        )
 
         _log_usage_best_effort(aid, question, refined)
-        return _build_hit_response(
-            answer=refined,
-            mode=mode,
-            plan_expiry=None,
-            daily_used=new_total,
-            daily_limit=HARD_DAILY_MAX,
-            source="ai",
-            used_cache=False,
-            ai_hit=True,
-            cost=0,
-            credits_remaining=None,
-            extra={"free_cache_used": cache_used2, "free_ai_used": ai_used2},
-        )
+
+        return {
+            "ok": True,
+            "answer": refined,
+            "audio_url": None,
+            "mode": mode,
+            "used_cache": False,
+            "used_library": False,
+            "ai_hit": True,
+            "cost": 0,
+            "credits_remaining": None,
+            "plan_expiry": None,
+            "daily_used": new_total,
+            "daily_limit": HARD_DAILY_MAX,
+            "free_cache_used": cache_used2,
+            "free_ai_used": ai_used2,
+            "canonical_key": ckey,
+        }
 
     # ----------------------------
     # PAID USERS
@@ -495,29 +419,33 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
                 "cache_limit": PAID_CACHE_DAILY_LIMIT,
             }
 
-        ans = (cached["answer"] or "").strip()
+        ans = cached["answer"]
         touch_cache_best_effort(cached.get("id") or "")
         cache_used2 = _bump_paid_cache_used(aid)
         new_total = _bump_total_used_today_best_effort(aid, HARD_DAILY_MAX)
-        _log_usage_best_effort(aid, question, ans)
 
-        return _build_hit_response(
-            answer=ans,
-            mode=mode,
-            plan_expiry=status.get("expires_at"),
-            daily_used=new_total,
-            daily_limit=HARD_DAILY_MAX,
-            source="cache",
-            used_cache=True,
-            ai_hit=False,
-            cost=0,
-            credits_remaining=None,
-            extra={"cache_used": cache_used2, "cache_limit": PAID_CACHE_DAILY_LIMIT},
-        )
+        ans2 = refine_answer(ans, lang=lang, source="cache", provider=provider or "web") or ans
+        _log_usage_best_effort(aid, question, ans2)
 
-    # ============================================================
-    # 3) AI THIRD (paid users: deduct credits; free users handled above)
-    # ============================================================
+        return {
+            "ok": True,
+            "answer": ans2,
+            "audio_url": None,
+            "mode": mode,
+            "used_cache": True,
+            "used_library": False,
+            "ai_hit": False,
+            "cost": 0,
+            "credits_remaining": None,
+            "plan_expiry": status.get("expires_at"),
+            "daily_used": new_total,
+            "daily_limit": HARD_DAILY_MAX,
+            "cache_used": cache_used2,
+            "cache_limit": PAID_CACHE_DAILY_LIMIT,
+            "canonical_key": ckey,
+        }
+
+    # Cache miss => AI with credit ledger
     cost = _cost_for_mode(mode)
 
     try:
@@ -552,7 +480,7 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     raw = ask_ai(question, lang=lang)
-    refined = refine_answer(raw or "", lang=lang, source="ai")
+    refined = refine_answer(raw or "", lang=lang, source="ai", provider=provider or "web")
 
     # AI failed => refund credits, do NOT cache
     if not refined:
@@ -572,20 +500,28 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
 
     new_total = _bump_total_used_today_best_effort(aid, HARD_DAILY_MAX)
 
-    # IMPORTANT: Save AI ONLY (NOT library). Save question+answer if possible.
-    upsert_ai_answer_to_cache_best_effort(normalized_q, refined, lang, original_question=question)
-
-    _log_usage_best_effort(aid, question, refined)
-    return _build_hit_response(
+    # Cache ONLY refined AI answers
+    upsert_ai_answer_to_cache_best_effort(
+        canonical_key=ckey,
+        normalized_question=normalized_q,
         answer=refined,
-        mode=mode,
-        plan_expiry=status.get("expires_at"),
-        daily_used=new_total,
-        daily_limit=HARD_DAILY_MAX,
-        source="ai",
-        used_cache=False,
-        ai_hit=True,
-        cost=cost,
-        credits_remaining=spend_data.get("credits_remaining"),
-        extra={"cache_limit": PAID_CACHE_DAILY_LIMIT},
+        lang=lang,
     )
+    _log_usage_best_effort(aid, question, refined)
+
+    return {
+        "ok": True,
+        "answer": refined,
+        "audio_url": None,
+        "mode": mode,
+        "used_cache": False,
+        "used_library": False,
+        "ai_hit": True,
+        "cost": cost,
+        "credits_remaining": spend_data.get("credits_remaining"),
+        "plan_expiry": status.get("expires_at"),
+        "daily_used": new_total,
+        "daily_limit": HARD_DAILY_MAX,
+        "cache_limit": PAID_CACHE_DAILY_LIMIT,
+        "canonical_key": ckey,
+    }
