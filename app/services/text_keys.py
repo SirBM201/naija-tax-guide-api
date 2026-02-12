@@ -1,44 +1,34 @@
-# app/services/text_keys.py
 from __future__ import annotations
 import re
-import unicodedata
 from typing import Optional
 
-_WS = re.compile(r"\s+")
-_PUNCT = re.compile(r"[^\w\s₦$€£]", flags=re.UNICODE)
-
-# Very conservative amount normalizer:
-# - Converts "₦100,000" / "$10,000" to "<money>"
-# - Only when a currency symbol is present (prevents breaking normal numbers like "2025")
-_MONEY = re.compile(r"(₦|\$|€|£)\s*\d[\d,]*(\.\d+)?", flags=re.IGNORECASE)
-
-def _nfkc(s: str) -> str:
-    return unicodedata.normalize("NFKC", s)
-
-def canonicalize_question(q: str, *, lang: Optional[str] = None) -> str:
-    """
-    Produces a stable canonical key for meaning-equivalent questions.
-
-    IMPORTANT:
-    - Does NOT translate (keeps cost low).
-    - Does NOT aggressively stem (reduces wrong matches).
-    """
-    s = (q or "").strip()
-    s = _nfkc(s)
-    s = s.lower()
-
-    # money normalization (safe only when currency symbol exists)
-    s = _MONEY.sub("<money>", s)
-
-    # remove punctuation noise but keep words/numbers/underscore
-    s = _PUNCT.sub(" ", s)
-
-    # collapse whitespace
-    s = _WS.sub(" ", s).strip()
-
-    # optional: tag language to reduce cross-language collisions
-    # (keeps your UNIQUE(canonical_key, lang) strong)
-    if lang:
-        s = f"{lang}:{s}"
-
+def _clean(s: str) -> str:
+    s = (s or "").lower().strip()
+    s = re.sub(r"[^a-z0-9\s]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
     return s
+
+def canonicalize_question(question: str, lang: Optional[str] = "en") -> str:
+    """
+    Canonical key rules (EN):
+      - normalize punctuation/space
+      - map short acronyms: "vat" -> "what is vat"
+      - normalize "what's/whats/define/meaning of" -> "what is ..."
+      - join with underscores
+    For non-EN, we still normalize similarly, but language matching is primarily via qa_aliases.
+    """
+    s = _clean(question)
+
+    if not s:
+        return ""
+
+    # English intent normalization
+    if (lang or "en") == "en":
+        # acronym-only (2..6 chars) -> treat as definition query
+        if re.fullmatch(r"[a-z]{2,6}", s):
+            s = f"what is {s}"
+
+        s = re.sub(r"^(what is|whats|what s|define|meaning of)\s+", "what is ", s)
+
+    # underscores
+    return re.sub(r"\s+", "_", s)
