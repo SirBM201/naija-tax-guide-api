@@ -1,149 +1,120 @@
 # app/services/qa_library_service.py
 from __future__ import annotations
 
-from typing import Optional, Dict, Any, List
-
+from typing import Any, Dict, Optional
 from ..core.supabase_client import supabase
+from .response_refiner import looks_like_ai_failure
 
 
 def _clean(s: str) -> str:
     return (s or "").strip()
 
 
-def _norm_lang(lang: str) -> str:
+def _norm_lang(lang: Optional[str]) -> str:
     l = (lang or "en").strip().lower()
     return l or "en"
 
 
-def _pick_answer_from_row(row: Dict[str, Any], lang: str) -> str:
-    """
-    Supports common schemas:
-      - answer (single column)
-      - answer_en / answer_yo / answer_ig / answer_ha / answer_pcm
-      - answer_<lang>
-    """
+def _pick_lang_answer(row: Dict[str, Any], lang: str) -> str:
     lang = _norm_lang(lang)
 
-    # 1) direct "answer"
-    a = _clean(row.get("answer") or "")
-    if a:
-        return a
+    # common aliases
+    if lang in ("yo", "yoruba"):
+        return _clean(row.get("answer_yo") or row.get("answer_yoruba") or "")
+    if lang in ("ig", "igbo"):
+        return _clean(row.get("answer_ig") or row.get("answer_igbo") or "")
+    if lang in ("ha", "hausa"):
+        return _clean(row.get("answer_ha") or row.get("answer_hausa") or "")
+    if lang in ("pcm", "pidgin"):
+        return _clean(row.get("answer_pcm") or row.get("answer_pidgin") or "")
 
-    # 2) per-language column answer_<lang>
-    key = f"answer_{lang}"
-    a = _clean(row.get(key) or "")
-    if a:
-        return a
-
-    # 3) common Nigerian languages naming variations
-    fallback_keys = {
-        "yo": ["answer_yo", "answer_yoruba"],
-        "ig": ["answer_ig", "answer_igbo"],
-        "ha": ["answer_ha", "answer_hausa"],
-        "pcm": ["answer_pcm", "answer_pigin", "answer_pidgin"],
-        "en": ["answer_en", "answer_english"],
-    }.get(lang, [])
-
-    for k in fallback_keys:
-        a = _clean(row.get(k) or "")
-        if a:
-            return a
-
-    # 4) fallback to english if present
-    for k in ("answer_en", "answer_english"):
-        a = _clean(row.get(k) or "")
-        if a:
-            return a
-
-    return ""
+    # default english
+    return _clean(row.get("answer_en") or row.get("answer") or "")
 
 
-def find_library_answer(
-    *,
-    canonical_key: str,
-    normalized_question: str = "",
-    lang: str = "en",
-) -> Optional[Dict[str, Any]]:
-    """
-    Returns:
-      { "answer": "...", "lang_used": "<lang>", "canonical_key": "...", "source": "library", "id": <uuid?> }
-
-    Strategy:
-      1) Try exact canonical_key match in qa_library (preferred)
-      2) If your schema doesn't have canonical_key, fallback to normalized_question match
-         (kept best-effort so it won't crash)
-    """
+def get_library_answer_by_canonical(canonical_key: str, lang: str) -> Optional[Dict[str, Any]]:
     canonical_key = _clean(canonical_key)
-    normalized_question = _clean(normalized_question)
     lang = _norm_lang(lang)
-
-    if not canonical_key and not normalized_question:
+    if not canonical_key:
         return None
 
-    # ---- Attempt A: canonical_key lookup ----
     try:
         res = (
             supabase()
             .table("qa_library")
             .select("*")
             .eq("canonical_key", canonical_key)
+            .eq("enabled", True)
+            .order("priority", desc=True)
             .limit(1)
             .execute()
         )
-        rows = getattr(res, "data", None) or []
-        if rows:
-            row = rows[0] or {}
-            ans = _pick_answer_from_row(row, lang)
-            if ans:
-                return {
-                    "id": row.get("id"),
-                    "answer": ans,
-                    "lang_used": lang,
-                    "canonical_key": canonical_key,
-                    "source": "library",
-                }
+        rows = res.data or []
+        if not rows:
+            return None
+
+        row = rows[0] or {}
+        ans = _pick_lang_answer(row, lang)
+        if not ans or looks_like_ai_failure(ans):
+            return None
+
+        return {
+            "id": row.get("id"),
+            "answer": ans,
+            "canonical_key": row.get("canonical_key") or canonical_key,
+            "lang_used": lang,
+            "source": "library",
+        }
     except Exception:
-        # Column may not exist; ignore
-        pass
-
-    # ---- Attempt B: normalized question fallback ----
-    if normalized_question:
-        # Try common columns: normalized_question or question
-        for col in ("normalized_question", "question"):
-            try:
-                res = (
-                    supabase()
-                    .table("qa_library")
-                    .select("*")
-                    .eq(col, normalized_question)
-                    .limit(1)
-                    .execute()
-                )
-                rows = getattr(res, "data", None) or []
-                if rows:
-                    row = rows[0] or {}
-                    ans = _pick_answer_from_row(row, lang)
-                    if ans:
-                        return {
-                            "id": row.get("id"),
-                            "answer": ans,
-                            "lang_used": lang,
-                            "canonical_key": canonical_key or _clean(row.get("canonical_key") or ""),
-                            "source": "library",
-                        }
-            except Exception:
-                pass
-
-    return None
+        return None
 
 
-# ------------------------------------------------------------
-# Optional backward-compat aliases (in case other modules use
-# different names)
-# ------------------------------------------------------------
-def get_library_answer(*args, **kwargs):
-    return find_library_answer(*args, **kwargs)
+def find_library_answer(*, canonical_key: str, normalized_question: str, lang: str) -> Optional[Dict[str, Any]]:
+    """
+    Compatibility wrapper for ask_service.
+    Ranking:
+      1) canonical_key match
+      2) normalized_question match
+    """
+    canonical_key = _clean(canonical_key)
+    normalized_question = _clean(normalized_question)
+    lang = _norm_lang(lang)
 
+    # 1) canonical
+    hit = get_library_answer_by_canonical(canonical_key, lang)
+    if hit:
+        return hit
 
-def lookup_library_answer(*args, **kwargs):
-    return find_library_answer(*args, **kwargs)
+    # 2) normalized question fallback
+    if not normalized_question:
+        return None
+
+    try:
+        res = (
+            supabase()
+            .table("qa_library")
+            .select("*")
+            .eq("normalized_question", normalized_question)
+            .eq("enabled", True)
+            .order("priority", desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        if not rows:
+            return None
+
+        row = rows[0] or {}
+        ans = _pick_lang_answer(row, lang)
+        if not ans or looks_like_ai_failure(ans):
+            return None
+
+        return {
+            "id": row.get("id"),
+            "answer": ans,
+            "canonical_key": row.get("canonical_key") or canonical_key or None,
+            "lang_used": lang,
+            "source": "library",
+        }
+    except Exception:
+        return None
