@@ -17,6 +17,17 @@ from ..services.qa_library_service import find_library_answer
 from ..services.response_refiner import refine_answer
 from ..services.question_canonicalizer import basic_normalize, canonical_key
 
+
+# ------------------------------------------------------------
+# Supabase wrapper (supports both supabase() and supabase styles)
+# ------------------------------------------------------------
+def _sb():
+    try:
+        return supabase()  # type: ignore
+    except TypeError:
+        return supabase
+
+
 # ------------------------------------------------------------
 # ENV / Config
 # ------------------------------------------------------------
@@ -27,6 +38,7 @@ FREE_CACHE_DAILY_LIMIT = int((os.getenv("FREE_CACHE_DAILY_LIMIT", "20") or "20")
 FREE_AI_DAILY_LIMIT = int((os.getenv("FREE_AI_DAILY_LIMIT", "1") or "1").strip())
 
 CACHE_MAX_RESULTS = int((os.getenv("CACHE_MAX_RESULTS", "1") or "1").strip())
+
 
 # ------------------------------------------------------------
 # Normalizers
@@ -74,7 +86,7 @@ def _cost_for_mode(mode: str) -> int:
 # ------------------------------------------------------------
 def _log_usage_best_effort(account_id: str, question: str, answer: str) -> None:
     try:
-        supabase().table("ai_usage_logs").insert(
+        _sb().table("ai_usage_logs").insert(
             {
                 "account_id": account_id,
                 "question": question,
@@ -87,13 +99,13 @@ def _log_usage_best_effort(account_id: str, question: str, answer: str) -> None:
 
 
 # ------------------------------------------------------------
-# HARD DAILY MAX
+# HARD DAILY MAX (daily_question_usage.count)
 # ------------------------------------------------------------
 def _get_total_used_today(account_id: str) -> int:
     day_str = _today_utc_date_str()
     try:
         got = (
-            supabase()
+            _sb()
             .table("daily_question_usage")
             .select("count")
             .eq("account_id", account_id)
@@ -101,8 +113,9 @@ def _get_total_used_today(account_id: str) -> int:
             .limit(1)
             .execute()
         )
-        if got.data:
-            return int(got.data[0].get("count") or 0)
+        rows = getattr(got, "data", None) or []
+        if rows:
+            return int(rows[0].get("count") or 0)
     except Exception:
         pass
     return 0
@@ -114,7 +127,7 @@ def _bump_total_used_today_best_effort(account_id: str, hard_limit: int) -> int:
 
     # Prefer RPC (atomic)
     try:
-        res = supabase().rpc(
+        res = _sb().rpc(
             "bump_daily_question_usage",
             {"p_account_id": account_id, "p_day": day.isoformat(), "p_limit": int(hard_limit)},
         ).execute()
@@ -129,7 +142,7 @@ def _bump_total_used_today_best_effort(account_id: str, hard_limit: int) -> int:
     # Fallback (best-effort)
     try:
         got = (
-            supabase()
+            _sb()
             .table("daily_question_usage")
             .select("count")
             .eq("account_id", account_id)
@@ -137,115 +150,159 @@ def _bump_total_used_today_best_effort(account_id: str, hard_limit: int) -> int:
             .limit(1)
             .execute()
         )
-        cur = 0
-        if got.data:
-            cur = int(got.data[0].get("count") or 0)
-            supabase().table("daily_question_usage").update({"count": cur + 1}).eq("account_id", account_id).eq("day", day_str).execute()
+        rows = getattr(got, "data", None) or []
+        if rows:
+            cur = int(rows[0].get("count") or 0)
+            _sb().table("daily_question_usage").update({"count": cur + 1}).eq("account_id", account_id).eq("day", day_str).execute()
             return cur + 1
 
-        supabase().table("daily_question_usage").insert({"account_id": account_id, "day": day_str, "count": 1}).execute()
+        _sb().table("daily_question_usage").insert({"account_id": account_id, "day": day_str, "count": 1}).execute()
         return 1
     except Exception:
         return _get_total_used_today(account_id)
 
 
 # ------------------------------------------------------------
-# daily_question_counters (free + cache tracking)
+# daily_question_counters (uses your real columns)
+# Columns:
+#   total_count, text_count, voice_count, cache_count, ai_count, updated_at
 # ------------------------------------------------------------
-def _get_free_counters(account_id: str) -> Tuple[int, int]:
+def _get_counters(account_id: str) -> Tuple[int, int]:
+    """
+    Returns (cache_count, ai_count) for today.
+    """
     day_str = _today_utc_date_str()
     try:
         got = (
-            supabase()
+            _sb()
             .table("daily_question_counters")
-            .select("cache_used,ai_used")
+            .select("cache_count,ai_count")
             .eq("account_id", account_id)
             .eq("day", day_str)
             .limit(1)
             .execute()
         )
-        if got.data:
-            row = got.data[0]
-            return int(row.get("cache_used") or 0), int(row.get("ai_used") or 0)
+        rows = getattr(got, "data", None) or []
+        if rows:
+            row = rows[0]
+            return int(row.get("cache_count") or 0), int(row.get("ai_count") or 0)
     except Exception:
         pass
     return 0, 0
 
 
-def _bump_counter(account_id: str, which: str) -> Tuple[int, int]:
+def _bump_counters_best_effort(account_id: str, *, kind: str, mode: str) -> Tuple[int, int]:
+    """
+    Increments today's counters.
+    kind: "cache" | "ai"
+    mode: "text" | "voice"  (affects text_count/voice_count)
+    Returns (cache_count, ai_count) after bump (best-effort).
+    """
     day_str = _today_utc_date_str()
+    now_iso = _now_utc().isoformat()
 
-    # Prefer RPC (atomic)
+    kind = (kind or "").strip().lower()
+    mode = (mode or "text").strip().lower()
+    if kind not in ("cache", "ai"):
+        kind = "cache"
+    if mode not in ("text", "voice"):
+        mode = "text"
+
+    # Prefer RPC if you have it (optional)
     try:
-        res = supabase().rpc(
+        res = _sb().rpc(
             "bump_daily_question_counters",
-            {"p_account_id": account_id, "p_day": day_str, "p_kind": which},
+            {"p_account_id": account_id, "p_day": day_str, "p_kind": kind, "p_mode": mode},
         ).execute()
         data = res.data or {}
         if isinstance(data, list):
             data = data[0] if data else {}
+        # Accept either naming style from RPC implementations
+        if "cache_count" in data and "ai_count" in data:
+            return int(data.get("cache_count") or 0), int(data.get("ai_count") or 0)
         if "cache_used" in data and "ai_used" in data:
-            return int(data["cache_used"] or 0), int(data["ai_used"] or 0)
+            return int(data.get("cache_used") or 0), int(data.get("ai_used") or 0)
     except Exception:
         pass
 
-    # Fallback (best-effort)
+    # Fallback: read + write
     try:
         got = (
-            supabase()
+            _sb()
             .table("daily_question_counters")
-            .select("cache_used,ai_used")
+            .select("total_count,text_count,voice_count,cache_count,ai_count")
             .eq("account_id", account_id)
             .eq("day", day_str)
             .limit(1)
             .execute()
         )
+        rows = getattr(got, "data", None) or []
 
-        cache_used = 0
-        ai_used = 0
-        if got.data:
-            row = got.data[0]
-            cache_used = int(row.get("cache_used") or 0)
-            ai_used = int(row.get("ai_used") or 0)
+        if rows:
+            row = rows[0]
+            total_count = int(row.get("total_count") or 0)
+            text_count = int(row.get("text_count") or 0)
+            voice_count = int(row.get("voice_count") or 0)
+            cache_count = int(row.get("cache_count") or 0)
+            ai_count = int(row.get("ai_count") or 0)
 
-            if which == "cache":
-                cache_used += 1
+            total_count += 1
+            if mode == "voice":
+                voice_count += 1
             else:
-                ai_used += 1
+                text_count += 1
 
-            supabase().table("daily_question_counters").update({"cache_used": cache_used, "ai_used": ai_used}).eq("account_id", account_id).eq("day", day_str).execute()
-            return cache_used, ai_used
+            if kind == "ai":
+                ai_count += 1
+            else:
+                cache_count += 1
 
-        cache_used = 1 if which == "cache" else 0
-        ai_used = 1 if which == "ai" else 0
-        supabase().table("daily_question_counters").insert({"account_id": account_id, "day": day_str, "cache_used": cache_used, "ai_used": ai_used}).execute()
-        return cache_used, ai_used
+            _sb().table("daily_question_counters").update(
+                {
+                    "total_count": total_count,
+                    "text_count": text_count,
+                    "voice_count": voice_count,
+                    "cache_count": cache_count,
+                    "ai_count": ai_count,
+                    "updated_at": now_iso,
+                }
+            ).eq("account_id", account_id).eq("day", day_str).execute()
+
+            return cache_count, ai_count
+
+        # Row does not exist yet -> insert with defaults (NOT NULL columns)
+        total_count = 1
+        text_count = 1 if mode == "text" else 0
+        voice_count = 1 if mode == "voice" else 0
+        cache_count = 1 if kind == "cache" else 0
+        ai_count = 1 if kind == "ai" else 0
+
+        _sb().table("daily_question_counters").insert(
+            {
+                "account_id": account_id,
+                "day": day_str,
+                "total_count": total_count,
+                "text_count": text_count,
+                "voice_count": voice_count,
+                "cache_count": cache_count,
+                "ai_count": ai_count,
+                "updated_at": now_iso,
+            }
+        ).execute()
+        return cache_count, ai_count
+
     except Exception:
-        return 0, 0
+        return _get_counters(account_id)
 
 
 def _get_paid_cache_used(account_id: str) -> int:
-    day_str = _today_utc_date_str()
-    try:
-        got = (
-            supabase()
-            .table("daily_question_counters")
-            .select("cache_used")
-            .eq("account_id", account_id)
-            .eq("day", day_str)
-            .limit(1)
-            .execute()
-        )
-        if got.data:
-            return int(got.data[0].get("cache_used") or 0)
-    except Exception:
-        pass
-    return 0
+    cache_count, _ = _get_counters(account_id)
+    return int(cache_count or 0)
 
 
-def _bump_paid_cache_used(account_id: str) -> int:
-    cache_used, _ = _bump_counter(account_id, "cache")
-    return int(cache_used or 0)
+def _bump_paid_cache_used(account_id: str, mode: str) -> int:
+    cache_count, _ = _bump_counters_best_effort(account_id, kind="cache", mode=mode)
+    return int(cache_count or 0)
 
 
 # ------------------------------------------------------------
@@ -293,6 +350,9 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
         ans2 = refine_answer(ans, lang=lang, source="library", provider=provider or "web") or ans
 
         new_total = _bump_total_used_today_best_effort(aid, HARD_DAILY_MAX)
+        # (Optional) You can count library usage into total_count if you want:
+        # _bump_counters_best_effort(aid, kind="cache", mode=mode)  # not recommended; leave it clean.
+
         _log_usage_best_effort(aid, question, ans2)
 
         return {
@@ -325,21 +385,23 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
     # FREE USERS
     # ----------------------------
     if not status.get("active"):
+        cache_count, ai_count = _get_counters(aid)
+
         if cached and cached.get("answer"):
-            cache_used, ai_used = _get_free_counters(aid)
-            if cache_used >= FREE_CACHE_DAILY_LIMIT:
+            if cache_count >= FREE_CACHE_DAILY_LIMIT:
                 return {
                     "ok": False,
                     "reason": "free_cache_limit_reached",
                     "message": f"Free daily cache limit reached ({FREE_CACHE_DAILY_LIMIT}/day). Please subscribe for more access.",
                     "plan_expiry": None,
-                    "daily_used": cache_used + ai_used,
+                    "daily_used": cache_count + ai_count,
                     "daily_limit": FREE_CACHE_DAILY_LIMIT + FREE_AI_DAILY_LIMIT,
                 }
 
             ans = cached["answer"]
             touch_cache_best_effort(cached.get("id") or "")
-            cache_used2, ai_used2 = _bump_counter(aid, "cache")
+
+            cache_count2, ai_count2 = _bump_counters_best_effort(aid, kind="cache", mode=mode)
             new_total = _bump_total_used_today_best_effort(aid, HARD_DAILY_MAX)
 
             ans2 = refine_answer(ans, lang=lang, source="cache", provider=provider or "web") or ans
@@ -358,20 +420,19 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
                 "plan_expiry": None,
                 "daily_used": new_total,
                 "daily_limit": HARD_DAILY_MAX,
-                "free_cache_used": cache_used2,
-                "free_ai_used": ai_used2,
+                "free_cache_used": cache_count2,
+                "free_ai_used": ai_count2,
                 "canonical_key": ckey,
             }
 
         # Cache miss => free AI/day cap
-        cache_used, ai_used = _get_free_counters(aid)
-        if ai_used >= FREE_AI_DAILY_LIMIT:
+        if ai_count >= FREE_AI_DAILY_LIMIT:
             return {
                 "ok": False,
                 "reason": "free_ai_limit_reached",
                 "message": f"Free daily AI limit reached ({FREE_AI_DAILY_LIMIT}/day). Please subscribe to continue.",
                 "plan_expiry": None,
-                "daily_used": cache_used + ai_used,
+                "daily_used": cache_count + ai_count,
                 "daily_limit": FREE_CACHE_DAILY_LIMIT + FREE_AI_DAILY_LIMIT,
             }
 
@@ -388,7 +449,7 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
                 "daily_limit": HARD_DAILY_MAX,
             }
 
-        cache_used2, ai_used2 = _bump_counter(aid, "ai")
+        cache_count2, ai_count2 = _bump_counters_best_effort(aid, kind="ai", mode=mode)
         new_total = _bump_total_used_today_best_effort(aid, HARD_DAILY_MAX)
 
         # Cache ONLY AI refined success answers (NOT library)
@@ -414,8 +475,8 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
             "plan_expiry": None,
             "daily_used": new_total,
             "daily_limit": HARD_DAILY_MAX,
-            "free_cache_used": cache_used2,
-            "free_ai_used": ai_used2,
+            "free_cache_used": cache_count2,
+            "free_ai_used": ai_count2,
             "canonical_key": ckey,
         }
 
@@ -438,7 +499,7 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
 
         ans = cached["answer"]
         touch_cache_best_effort(cached.get("id") or "")
-        cache_used2 = _bump_paid_cache_used(aid)
+        cache_used2 = _bump_paid_cache_used(aid, mode=mode)
         new_total = _bump_total_used_today_best_effort(aid, HARD_DAILY_MAX)
 
         ans2 = refine_answer(ans, lang=lang, source="cache", provider=provider or "web") or ans
@@ -466,7 +527,7 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
     cost = _cost_for_mode(mode)
 
     try:
-        spend = supabase().rpc("consume_ai_credits", {"p_account_id": aid, "p_cost": cost}).execute()
+        spend = _sb().rpc("consume_ai_credits", {"p_account_id": aid, "p_cost": cost}).execute()
         spend_data: Any = spend.data or {}
         if isinstance(spend_data, list):
             spend_data = spend_data[0] if spend_data else {}
@@ -502,7 +563,7 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
     # AI failed => refund credits, do NOT cache
     if not refined:
         try:
-            supabase().rpc("refund_ai_credits", {"p_account_id": aid, "p_cost": cost}).execute()
+            _sb().rpc("refund_ai_credits", {"p_account_id": aid, "p_cost": cost}).execute()
         except Exception:
             pass
         return {
