@@ -1,17 +1,19 @@
 # app/services/qa_cache_service.py
 from __future__ import annotations
 
+from typing import Any, Dict, Optional
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List
 
 from ..core.supabase_client import supabase
+from .response_refiner import looks_like_ai_failure
 
 
-# ------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------
-def _now_utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _clean(s: str) -> str:
+    return (s or "").strip()
 
 
 def _norm_lang(lang: str) -> str:
@@ -19,22 +21,17 @@ def _norm_lang(lang: str) -> str:
     return l or "en"
 
 
-def _clean(s: str) -> str:
-    return (s or "").strip()
-
-
-# ------------------------------------------------------------
-# Canonical Cache Read
-# ------------------------------------------------------------
+# ============================================================
+# New-style API (canonical_key primary)
+# ============================================================
 def get_cache_answer(canonical_key: str, lang: str) -> Optional[Dict[str, Any]]:
     """
-    Fetch the best enabled cache answer for (canonical_key, lang).
-    Returns a dict shaped to satisfy ask_service usage:
-      { id, answer, lang_used, canonical_key, source="cache" }
+    Preferred resolver:
+      SELECT best enabled row by (canonical_key, lang)
+    Returns: {answer, lang_used, canonical_key, source, id?}
     """
     canonical_key = _clean(canonical_key)
     lang = _norm_lang(lang)
-
     if not canonical_key:
         return None
 
@@ -42,12 +39,12 @@ def get_cache_answer(canonical_key: str, lang: str) -> Optional[Dict[str, Any]]:
         res = (
             supabase()
             .table("qa_cache")
-            .select("id, canonical_key, lang, answer, source, priority, created_at")
+            .select("id,canonical_key,lang,answer,source,priority,enabled,last_used_at")
             .eq("canonical_key", canonical_key)
             .eq("lang", lang)
             .eq("enabled", True)
             .order("priority", desc=True)
-            .order("created_at", desc=True)
+            .order("last_used_at", desc=True)
             .limit(1)
             .execute()
         )
@@ -59,13 +56,15 @@ def get_cache_answer(canonical_key: str, lang: str) -> Optional[Dict[str, Any]]:
         ans = _clean(row.get("answer") or "")
         if not ans:
             return None
+        if looks_like_ai_failure(ans):
+            return None
 
         return {
             "id": row.get("id"),
             "answer": ans,
             "lang_used": row.get("lang") or lang,
-            "canonical_key": canonical_key,
-            "source": "cache",
+            "canonical_key": row.get("canonical_key") or canonical_key,
+            "source": row.get("source") or "cache",
         }
     except Exception:
         return None
@@ -75,26 +74,17 @@ def get_cache_answer_en_fallback(canonical_key: str) -> Optional[Dict[str, Any]]
     return get_cache_answer(canonical_key, "en")
 
 
-# ------------------------------------------------------------
-# Canonical Cache Upsert (AI answers only)
-# ------------------------------------------------------------
-def upsert_cache_ai_answer(
-    *,
-    canonical_key: str,
-    lang: str,
-    answer: str,
-    tags: Optional[List[str]] = None,
-    priority: int = 0,
-) -> None:
+def upsert_cache_ai_answer(*, canonical_key: str, lang: str, answer: str, tags=None, priority: int = 0) -> None:
     """
-    Upsert AI answer into qa_cache at unique (canonical_key, lang).
-    Uses minimal columns (safe vs schema drift).
+    Upsert AI answer only. Safe to call repeatedly (idempotent if unique index exists).
     """
     canonical_key = _clean(canonical_key)
     lang = _norm_lang(lang)
     answer = _clean(answer)
 
     if not canonical_key or not answer:
+        return
+    if looks_like_ai_failure(answer):
         return
 
     payload: Dict[str, Any] = {
@@ -104,85 +94,174 @@ def upsert_cache_ai_answer(
         "source": "ai",
         "enabled": True,
         "priority": int(priority or 0),
+        "last_used_at": _now_utc().isoformat(),
     }
     if tags is not None:
         payload["tags"] = tags
 
     try:
+        # Requires UNIQUE(canonical_key, lang) for perfect idempotency.
         supabase().table("qa_cache").upsert(payload, on_conflict="canonical_key,lang").execute()
     except Exception:
-        # best-effort only
-        pass
+        # best-effort fallback insert
+        try:
+            supabase().table("qa_cache").insert(payload).execute()
+        except Exception:
+            pass
 
 
-# ------------------------------------------------------------
-# Best-effort tracking (must exist for ask_service import)
-# ------------------------------------------------------------
-def touch_cache_best_effort(cache_id: str) -> None:
+# ============================================================
+# Backward-compatible API (older ask_service imports)
+# ============================================================
+def find_cached_answer(
+    normalized_question: Optional[str] = None,
+    lang: str = "en",
+    *,
+    canonical_key: Optional[str] = None,
+    max_results: int = 1,
+) -> Optional[Dict[str, Any]]:
     """
-    Best-effort: mark a cache row as used.
-    Tries common columns; ignores failures.
+    Backward-compatible cache lookup.
+
+    Supports BOTH:
+      - find_cached_answer(normalized_question, lang, max_results=?)
+      - find_cached_answer(canonical_key=..., normalized_question=..., lang=...)
+
+    Ranking:
+      - If canonical_key exists -> prefer it
+      - Else -> use normalized_question
     """
-    cache_id = _clean(cache_id)
-    if not cache_id:
-        return
+    lang = _norm_lang(lang)
+    canonical_key = _clean(canonical_key or "")
+    normalized_question = _clean(normalized_question or "")
 
-    # Try last_used_at
     try:
-        supabase().table("qa_cache").update({"last_used_at": _now_utc_iso()}).eq("id", cache_id).execute()
-        return
-    except Exception:
-        pass
+        q = (
+            supabase()
+            .table("qa_cache")
+            .select("id,canonical_key,normalized_question,lang,answer,source,priority,enabled,last_used_at")
+            .eq("lang", lang)
+            .eq("enabled", True)
+        )
 
-    # Try updated_at
-    try:
-        supabase().table("qa_cache").update({"updated_at": _now_utc_iso()}).eq("id", cache_id).execute()
-    except Exception:
-        pass
+        if canonical_key:
+            q = q.eq("canonical_key", canonical_key)
+        elif normalized_question:
+            q = q.eq("normalized_question", normalized_question)
+        else:
+            return None
 
-    # Try hit_count increment (read then write)
-    try:
-        got = supabase().table("qa_cache").select("hit_count").eq("id", cache_id).limit(1).execute()
-        rows = getattr(got, "data", None) or []
+        res = (
+            q.order("priority", desc=True)
+            .order("last_used_at", desc=True)
+            .limit(int(max_results or 1))
+            .execute()
+        )
+        rows = getattr(res, "data", None) or []
         if not rows:
-            return
-        cur = int(rows[0].get("hit_count") or 0)
-        supabase().table("qa_cache").update({"hit_count": cur + 1}).eq("id", cache_id).execute()
+            return None
+
+        row = rows[0] or {}
+        ans = _clean(row.get("answer") or "")
+        if not ans:
+            return None
+        if looks_like_ai_failure(ans):
+            return None
+
+        return {
+            "id": row.get("id"),
+            "answer": ans,
+            "lang_used": row.get("lang") or lang,
+            "canonical_key": row.get("canonical_key") or canonical_key,
+            "source": row.get("source") or "cache",
+        }
+    except Exception:
+        return None
+
+
+def touch_cache_best_effort(row_id: str) -> None:
+    """
+    Best-effort usage bump so your ordering stays good.
+    Works even if you don't have RPC.
+    """
+    row_id = _clean(row_id)
+    if not row_id:
+        return
+
+    # RPC if present
+    try:
+        supabase().rpc("touch_qa_cache", {"p_id": row_id}).execute()
+        return
+    except Exception:
+        pass
+
+    # Fallback update
+    try:
+        got = supabase().table("qa_cache").select("use_count").eq("id", row_id).limit(1).execute()
+        cur = 0
+        rows = getattr(got, "data", None) or []
+        if rows:
+            cur = int(rows[0].get("use_count") or 0)
+
+        supabase().table("qa_cache").update(
+            {"use_count": cur + 1, "last_used_at": _now_utc().isoformat()}
+        ).eq("id", row_id).execute()
     except Exception:
         pass
 
 
 def upsert_ai_answer_to_cache_best_effort(
-    *,
-    canonical_key: str,
     normalized_question: str,
     answer: str,
     lang: str,
+    *,
+    canonical_key: Optional[str] = None,
+    priority: int = 0,
+    tags=None,
 ) -> None:
     """
-    Best-effort: store AI answer into cache.
-    We keep normalized_question in the signature for compatibility,
-    but we don't write it unless your table has such a column.
-    """
-    _ = normalized_question  # keep signature compatibility
-    upsert_cache_ai_answer(canonical_key=canonical_key, lang=lang, answer=answer, priority=0)
+    Old signature compatibility.
+    You decided: cache ONLY AI answers. So this enforces that.
 
-
-# ------------------------------------------------------------
-# Backward-compat adapter (must exist for ask_service import)
-# ------------------------------------------------------------
-def find_cached_answer(
-    *,
-    canonical_key: str,
-    normalized_question: str = "",
-    lang: str = "en",
-    max_results: int = 1,
-) -> Optional[Dict[str, Any]]:
+    Stores:
+      - canonical_key if provided
+      - normalized_question (helpful for old lookups)
     """
-    Backward-compatible adapter for older ask_service calls.
+    normalized_question = _clean(normalized_question)
+    answer = _clean(answer)
+    lang = _norm_lang(lang)
+    canonical_key = _clean(canonical_key or "")
 
-    Your current cache lookup is by (canonical_key, lang),
-    not by fuzzy normalized_question search.
-    """
-    _ = (normalized_question, max_results)  # signature compatibility only
-    return get_cache_answer(canonical_key, lang)
+    if not answer:
+        return
+    if looks_like_ai_failure(answer):
+        return
+
+    payload: Dict[str, Any] = {
+        "answer": answer,
+        "source": "ai",
+        "enabled": True,
+        "priority": int(priority or 0),
+        "lang": lang,
+        "last_used_at": _now_utc().isoformat(),
+    }
+    if normalized_question:
+        payload["normalized_question"] = normalized_question
+    if canonical_key:
+        payload["canonical_key"] = canonical_key
+    if tags is not None:
+        payload["tags"] = tags
+
+    # Prefer conflict on canonical_key+lang if canonical_key present
+    try:
+        if canonical_key:
+            supabase().table("qa_cache").upsert(payload, on_conflict="canonical_key,lang").execute()
+        else:
+            # fallback uniqueness by normalized_question+lang if you have that index
+            supabase().table("qa_cache").upsert(payload, on_conflict="normalized_question,lang").execute()
+    except Exception:
+        # best-effort insert
+        try:
+            supabase().table("qa_cache").insert(payload).execute()
+        except Exception:
+            pass
