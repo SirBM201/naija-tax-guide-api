@@ -39,3 +39,17 @@ def upsert_cache_ai_answer(*, canonical_key: str, lang: str, answer: str, tags=N
         payload["tags"] = tags
 
     supabase.table("qa_cache").upsert(payload, on_conflict="canonical_key,lang").execute()
+
+# -------------------------------------------------------------------
+# Backward-compat aliases (prevents ImportError when older modules
+# still import old function names)
+# -------------------------------------------------------------------
+
+def find_cached_answer(*args, **kwargs):
+    """
+    Backward-compatible alias.
+    Old code expects find_cached_answer(...).
+    Newer code uses get_cache_answer(...).
+    """
+    return get_cache_answer(*args, **kwargs)
+
