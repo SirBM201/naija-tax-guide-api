@@ -1,40 +1,61 @@
-# app/services/lang_service.py
 from __future__ import annotations
-import re
-from typing import Optional, List
+from typing import Optional
+
+LANG_ALIASES = {
+    "en": "en",
+    "english": "en",
+
+    "yo": "yo",
+    "yoruba": "yo",
+
+    "ig": "ig",
+    "igbo": "ig",
+
+    "ha": "ha",
+    "hausa": "ha",
+
+    "pcm": "pcm",
+    "pidgin": "pcm",
+    "naija": "pcm",
+    "nigerian pidgin": "pcm",
+}
 
 SUPPORTED = {"en", "yo", "ig", "ha", "pcm"}
 
 def normalize_lang(lang: Optional[str]) -> str:
-    l = (lang or "").strip().lower()
-    if l in ("yoruba", "yo"):
-        return "yo"
-    if l in ("igbo", "ig"):
-        return "ig"
-    if l in ("hausa", "ha"):
-        return "ha"
-    if l in ("pidgin", "pcm", "pigin"):
-        return "pcm"
-    return "en" if l not in SUPPORTED else l
-
-# Simple low-cost heuristic (better than nothing; WhatsApp/Telegram can pass lang later)
-_YO_HINT = re.compile(r"\b(kí|kini|ẹ|ọba|jẹ|fẹ|jọ̀wọ́|ọwọ)\b", re.IGNORECASE)
-_HA_HINT = re.compile(r"\b(ina|yaya|me yasa|don|na|kai|ku)\b", re.IGNORECASE)
-_IG_HINT = re.compile(r"\b(kedu|biko|anyị|ụlọ|ego)\b", re.IGNORECASE)
+    v = (lang or "").strip().lower()
+    if not v:
+        return "en"
+    v = LANG_ALIASES.get(v, v)
+    return v if v in SUPPORTED else "en"
 
 def detect_lang(text: str) -> str:
-    t = (text or "").lower()
-    if _YO_HINT.search(t):
-        return "yo"
-    if _IG_HINT.search(t):
-        return "ig"
-    if _HA_HINT.search(t):
-        return "ha"
-    return "en"
+    """
+    Cheap heuristic (offline). Good enough for YO/IG/HA/PCM vs EN.
+    If you later want higher accuracy, you can upgrade this without changing resolver logic.
+    """
+    t = (text or "").strip().lower()
+    if not t:
+        return "en"
 
-def LANG_FALLBACK_ORDER(preferred: str) -> List[str]:
-    p = normalize_lang(preferred)
-    if p == "en":
-        return ["en"]
-    # You can tune this order
-    return [p, "en"]
+    # Yoruba hints
+    yo_tokens = [" ẹni ", " ṣé", " ni?", " kini", "kí ni", "owo ori", "ìjọba", "jẹ́"]
+    if any(tok in t for tok in yo_tokens):
+        return "yo"
+
+    # Hausa hints
+    ha_tokens = [" haraji", " me yasa", " yaya", " gwamnati", " kudin", " shin "]
+    if any(tok in t for tok in ha_tokens):
+        return "ha"
+
+    # Igbo hints
+    ig_tokens = [" ụtụ", " gọọmenti", " kedu", " ego", " òlee", " gịnị"]
+    if any(tok in t for tok in ig_tokens):
+        return "ig"
+
+    # Pidgin hints
+    pcm_tokens = [" wetin", " how far", " abi", " na ", " dey", " no be", " una "]
+    if any(tok in t for tok in pcm_tokens):
+        return "pcm"
+
+    return "en"
