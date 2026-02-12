@@ -1,51 +1,40 @@
 # app/services/lang_service.py
 from __future__ import annotations
 import re
-from typing import Optional
+from typing import Optional, List
 
-SUPPORTED = ("en", "pcm", "yo", "ig", "ha")
-
-# Lightweight, rule-based detection (NO AI cost)
-_YO_MARKERS = {"jẹ", "ọba", "gbọ", "ṣé", "kí", "nítorí", "àti", "wọ́n", "mi", "rẹ", "ń"}
-_IG_MARKERS = {"anyị", "gịnị", "ụlọ", "anyị", "n'ụzọ", "ọrụ", "ego", "nke", "na", "ụzọ"}
-_HA_MARKERS = {"ina", "me", "ya", "kudi", "haraji", "yaya", "ta", "na", "shi", "kai"}
-_PCM_MARKERS = {"wetin", "how far", "abeg", "na", "dey", "wey", "una", "pikin", "no be", "sha"}
+SUPPORTED = {"en", "yo", "ig", "ha", "pcm"}
 
 def normalize_lang(lang: Optional[str]) -> str:
-    if not lang:
-        return "en"
-    l = lang.strip().lower()
+    l = (lang or "").strip().lower()
+    if l in ("yoruba", "yo"):
+        return "yo"
+    if l in ("igbo", "ig"):
+        return "ig"
+    if l in ("hausa", "ha"):
+        return "ha"
+    if l in ("pidgin", "pcm", "pigin"):
+        return "pcm"
+    return "en" if l not in SUPPORTED else l
 
-    # normalize common aliases
-    alias = {
-        "english": "en",
-        "en-us": "en", "en-gb": "en",
-        "yoruba": "yo", "yo-ng": "yo",
-        "igbo": "ig", "ig-ng": "ig",
-        "hausa": "ha", "ha-ng": "ha",
-        "pidgin": "pcm", "naija": "pcm", "nigerian pidgin": "pcm",
-    }.get(l, l)
-
-    return alias if alias in SUPPORTED else "en"
+# Simple low-cost heuristic (better than nothing; WhatsApp/Telegram can pass lang later)
+_YO_HINT = re.compile(r"\b(kí|kini|ẹ|ọba|jẹ|fẹ|jọ̀wọ́|ọwọ)\b", re.IGNORECASE)
+_HA_HINT = re.compile(r"\b(ina|yaya|me yasa|don|na|kai|ku)\b", re.IGNORECASE)
+_IG_HINT = re.compile(r"\b(kedu|biko|anyị|ụlọ|ego)\b", re.IGNORECASE)
 
 def detect_lang(text: str) -> str:
-    t = (text or "").strip().lower()
-    if not t:
-        return "en"
-
-    # quick pidgin phrase check
-    for m in _PCM_MARKERS:
-        if m in t:
-            return "pcm"
-
-    # token marker checks
-    tokens = set(re.findall(r"[a-zA-ZÀ-ž'ọ̀ṣẹ́ụ̀ń]+", t))
-
-    if tokens & _YO_MARKERS:
+    t = (text or "").lower()
+    if _YO_HINT.search(t):
         return "yo"
-    if tokens & _IG_MARKERS:
+    if _IG_HINT.search(t):
         return "ig"
-    if tokens & _HA_MARKERS:
+    if _HA_HINT.search(t):
         return "ha"
-
     return "en"
+
+def LANG_FALLBACK_ORDER(preferred: str) -> List[str]:
+    p = normalize_lang(preferred)
+    if p == "en":
+        return ["en"]
+    # You can tune this order
+    return [p, "en"]
