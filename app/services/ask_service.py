@@ -6,13 +6,16 @@ from datetime import date
 import time
 
 from ..core.supabase_client import supabase
-from .qa_cache_service import find_cached_answer, touch_cache_best_effort, upsert_ai_answer_to_cache_best_effort
+from .qa_cache_service import (
+    find_cached_answer,
+    touch_cache_best_effort,
+    upsert_ai_answer_to_cache_best_effort,
+)
 from .qa_library_service import find_library_answer
 from .qa_logging_service import log_qa_event_best_effort
 
 
-PAID_CACHE_DAILY_LIMIT = 1000  # ✅ paid users cache/day
-# ✅ No paid AI daily limit. AI usage is controlled ONLY by AI credits.
+PAID_CACHE_DAILY_LIMIT = 1000  # paid users cache/day; AI has no daily cap for paid
 
 
 def _today_utc() -> str:
@@ -81,9 +84,10 @@ def _paid_cache_used_today(account_id: str, day: str) -> int:
 
 def _consume_ai_credits(account_id: str, cost: int) -> Tuple[bool, str]:
     """
-    Uses your confirmed signature:
+    Your confirmed signature:
       consume_ai_credits(p_account_id, p_cost)
-    Must return ok/reason pattern or boolean.
+    Expected return:
+      {"ok": true/false, "reason": "..."}  OR boolean
     """
     cost = int(cost or 0)
     if cost <= 0:
@@ -96,13 +100,11 @@ def _consume_ai_credits(account_id: str, cost: int) -> Tuple[bool, str]:
         if isinstance(data, list):
             data = data[0] if data else {}
 
-        # handle dict style: {"ok": true/false, "reason": "..."}
         if isinstance(data, dict):
             if data.get("ok") is True:
                 return True, "ok"
             return False, (data.get("reason") or "out_of_credits")
 
-        # handle boolean style
         if data is True:
             return True, "ok"
 
@@ -112,15 +114,11 @@ def _consume_ai_credits(account_id: str, cost: int) -> Tuple[bool, str]:
 
 
 def _cost_for_mode(mode: str) -> int:
-    # you can tune later
     return 1 if mode == "text" else 2
 
 
 def _call_ai_model(question: str, lang: str = "en") -> str:
-    """
-    Replace with your real AI provider call.
-    Keep as stub so boot is always safe.
-    """
+    # Replace with your real AI provider call later.
     return f"(AI) I received your question: {question}"
 
 
@@ -131,13 +129,14 @@ def answer_question(
     lang: str = "en",
     canonical_key: Optional[str] = None,
     mode: str = "text",            # text|voice
-    is_paid_user: bool = True,     # your subscription layer sets this
-    plan_active: bool = True,      # pass your computed plan status here
+    is_paid_user: bool = True,     # subscription layer sets
+    plan_active: bool = True,      # subscription layer sets
     cache_tags: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Returns ONLY answer or a clean topup-required error.
-    Does not expose cache/ai sources to users.
+    User-facing response hides internals (no source, no credits_used).
+    Internal logging records source/cost.
+    If plan is active but AI credits are exhausted -> AI_TOPUP_REQUIRED.
     """
     t0 = time.time()
 
@@ -171,7 +170,7 @@ def answer_question(
     day = _today_utc()
     nq = _normalize_question(q_raw)
 
-    # 1) Library first
+    # 1) Library
     lib = find_library_answer(nq, lang=lang, canonical_key=canonical_key)
     if lib and lib.get("answer"):
         latency = int((time.time() - t0) * 1000)
@@ -194,11 +193,10 @@ def answer_question(
         )
         return {"ok": True, "answer": lib.get("answer")}
 
-    # 2) Cache next (paid limit applies)
+    # 2) Cache (paid limit)
     cache_allowed = True
-    if is_paid_user:
-        if _paid_cache_used_today(account_id, day) >= PAID_CACHE_DAILY_LIMIT:
-            cache_allowed = False
+    if is_paid_user and _paid_cache_used_today(account_id, day) >= PAID_CACHE_DAILY_LIMIT:
+        cache_allowed = False
 
     if cache_allowed:
         cached = find_cached_answer(nq, lang=lang, canonical_key=canonical_key)
@@ -224,14 +222,12 @@ def answer_question(
             )
             return {"ok": True, "answer": cached.get("answer")}
 
-    # 3) AI fallback (credits only)
+    # 3) AI (credits only)
     cost = _cost_for_mode(mode)
     ok, reason = _consume_ai_credits(account_id, cost)
 
     if not ok:
         latency = int((time.time() - t0) * 1000)
-
-        # Log internal block
         log_qa_event_best_effort(
             account_id=account_id,
             mode=mode,
@@ -249,7 +245,6 @@ def answer_question(
             latency_ms=latency,
         )
 
-        # User-facing: no credit numbers, no source
         if plan_active:
             return {
                 "ok": False,
@@ -262,7 +257,6 @@ def answer_question(
             "message": "Your subscription is not active. Please renew to continue.",
         }
 
-    # AI success
     ai_answer = _call_ai_model(q_raw, lang=lang)
 
     upsert_ai_answer_to_cache_best_effort(
@@ -279,7 +273,6 @@ def answer_question(
     latency = int((time.time() - t0) * 1000)
     _update_daily_counter_best_effort(account_id, day, mode=mode, used_cache=False, used_ai=True)
 
-    # Internal log includes cost, but user never sees it
     log_qa_event_best_effort(
         account_id=account_id,
         mode=mode,
@@ -298,3 +291,32 @@ def answer_question(
     )
 
     return {"ok": True, "answer": ai_answer}
+
+
+# ---------------------------------------------------------
+# Compatibility wrapper for existing routes:
+# app/routes/ask.py imports ask_guarded
+# ---------------------------------------------------------
+def ask_guarded(
+    account_id: str,
+    question: str,
+    *,
+    mode: str = "text",
+    lang: str = "en",
+    canonical_key: Optional[str] = None,
+    is_paid_user: bool = True,
+    plan_active: bool = True,
+) -> Dict[str, Any]:
+    """
+    Backward-compatible entrypoint expected by routes.
+    Returns the same shape your route expects: dict with ok/answer or ok/error/message.
+    """
+    return answer_question(
+        account_id=account_id,
+        question=question,
+        mode=mode,
+        lang=lang,
+        canonical_key=canonical_key,
+        is_paid_user=is_paid_user,
+        plan_active=plan_active,
+    )
