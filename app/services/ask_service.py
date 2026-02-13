@@ -6,6 +6,7 @@ from datetime import date
 import time
 
 from ..core.supabase_client import supabase
+
 from .qa_cache_service import (
     find_cached_answer,
     touch_cache_best_effort,
@@ -15,7 +16,7 @@ from .qa_library_service import find_library_answer
 from .qa_logging_service import log_qa_event_best_effort
 
 
-PAID_CACHE_DAILY_LIMIT = 1000  # paid users cache/day; AI has no daily cap for paid
+PAID_CACHE_DAILY_LIMIT = 1000  # ✅ paid users cache/day; AI has no daily cap for paid
 
 
 def _today_utc() -> str:
@@ -26,6 +27,34 @@ def _normalize_question(q: str) -> str:
     return " ".join((q or "").strip().lower().split())
 
 
+def _cost_for_mode(mode: str) -> int:
+    return 1 if mode == "text" else 2
+
+
+# -------------------------
+# Subscription helpers
+# -------------------------
+def _get_subscription_status_best_effort(
+    account_id: str,
+    provider: Optional[str],
+    provider_user_id: Optional[str],
+) -> Dict[str, Any]:
+    """
+    Best-effort subscription lookup.
+    If you already have a subscriptions_service, wire it here.
+    For now: assumes paid unless you later connect real status.
+    """
+    # TODO: integrate your existing subscriptions_service.py if available
+    return {
+        "active": True,
+        "state": "active",
+        "reason": "assumed_active",
+    }
+
+
+# -------------------------
+# Daily counters
+# -------------------------
 def _get_or_create_daily_counter(account_id: str, day: str) -> Dict[str, Any]:
     res = (
         supabase().table("daily_question_counters")
@@ -82,12 +111,15 @@ def _paid_cache_used_today(account_id: str, day: str) -> int:
         return 0
 
 
+# -------------------------
+# AI credits
+# -------------------------
 def _consume_ai_credits(account_id: str, cost: int) -> Tuple[bool, str]:
     """
-    Your confirmed signature:
+    Your confirmed RPC:
       consume_ai_credits(p_account_id, p_cost)
-    Expected return:
-      {"ok": true/false, "reason": "..."}  OR boolean
+    Return:
+      {"ok": true/false, "reason": "..."} or boolean
     """
     cost = int(cost or 0)
     if cost <= 0:
@@ -113,51 +145,57 @@ def _consume_ai_credits(account_id: str, cost: int) -> Tuple[bool, str]:
         return False, "ledger_error"
 
 
-def _cost_for_mode(mode: str) -> int:
-    return 1 if mode == "text" else 2
-
-
 def _call_ai_model(question: str, lang: str = "en") -> str:
-    # Replace with your real AI provider call later.
+    # Replace later with real provider. Boot-safe stub.
     return f"(AI) I received your question: {question}"
 
 
-def answer_question(
-    *,
-    account_id: str,
-    question: str,
-    lang: str = "en",
-    canonical_key: Optional[str] = None,
-    mode: str = "text",            # text|voice
-    is_paid_user: bool = True,     # subscription layer sets
-    plan_active: bool = True,      # subscription layer sets
-    cache_tags: Optional[str] = None,
-) -> Dict[str, Any]:
+# =========================================================
+# PUBLIC ENTRYPOINT your route expects: ask_guarded(body)
+# =========================================================
+def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
     """
-    User-facing response hides internals (no source, no credits_used).
-    Internal logging records source/cost.
-    If plan is active but AI credits are exhausted -> AI_TOPUP_REQUIRED.
+    This matches routes/ask.py exactly:
+      resp = ask_guarded(body)
+
+    Input body may include:
+      account_id OR (provider + provider_user_id)
+      question
+      lang
     """
     t0 = time.time()
 
-    account_id = (account_id or "").strip()
-    q_raw = (question or "").strip()
-    lang = (lang or "en").strip() or "en"
-    mode = (mode or "text").strip().lower()
+    body = body or {}
+    question = (body.get("question") or "").strip()
+    lang = (body.get("lang") or "en").strip() or "en"
+
+    # Optional identity styles
+    account_id = (body.get("account_id") or "").strip()
+    provider = (body.get("provider") or "").strip().lower() or None
+    provider_user_id = (body.get("provider_user_id") or "").strip() or None
+
+    # Mode: infer or default
+    mode = (body.get("mode") or "text").strip().lower()
     if mode not in ("text", "voice"):
         mode = "text"
 
-    if not account_id or not q_raw:
+    # Validate
+    if not question:
+        return {"ok": False, "error": "question is required"}
+
+    if not account_id:
+        # If you have an account lookup/upsert service, wire it here.
+        # For now we require account_id to avoid silent mis-routing.
         latency = int((time.time() - t0) * 1000)
         log_qa_event_best_effort(
-            account_id=account_id or "unknown",
+            account_id="unknown",
             mode=mode,
             lang=lang,
-            question_raw=q_raw,
+            question_raw=question,
             normalized_question="",
-            canonical_key=canonical_key,
+            canonical_key=None,
             outcome="blocked",
-            reason="validation_error",
+            reason="missing_account_id",
             source=None,
             cache_hit=False,
             library_hit=False,
@@ -165,10 +203,16 @@ def answer_question(
             ai_credit_cost=0,
             latency_ms=latency,
         )
-        return {"ok": False, "error": "INVALID_REQUEST", "message": "account_id and question are required."}
+        return {"ok": False, "error": "account_id is required (or connect provider identity first)"}
+
+    # Subscription status (best-effort stub for now)
+    sub = _get_subscription_status_best_effort(account_id, provider, provider_user_id)
+    plan_active = bool(sub.get("active", True))
+    is_paid_user = bool(sub.get("active", True))  # treat active subscription as paid
 
     day = _today_utc()
-    nq = _normalize_question(q_raw)
+    nq = _normalize_question(question)
+    canonical_key = (body.get("canonical_key") or None)
 
     # 1) Library
     lib = find_library_answer(nq, lang=lang, canonical_key=canonical_key)
@@ -179,7 +223,7 @@ def answer_question(
             account_id=account_id,
             mode=mode,
             lang=lang,
-            question_raw=q_raw,
+            question_raw=question,
             normalized_question=nq,
             canonical_key=canonical_key,
             outcome="ok",
@@ -191,6 +235,7 @@ def answer_question(
             ai_credit_cost=0,
             latency_ms=latency,
         )
+        # User sees only answer (no source/credits)
         return {"ok": True, "answer": lib.get("answer")}
 
     # 2) Cache (paid limit)
@@ -208,7 +253,7 @@ def answer_question(
                 account_id=account_id,
                 mode=mode,
                 lang=lang,
-                question_raw=q_raw,
+                question_raw=question,
                 normalized_question=nq,
                 canonical_key=canonical_key,
                 outcome="ok",
@@ -232,7 +277,7 @@ def answer_question(
             account_id=account_id,
             mode=mode,
             lang=lang,
-            question_raw=q_raw,
+            question_raw=question,
             normalized_question=nq,
             canonical_key=canonical_key,
             outcome="blocked",
@@ -245,6 +290,7 @@ def answer_question(
             latency_ms=latency,
         )
 
+        # ✅ Your requirement: users don't see credits, only topup prompt if plan is active
         if plan_active:
             return {
                 "ok": False,
@@ -257,12 +303,13 @@ def answer_question(
             "message": "Your subscription is not active. Please renew to continue.",
         }
 
-    ai_answer = _call_ai_model(q_raw, lang=lang)
+    # AI success
+    ai_answer = _call_ai_model(question, lang=lang)
 
     upsert_ai_answer_to_cache_best_effort(
         normalized_question=nq,
         answer=ai_answer,
-        tags=cache_tags,
+        tags=None,
         source="ai",
         lang=lang,
         canonical_key=canonical_key,
@@ -277,7 +324,7 @@ def answer_question(
         account_id=account_id,
         mode=mode,
         lang=lang,
-        question_raw=q_raw,
+        question_raw=question,
         normalized_question=nq,
         canonical_key=canonical_key,
         outcome="ok",
@@ -291,32 +338,3 @@ def answer_question(
     )
 
     return {"ok": True, "answer": ai_answer}
-
-
-# ---------------------------------------------------------
-# Compatibility wrapper for existing routes:
-# app/routes/ask.py imports ask_guarded
-# ---------------------------------------------------------
-def ask_guarded(
-    account_id: str,
-    question: str,
-    *,
-    mode: str = "text",
-    lang: str = "en",
-    canonical_key: Optional[str] = None,
-    is_paid_user: bool = True,
-    plan_active: bool = True,
-) -> Dict[str, Any]:
-    """
-    Backward-compatible entrypoint expected by routes.
-    Returns the same shape your route expects: dict with ok/answer or ok/error/message.
-    """
-    return answer_question(
-        account_id=account_id,
-        question=question,
-        mode=mode,
-        lang=lang,
-        canonical_key=canonical_key,
-        is_paid_user=is_paid_user,
-        plan_active=plan_active,
-    )
