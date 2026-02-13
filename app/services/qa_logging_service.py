@@ -1,6 +1,9 @@
+# app/services/qa_logging_service.py
 from __future__ import annotations
+
 from typing import Optional
 from ..core.supabase_client import supabase
+
 
 def log_qa_event_best_effort(
     *,
@@ -10,9 +13,9 @@ def log_qa_event_best_effort(
     question_raw: str,
     normalized_question: str,
     canonical_key: Optional[str],
-    outcome: str,     # ok|blocked|error
-    reason: Optional[str],
-    source: Optional[str],  # cache|library|ai|None
+    outcome: str,          # ok|blocked|error
+    reason: Optional[str], # ai_credits_exhausted|validation_error|internal_error|...
+    source: Optional[str], # cache|library|ai|None
     cache_hit: bool,
     library_hit: bool,
     ai_used: bool,
@@ -30,9 +33,9 @@ def log_qa_event_best_effort(
             "p_outcome": outcome,
             "p_reason": reason,
             "p_source": source,
-            "p_cache_hit": cache_hit,
-            "p_library_hit": library_hit,
-            "p_ai_used": ai_used,
+            "p_cache_hit": bool(cache_hit),
+            "p_library_hit": bool(library_hit),
+            "p_ai_used": bool(ai_used),
             "p_ai_credit_cost": int(ai_credit_cost or 0),
             "p_latency_ms": int(latency_ms or 0),
         }).execute()
