@@ -3,9 +3,9 @@
 Central Supabase client factory for the backend.
 
 Rules:
-- Backend ALWAYS uses SERVICE ROLE key
-- Client is created once (singleton)
-- Safe for RPC, inserts, updates, webhooks
+- Backend uses SERVICE ROLE key only
+- Client created once (singleton)
+- Safe for RPC/inserts/updates/webhooks (server-side only)
 """
 
 from __future__ import annotations
@@ -19,10 +19,6 @@ _client: Optional[Any] = None
 
 
 def get_supabase() -> Any:
-    """
-    Returns a singleton Supabase client using SERVICE ROLE key.
-    Server-side only. Never expose to frontend.
-    """
     global _client
 
     if _client is not None:
@@ -37,6 +33,7 @@ def get_supabase() -> Any:
     return _client
 
 
-# Backwards-compatible import style:
-# from app.core.supabase_client import supabase
+# Backward-compatible import style:
+#   from app.core.supabase_client import supabase
+#   supabase.table("...").select("*").execute()
 supabase = get_supabase()
