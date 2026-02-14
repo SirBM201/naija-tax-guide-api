@@ -1,6 +1,8 @@
 # app/services/web_tokens_service.py
 from __future__ import annotations
 
+import hashlib
+import hmac
 import os
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
@@ -9,15 +11,22 @@ from flask import Request
 from app.core.supabase_client import supabase
 
 
-WEB_TOKEN_TABLE = (os.getenv("WEB_TOKEN_TABLE", "web_tokens") or "web_tokens").strip()
+# Your real table/columns (confirmed from your SQL results)
+TABLE = "web_sessions"
+COL_ACCOUNT_ID = "account_id"
+COL_EXPIRES_AT = "expires_at"
+COL_REVOKED_AT = "revoked_at"
+COL_TOKEN_HASH = "token_hash"
 
-# Column names (in case your table uses different names)
-COL_TOKEN = (os.getenv("WEB_TOKEN_COL_TOKEN", "token") or "token").strip()
-COL_ACCOUNT_ID = (os.getenv("WEB_TOKEN_COL_ACCOUNT_ID", "account_id") or "account_id").strip()
-COL_EXPIRES_AT = (os.getenv("WEB_TOKEN_COL_EXPIRES_AT", "expires_at") or "expires_at").strip()
-COL_REVOKED_AT = (os.getenv("WEB_TOKEN_COL_REVOKED_AT", "revoked_at") or "revoked_at").strip()
+# IMPORTANT:
+# Use the SAME secret + hashing strategy as your existing verify-otp code.
+# If your verify-otp uses a pepper/secret, set it here too.
+WEB_TOKEN_PEPPER = (os.getenv("WEB_TOKEN_PEPPER", "") or "").strip()
 
 
+# -----------------------------
+# Time helpers
+# -----------------------------
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -36,21 +45,54 @@ def _iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+# -----------------------------
+# Token extraction
+# -----------------------------
 def extract_bearer_token(req: Request) -> Optional[str]:
     auth = (req.headers.get("Authorization") or "").strip()
     if auth.lower().startswith("bearer "):
         t = auth[7:].strip()
         return t or None
+
     t2 = (req.headers.get("X-Auth-Token") or "").strip()
     return t2 or None
 
 
-def _get_token_row(token: str) -> Optional[Dict[str, Any]]:
+# -----------------------------
+# Hashing (must match verify-otp)
+# -----------------------------
+def _token_hash(token: str) -> str:
+    """
+    Hash strategy:
+    - If WEB_TOKEN_PEPPER is set, use HMAC-SHA256(pepper, token)
+    - Otherwise use SHA256(token)
+
+    NOTE:
+    This must match your /verify-otp implementation.
+    """
+    token = (token or "").strip()
+    if not token:
+        return ""
+
+    if WEB_TOKEN_PEPPER:
+        return hmac.new(WEB_TOKEN_PEPPER.encode("utf-8"), token.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+# -----------------------------
+# DB access
+# -----------------------------
+def _get_session_row_by_token(token: str) -> Optional[Dict[str, Any]]:
+    th = _token_hash(token)
+    if not th:
+        return None
+
     try:
         res = (
-            supabase.table(WEB_TOKEN_TABLE)
+            supabase.table(TABLE)
             .select("*")
-            .eq(COL_TOKEN, token)
+            .eq(COL_TOKEN_HASH, th)
             .limit(1)
             .execute()
         )
@@ -60,12 +102,15 @@ def _get_token_row(token: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+# -----------------------------
+# Public API
+# -----------------------------
 def validate_token(token: str) -> Tuple[bool, Dict[str, Any], Optional[str]]:
     token = (token or "").strip()
     if not token:
         return False, {}, "Unauthorized"
 
-    row = _get_token_row(token)
+    row = _get_session_row_by_token(token)
     if not row:
         return False, {}, "Unauthorized"
 
@@ -88,15 +133,16 @@ def revoke_token(token: str) -> Tuple[bool, Optional[str]]:
     if not token:
         return False, "Unauthorized"
 
-    row = _get_token_row(token)
+    row = _get_session_row_by_token(token)
     if not row:
         return True, None  # idempotent
 
+    th = _token_hash(token)
     try:
         (
-            supabase.table(WEB_TOKEN_TABLE)
+            supabase.table(TABLE)
             .update({COL_REVOKED_AT: _iso(_now_utc())})
-            .eq(COL_TOKEN, token)
+            .eq(COL_TOKEN_HASH, th)
             .execute()
         )
         return True, None
