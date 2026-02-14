@@ -19,7 +19,7 @@ from app.routes.accounts_admin import bp as accounts_admin_bp
 from app.routes.meta import bp as meta_bp
 from app.routes.email_link import bp as email_link_bp
 from app.routes.cron import bp as cron_bp
-from .routes.web_auth import bp as web_auth_bp
+from app.routes.web_auth import bp as web_auth_bp
 
 # Paystack
 from app.routes.paystack import paystack_bp
@@ -54,19 +54,25 @@ def create_app() -> Flask:
     app.register_blueprint(ask_bp, url_prefix=api_prefix)
     app.register_blueprint(webhooks_bp, url_prefix=api_prefix)
     app.register_blueprint(plans_bp, url_prefix=api_prefix)
-    app.register_blueprint(link_tokens_bp, url_prefix="/api")
-    app.register_blueprint(whatsapp_bp, url_prefix="/api")
-    app.register_blueprint(telegram_bp, url_prefix="/api")
-    app.register_blueprint(admin_link_tokens_bp, url_prefix="/api")
-    app.register_blueprint(debug_routes_bp, url_prefix="/api")
-    app.register_blueprint(accounts_admin_bp, url_prefix="/api")
-    app.register_blueprint(meta_bp, url_prefix="/api")
-    app.register_blueprint(email_link_bp, url_prefix="/api")
+
+    # Channel + linking routes
+    app.register_blueprint(link_tokens_bp, url_prefix=api_prefix)
+    app.register_blueprint(whatsapp_bp, url_prefix=api_prefix)
+    app.register_blueprint(telegram_bp, url_prefix=api_prefix)
+    app.register_blueprint(admin_link_tokens_bp, url_prefix=api_prefix)
+    app.register_blueprint(debug_routes_bp, url_prefix=api_prefix)
+    app.register_blueprint(accounts_admin_bp, url_prefix=api_prefix)
+    app.register_blueprint(meta_bp, url_prefix=api_prefix)
+    app.register_blueprint(email_link_bp, url_prefix=api_prefix)
+
+    # Web auth (DEV OTP + sessions)
+    app.register_blueprint(web_auth_bp, url_prefix=api_prefix)
+
+    # Cron (usually not under /api unless you want it)
     app.register_blueprint(cron_bp)
-     app.register_blueprint(web_auth_bp)
 
     # Paystack routes
     app.register_blueprint(paystack_bp, url_prefix=api_prefix)
     app.register_blueprint(paystack_webhook_bp, url_prefix=api_prefix)
-    
+
     return app
