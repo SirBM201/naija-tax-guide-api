@@ -212,7 +212,6 @@ def upsert_account_link(
     if not _is_uuid(auth_user_id):
         return {"ok": False, "error": "auth_user_id must be a valid uuid"}
 
-    # Guard: do not overwrite existing link to another user
     existing = lookup_account(provider=provider, provider_user_id=provider_user_id)
     if existing.get("ok") and existing.get("found"):
         old = (existing.get("auth_user_id") or "").strip()
@@ -243,6 +242,51 @@ def upsert_account_link(
 
     row = (res.data or [None])[0]
     return {"ok": True, "account": row}
+
+
+# ---------------------------------------------------------
+# REQUIRED BY web_auth.py
+# ---------------------------------------------------------
+def ensure_account_id(
+    *,
+    provider: str,
+    provider_user_id: str,
+    phone_e164: Optional[str] = None,
+    display_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Ensures an account exists and returns its account_id (accounts.id).
+
+    This is intentionally simple + stable:
+    - Uses (provider, provider_user_id) as the natural key
+    - Stores phone into accounts.phone when provided (for web it’s usually phone_e164)
+    - Returns {"ok": True, "account_id": "<uuid>", "account": <row>}
+    """
+    provider = _norm_provider(provider)
+    provider_user_id = (provider_user_id or "").strip()
+
+    err = _validate_provider_and_id(provider, provider_user_id)
+    if err:
+        return {"ok": False, "error": err}
+
+    # For web auth, we often want the phone saved
+    phone = (phone_e164 or None)
+
+    res = upsert_account(
+        provider=provider,
+        provider_user_id=provider_user_id,
+        display_name=display_name,
+        phone=phone,
+    )
+    if not res.get("ok"):
+        return res
+
+    row = res.get("account") or {}
+    account_id = row.get("id")
+    if not account_id:
+        return {"ok": False, "error": "Account created but id missing (unexpected)."}
+
+    return {"ok": True, "account_id": account_id, "account": row}
 
 
 # ---------------------------------------------------------
@@ -294,14 +338,9 @@ def _plan_from_subscriptions_table(auth_user_id: str) -> Tuple[Optional[Dict[str
 
 
 def _try_fetch_plan_from_table_guess(table_name: str, auth_user_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """
-    Best-effort fallback for other possible tables if you create them later.
-    Tries BOTH auth_user_id and user_id columns.
-    """
     auth_err = None
     user_err = None
 
-    # try auth_user_id first
     try:
         res = (
             supabase()
@@ -335,7 +374,6 @@ def _try_fetch_plan_from_table_guess(table_name: str, auth_user_id: str) -> Tupl
     except Exception as e:
         auth_err = str(e)
 
-    # then try user_id
     try:
         res2 = (
             supabase()
@@ -368,12 +406,6 @@ def _try_fetch_plan_from_table_guess(table_name: str, auth_user_id: str) -> Tupl
 
 
 def get_plan_status(auth_user_id: Optional[str]) -> Dict[str, Any]:
-    """
-    Best-practice plan status lookup for your current DB.
-    - First checks: public.subscriptions(user_id,...)
-    - Then tries: user_subscriptions / user_plans / plans (future compatibility)
-    - NEVER breaks your API if tables/columns differ.
-    """
     auth_user_id = (auth_user_id or "").strip()
     if not auth_user_id:
         return {"ok": True, "known": False, "is_active": False, "plan": None, "status": None, "plan_expiry": None}
