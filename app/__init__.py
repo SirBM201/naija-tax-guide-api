@@ -66,7 +66,7 @@ def create_app() -> Flask:
     app.register_blueprint(email_link_bp, url_prefix=api_prefix)
 
     # Web auth (DEV OTP + sessions)
-    app.register_blueprint(web_auth_bp, url_prefix=api_prefix)
+    app.register_blueprint(web_auth_bp, url_prefix="/api")
 
     # Cron (usually not under /api unless you want it)
     app.register_blueprint(cron_bp)
