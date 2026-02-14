@@ -53,29 +53,21 @@ def _is_uuid(value: str) -> bool:
 ALLOWED_PROVIDERS = {"wa", "tg", "msgr", "ig", "email", "web"}
 
 PROVIDER_ALIASES = {
-    # WhatsApp
     "wa": "wa",
     "whatsapp": "wa",
     "waba": "wa",
-    # Telegram
     "tg": "tg",
     "telegram": "tg",
-    # Messenger
     "msgr": "msgr",
     "messenger": "msgr",
     "facebook_messenger": "msgr",
     "fb_messenger": "msgr",
-    "fb messenger": "msgr",
     "facebook messenger": "msgr",
-    # Instagram
     "ig": "ig",
     "instagram": "ig",
     "instagram_dm": "ig",
-    "insta": "ig",
-    # Email
     "email": "email",
     "mail": "email",
-    # Web
     "web": "web",
     "website": "web",
 }
@@ -111,10 +103,6 @@ def upsert_account(
     display_name: Optional[str] = None,
     phone: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Creates or updates an account row WITHOUT auth_user_id (pre-link state).
-    Used when a message arrives before linking.
-    """
     provider = _norm_provider(provider)
     provider_user_id = (provider_user_id or "").strip()
 
@@ -148,9 +136,6 @@ def lookup_account(
     provider: str,
     provider_user_id: str,
 ) -> Dict[str, Any]:
-    """
-    Returns mapping from (provider, provider_user_id) -> auth_user_id (if linked)
-    """
     provider = _norm_provider(provider)
     provider_user_id = (provider_user_id or "").strip()
 
@@ -162,7 +147,7 @@ def lookup_account(
         res = (
             supabase()
             .table("accounts")
-            .select("id,provider,provider_user_id,auth_user_id,display_name,phone,updated_at,created_at")
+            .select("id,provider,provider_user_id,auth_user_id,display_name,phone,phone_e164,updated_at,created_at")
             .eq("provider", provider)
             .eq("provider_user_id", provider_user_id)
             .limit(1)
@@ -193,13 +178,6 @@ def upsert_account_link(
     display_name: Optional[str] = None,
     phone: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Upserts an account row AND binds it to auth_user_id (linked state).
-
-    Safety rule:
-    - If the channel is already linked to ANOTHER auth_user_id, block.
-    - If linked to SAME auth_user_id, idempotent OK.
-    """
     provider = _norm_provider(provider)
     provider_user_id = (provider_user_id or "").strip()
     auth_user_id = (auth_user_id or "").strip()
@@ -245,22 +223,23 @@ def upsert_account_link(
 
 
 # ---------------------------------------------------------
-# REQUIRED BY web_auth.py
+# REQUIRED BY web_auth.py (BACKWARD SAFE)
 # ---------------------------------------------------------
 def ensure_account_id(
     *,
     provider: str,
     provider_user_id: str,
     phone_e164: Optional[str] = None,
+    phone: Optional[str] = None,
     display_name: Optional[str] = None,
+    contact: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Ensures an account exists and returns its account_id (accounts.id).
+    Ensures an account exists and returns accounts.id as account_id.
 
-    This is intentionally simple + stable:
-    - Uses (provider, provider_user_id) as the natural key
-    - Stores phone into accounts.phone when provided (for web it’s usually phone_e164)
-    - Returns {"ok": True, "account_id": "<uuid>", "account": <row>}
+    Accepts multiple aliases to prevent future crashes:
+      - phone_e164 or phone or contact (any of them)
+    Stores phone into accounts.phone (and keeps provider_user_id as the channel ID).
     """
     provider = _norm_provider(provider)
     provider_user_id = (provider_user_id or "").strip()
@@ -269,14 +248,14 @@ def ensure_account_id(
     if err:
         return {"ok": False, "error": err}
 
-    # For web auth, we often want the phone saved
-    phone = (phone_e164 or None)
+    # prefer phone_e164, then phone, then contact
+    phone_value = (phone_e164 or phone or contact or None)
 
     res = upsert_account(
         provider=provider,
         provider_user_id=provider_user_id,
         display_name=display_name,
-        phone=phone,
+        phone=phone_value,
     )
     if not res.get("ok"):
         return res
@@ -290,14 +269,9 @@ def ensure_account_id(
 
 
 # ---------------------------------------------------------
-# Plan status: YOUR DB (public.subscriptions) FIRST
+# Plan status (kept as-is)
 # ---------------------------------------------------------
 def _plan_from_subscriptions_table(auth_user_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """
-    Your actual table: public.subscriptions
-    Columns seen:
-      user_id, plan, status, start_at, end_at, updated_at, id ...
-    """
     try:
         res = (
             supabase()
