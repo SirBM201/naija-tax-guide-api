@@ -4,6 +4,9 @@ import os
 def env(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
 
+# -----------------------------
+# Core
+# -----------------------------
 ENV = env("ENV", "prod")
 PORT = int(env("PORT", "8000") or "8000")
 
@@ -25,9 +28,22 @@ DEFAULT_PLAN_NAME = env("DEFAULT_PLAN_NAME", "Free")
 # Web Auth / OTP (DEV mode)
 # WEB_DEV_RETURN_OTP=1  -> API returns otp in response (dev only)
 # -----------------------------
-WEB_DEV_RETURN_OTP = env("WEB_DEV_RETURN_OTP", "0") in ("1", "true", "yes", "on")
+WEB_DEV_RETURN_OTP = env("WEB_DEV_RETURN_OTP", "0").lower() in ("1", "true", "yes", "on")
 
-# Optional knobs (safe defaults)
-OTP_TTL_SECONDS = int(env("OTP_TTL_SECONDS", "600") or "600")              # 10 mins
-OTP_COOLDOWN_SECONDS = int(env("OTP_COOLDOWN_SECONDS", "60") or "60")      # 1 min
+# -----------------------------
+# OTP knobs (COMPATIBILITY)
+# Your web_otp_service.py expects:
+#   WEB_OTP_TTL_MINUTES
+#   WEB_OTP_COOLDOWN_SECONDS
+# -----------------------------
+WEB_OTP_TTL_MINUTES = int(env("WEB_OTP_TTL_MINUTES", "10") or "10")              # 10 mins default
+WEB_OTP_COOLDOWN_SECONDS = int(env("WEB_OTP_COOLDOWN_SECONDS", "60") or "60")   # 60s default
+
+# -----------------------------
+# Optional: also expose seconds-based values
+# (kept so future services can use seconds directly)
+# -----------------------------
+OTP_TTL_SECONDS = int(env("OTP_TTL_SECONDS", str(WEB_OTP_TTL_MINUTES * 60)) or str(WEB_OTP_TTL_MINUTES * 60))
+OTP_COOLDOWN_SECONDS = int(env("OTP_COOLDOWN_SECONDS", str(WEB_OTP_COOLDOWN_SECONDS)) or str(WEB_OTP_COOLDOWN_SECONDS))
+
 WEB_SESSION_TTL_SECONDS = int(env("WEB_SESSION_TTL_SECONDS", "2592000") or "2592000")  # 30 days
