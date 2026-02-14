@@ -10,19 +10,6 @@ from app.services.web_tokens_service import extract_bearer_token, validate_token
 
 
 def require_auth(fn: Callable[..., Any]) -> Callable[..., Any]:
-    """
-    Protect routes with a web session token.
-
-    Token sources:
-      - Authorization: Bearer <token>
-      - X-Auth-Token: <token> (fallback)
-
-    On success:
-      g.account_id
-      g.auth_token
-      g.token_row
-    """
-
     @wraps(fn)
     def _wrapped(*args: Any, **kwargs: Any):
         token = extract_bearer_token(request)
@@ -36,7 +23,6 @@ def require_auth(fn: Callable[..., Any]) -> Callable[..., Any]:
         g.account_id = payload["account_id"]
         g.auth_token = token
         g.token_row = payload.get("token_row") or {}
-
         return fn(*args, **kwargs)
 
     return _wrapped
