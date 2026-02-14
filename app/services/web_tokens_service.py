@@ -5,7 +5,6 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 
 from flask import Request
-
 from app.core.supabase_client import supabase
 
 
@@ -23,37 +22,18 @@ def _parse_iso(value: Optional[str]) -> Optional[datetime]:
         return None
 
 
-def _iso(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
 def extract_bearer_token(req: Request) -> Optional[str]:
     auth = (req.headers.get("Authorization") or "").strip()
     if auth.lower().startswith("bearer "):
         t = auth[7:].strip()
         return t or None
-
     t2 = (req.headers.get("X-Auth-Token") or "").strip()
     return t2 or None
 
 
 def _get_token_row(token: str) -> Optional[Dict[str, Any]]:
-    """
-    Table expected: web_tokens
-      - token (text, unique)
-      - account_id (uuid)
-      - expires_at (timestamptz)
-      - revoked_at (timestamptz nullable)
-      - created_at (timestamptz)
-    """
     try:
-        res = (
-            supabase.table("web_tokens")
-            .select("*")
-            .eq("token", token)
-            .limit(1)
-            .execute()
-        )
+        res = supabase.table("web_tokens").select("*").eq("token", token).limit(1).execute()
         rows = (res.data or []) if hasattr(res, "data") else []
         return rows[0] if rows else None
     except Exception:
@@ -88,13 +68,14 @@ def revoke_token(token: str) -> Tuple[bool, Optional[str]]:
     if not token:
         return False, "Unauthorized"
 
-    # idempotent: ok if token row missing
     row = _get_token_row(token)
     if not row:
-        return True, None
+        return True, None  # idempotent
 
     try:
-        supabase.table("web_tokens").update({"revoked_at": _iso(_now_utc())}).eq("token", token).execute()
+        supabase.table("web_tokens").update({"revoked_at": _now_utc().isoformat().replace("+00:00", "Z")}).eq(
+            "token", token
+        ).execute()
         return True, None
     except Exception:
         return False, "Failed to logout"
