@@ -4,7 +4,7 @@ from __future__ import annotations
 from flask import Blueprint, jsonify, request
 
 from ..core.config import WEB_DEV_RETURN_OTP
-from ..services.accounts_service import upsert_account
+from ..services.accounts_service import ensure_account_id
 from ..services.web_otp_service import create_otp, verify_otp, otp_request_cooldown_ok
 from ..services.web_sessions_service import (
     create_web_session,
@@ -17,7 +17,6 @@ bp = Blueprint("web_auth", __name__)
 
 
 def _get_ip() -> str | None:
-    # if behind proxy, you may later trust X-Forwarded-For in a controlled way
     return request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or request.remote_addr
 
 
@@ -36,19 +35,11 @@ def _bearer_token() -> str | None:
 
 @bp.post("/web/auth/request-otp")
 def request_otp():
-    """
-    Body:
-      { "phone_e164": "+234..." }  OR  { "contact": "+234..." }
-    Returns:
-      { ok, expires_at, otp? }  (otp only in DEV)
-    """
     body = request.get_json(silent=True) or {}
     contact = (body.get("phone_e164") or body.get("contact") or "").strip()
 
     if not contact:
         return jsonify({"ok": False, "error": "phone_e164 is required"}), 400
-
-    # basic sanity for phone-ish input (you can tighten later)
     if len(contact) < 7:
         return jsonify({"ok": False, "error": "invalid phone"}), 400
 
@@ -57,21 +48,13 @@ def request_otp():
 
     otp = create_otp(contact=contact, purpose="web_login")
     resp = {"ok": True, "expires_at": otp["expires_at"]}
-
     if WEB_DEV_RETURN_OTP:
         resp["otp"] = otp["code_plain"]
-
     return jsonify(resp)
 
 
 @bp.post("/web/auth/verify-otp")
 def verify_otp_route():
-    """
-    Body:
-      { "phone_e164": "+234...", "otp": "123456" }
-    Returns:
-      { ok, token, account_id, expires_at }
-    """
     body = request.get_json(silent=True) or {}
     contact = (body.get("phone_e164") or body.get("contact") or "").strip()
     code = (body.get("otp") or body.get("code") or "").strip()
@@ -83,18 +66,19 @@ def verify_otp_route():
     if not ok:
         return jsonify({"ok": False, "error": reason}), 401
 
-    # Create/Find account identity for web channel
-    # provider="web", provider_user_id=phone_e164 (simple + stable)
-    account_id, _created = upsert_account(
+    # Create/Find account (provider=web, provider_user_id=phone)
+    acc = ensure_account_id(
         provider="web",
         provider_user_id=contact,
         display_name=None,
         phone=contact,
         phone_e164=contact,
     )
+    if not acc.get("ok") or not acc.get("account_id"):
+        return jsonify({"ok": False, "error": acc.get("error") or "account_create_failed"}), 500
 
     sess = create_web_session(
-        account_id=account_id,
+        account_id=acc["account_id"],
         ip=_get_ip(),
         user_agent=_get_ua(),
     )
@@ -102,7 +86,7 @@ def verify_otp_route():
     return jsonify(
         {
             "ok": True,
-            "account_id": account_id,
+            "account_id": acc["account_id"],
             "token": sess["token"],
             "expires_at": sess["expires_at"],
         }
@@ -111,11 +95,6 @@ def verify_otp_route():
 
 @bp.get("/web/auth/me")
 def me():
-    """
-    Header: Authorization: Bearer <token>
-    Returns:
-      { ok, account_id }
-    """
     token = _bearer_token()
     if not token:
         return jsonify({"ok": False, "error": "missing_token"}), 401
@@ -130,9 +109,6 @@ def me():
 
 @bp.post("/web/auth/logout")
 def logout():
-    """
-    Header: Authorization: Bearer <token>
-    """
     token = _bearer_token()
     if not token:
         return jsonify({"ok": False, "error": "missing_token"}), 401
