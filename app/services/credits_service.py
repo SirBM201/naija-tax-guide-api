@@ -7,20 +7,10 @@ from typing import Any, Dict, Optional, Tuple
 
 from app.core.supabase_client import supabase
 
-# -----------------------------
-# Config
-# -----------------------------
-DEFAULT_INITIAL_CREDITS = int((os.getenv("DEFAULT_INITIAL_CREDITS", "0") or "0").strip())
 
-# Optional: if you want plan-based initial credits, define env like:
-# PLAN_CREDITS_JSON='{"monthly":300,"quarterly":900,"yearly":3600,"free":0}'
-# or PLAN_CREDITS_JSON='{"basic":300,"pro":600,"enterprise":2000}'
-PLAN_CREDITS_JSON = (os.getenv("PLAN_CREDITS_JSON", "") or "").strip()
-
-
-# -----------------------------
-# Time helpers
-# -----------------------------
+# ------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -29,240 +19,191 @@ def _iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-# -----------------------------
-# Internal helpers
-# -----------------------------
-def _safe_int(x: Any, default: int = 0) -> int:
-    try:
-        return int(x)
-    except Exception:
-        return default
+def _table(name: str, default: str) -> str:
+    return (os.getenv(name, default) or default).strip()
 
 
-def _plan_credit_map() -> Dict[str, int]:
+# Tables (keep defaults matching your DB)
+PLANS_TABLE = _table("PLANS_TABLE", "plans")
+CREDIT_BALANCES_TABLE = _table("AI_CREDIT_BALANCES_TABLE", "ai_credit_balances")
+CREDIT_EVENTS_TABLE = _table("AI_CREDIT_EVENTS_TABLE", "ai_credit_events")
+
+
+# Column names (defaults based on what you showed)
+PLANS_COL_CODE = (os.getenv("PLANS_COL_CODE", "plan_code") or "plan_code").strip()
+PLANS_COL_CREDITS = (os.getenv("PLANS_COL_CREDITS", "ai_credits_total") or "ai_credits_total").strip()
+
+BAL_COL_ACCOUNT_ID = (os.getenv("AI_CREDIT_BALANCES_COL_ACCOUNT_ID", "account_id") or "account_id").strip()
+BAL_COL_BALANCE = (os.getenv("AI_CREDIT_BALANCES_COL_BALANCE", "balance") or "balance").strip()
+BAL_COL_UPDATED_AT = (os.getenv("AI_CREDIT_BALANCES_COL_UPDATED_AT", "updated_at") or "updated_at").strip()
+
+EV_COL_ACCOUNT_ID = (os.getenv("AI_CREDIT_EVENTS_COL_ACCOUNT_ID", "account_id") or "account_id").strip()
+EV_COL_EVENT_TYPE = (os.getenv("AI_CREDIT_EVENTS_COL_EVENT_TYPE", "event_type") or "event_type").strip()
+EV_COL_AMOUNT = (os.getenv("AI_CREDIT_EVENTS_COL_AMOUNT", "amount") or "amount").strip()
+EV_COL_META = (os.getenv("AI_CREDIT_EVENTS_COL_META", "meta") or "meta").strip()
+EV_COL_CREATED_AT = (os.getenv("AI_CREDIT_EVENTS_COL_CREATED_AT", "created_at") or "created_at").strip()
+
+
+# ------------------------------------------------------------
+# Public API
+# ------------------------------------------------------------
+def get_plan_credits(plan_code: str) -> Tuple[int, Optional[str]]:
     """
-    Loads optional mapping from env PLAN_CREDITS_JSON.
-    If not set or invalid, returns empty dict.
+    Reads ai_credits_total from plans table for the given plan_code.
     """
-    if not PLAN_CREDITS_JSON:
-        return {}
-    try:
-        import json
+    plan_code = (plan_code or "").strip()
+    if not plan_code:
+        return 0, "Missing plan_code"
 
-        raw = json.loads(PLAN_CREDITS_JSON)
-        if isinstance(raw, dict):
-            out: Dict[str, int] = {}
-            for k, v in raw.items():
-                out[str(k).strip().lower()] = _safe_int(v, 0)
-            return out
-        return {}
-    except Exception:
-        return {}
-
-
-def _get_balance_row(account_id: str) -> Optional[Dict[str, Any]]:
     try:
         res = (
-            supabase.table("ai_credit_balances")
-            .select("*")
-            .eq("account_id", account_id)
+            supabase.table(PLANS_TABLE)
+            .select(f"{PLANS_COL_CREDITS}")
+            .eq(PLANS_COL_CODE, plan_code)
             .limit(1)
             .execute()
         )
-        rows = (res.data or []) if hasattr(res, "data") else []
-        return rows[0] if rows else None
-    except Exception:
-        return None
+        rows = res.data or []
+        if not rows:
+            return 0, f"Plan not found: {plan_code}"
+        raw = rows[0].get(PLANS_COL_CREDITS)
+        try:
+            return int(raw or 0), None
+        except Exception:
+            return 0, f"Invalid {PLANS_COL_CREDITS} for plan {plan_code}"
+    except Exception as e:
+        return 0, f"Failed to read plan credits: {e}"
 
 
-def _read_balance_value(row: Dict[str, Any]) -> int:
-    bal = row.get("balance")
-    if bal is None:
-        bal = row.get("credits")
-    return _safe_int(bal, 0)
-
-
-def _upsert_balance(account_id: str, new_balance: int) -> bool:
+def get_credit_balance(account_id: str) -> Tuple[int, Optional[str]]:
     """
-    Upsert using update first; if missing row, insert.
-    Handles both 'balance' and 'credits' column variants.
-    """
-    new_balance = _safe_int(new_balance, 0)
-
-    # Try update (balance)
-    try:
-        supabase.table("ai_credit_balances").update(
-            {"balance": new_balance, "updated_at": _iso(_now_utc())}
-        ).eq("account_id", account_id).execute()
-        return True
-    except Exception:
-        pass
-
-    # Try update (credits)
-    try:
-        supabase.table("ai_credit_balances").update(
-            {"credits": new_balance, "updated_at": _iso(_now_utc())}
-        ).eq("account_id", account_id).execute()
-        return True
-    except Exception:
-        pass
-
-    # Try insert (balance)
-    try:
-        supabase.table("ai_credit_balances").insert(
-            {"account_id": account_id, "balance": new_balance, "updated_at": _iso(_now_utc())}
-        ).execute()
-        return True
-    except Exception:
-        pass
-
-    # Try insert (credits)
-    try:
-        supabase.table("ai_credit_balances").insert(
-            {"account_id": account_id, "credits": new_balance, "updated_at": _iso(_now_utc())}
-        ).execute()
-        return True
-    except Exception:
-        return False
-
-
-def _log_ledger_event(account_id: str, delta: int, reason: str, meta: Optional[Dict[str, Any]] = None) -> None:
-    """
-    Optional event log; best-effort only.
-    """
-    try:
-        supabase.table("ai_credit_ledger").insert(
-            {
-                "account_id": account_id,
-                "delta": _safe_int(delta, 0),
-                "reason": (reason or "unknown")[:120],
-                "meta": meta or {},
-                "created_at": _iso(_now_utc()),
-            }
-        ).execute()
-    except Exception:
-        pass
-
-
-# -----------------------------
-# Public functions
-# -----------------------------
-def get_credit_balance(account_id: str) -> Dict[str, Any]:
-    """
-    Reads from: public.ai_credit_balances
-
-    Returns:
-      { ok: True, account_id, balance, source: "existing"|"created" }
+    Returns current credit balance. If no row exists, returns 0.
     """
     account_id = (account_id or "").strip()
     if not account_id:
-        return {"ok": False, "error": "no_account_id"}
+        return 0, "Missing account_id"
 
-    row = _get_balance_row(account_id)
-    if row:
-        return {"ok": True, "account_id": account_id, "balance": _read_balance_value(row), "source": "existing"}
+    try:
+        res = (
+            supabase.table(CREDIT_BALANCES_TABLE)
+            .select(f"{BAL_COL_BALANCE}")
+            .eq(BAL_COL_ACCOUNT_ID, account_id)
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        if not rows:
+            return 0, None
+        try:
+            return int(rows[0].get(BAL_COL_BALANCE) or 0), None
+        except Exception:
+            return 0, "Invalid balance type in DB"
+    except Exception as e:
+        return 0, f"Failed to read credit balance: {e}"
 
-    # Create if missing (best-effort)
-    ok = _upsert_balance(account_id, DEFAULT_INITIAL_CREDITS)
-    if ok:
-        return {"ok": True, "account_id": account_id, "balance": DEFAULT_INITIAL_CREDITS, "source": "created"}
 
-    return {"ok": False, "error": "failed_to_init_balance"}
-
-
-def init_credits_for_plan(account_id: str, plan_code: Optional[str]) -> Dict[str, Any]:
+def set_credit_balance(account_id: str, new_balance: int, meta: Optional[Dict[str, Any]] = None) -> Tuple[bool, Optional[str]]:
     """
-    Compatibility function required by your existing subscriptions_service.py.
-
-    Behavior (safe & professional):
-    - Ensures ai_credit_balances row exists.
-    - If PLAN_CREDITS_JSON is set and plan_code matches, it TOPS UP to at least that amount
-      (i.e. sets balance = max(current, plan_default)).
-    - If no mapping, it does nothing beyond ensuring the row exists.
-
-    Returns:
-      { ok: True, balance, applied: bool, plan_code, rule }
+    Upserts the credit balance for the user.
     """
     account_id = (account_id or "").strip()
-    plan = (plan_code or "").strip().lower()
+    if not account_id:
+        return False, "Missing account_id"
 
-    bal = get_credit_balance(account_id)
-    if not bal.get("ok"):
-        return bal
-
-    current = _safe_int(bal.get("balance"), 0)
-
-    mapping = _plan_credit_map()
-    if not mapping or not plan or plan not in mapping:
-        # No plan rule configured; keep current
-        return {
-            "ok": True,
-            "account_id": account_id,
-            "balance": current,
-            "applied": False,
-            "plan_code": plan_code,
-            "rule": "no_plan_mapping",
+    try:
+        payload = {
+            BAL_COL_ACCOUNT_ID: account_id,
+            BAL_COL_BALANCE: int(new_balance),
+            BAL_COL_UPDATED_AT: _iso(_now_utc()),
         }
+        supabase.table(CREDIT_BALANCES_TABLE).upsert(payload).execute()
 
-    target = _safe_int(mapping.get(plan), 0)
-    if target <= 0:
-        return {
-            "ok": True,
-            "account_id": account_id,
-            "balance": current,
-            "applied": False,
-            "plan_code": plan_code,
-            "rule": "plan_target_zero",
-        }
+        # Optional event log
+        if meta is not None:
+            _log_credit_event(account_id, "set_balance", int(new_balance), meta)
 
-    # Only increase to minimum target (avoid wiping user's earned credits)
-    new_balance = current if current >= target else target
-    if new_balance != current:
-        if not _upsert_balance(account_id, new_balance):
-            return {"ok": False, "error": "failed_to_apply_plan_credits", "balance": current}
-        _log_ledger_event(account_id, new_balance - current, reason="plan_credit_init", meta={"plan_code": plan_code})
-        return {
-            "ok": True,
-            "account_id": account_id,
-            "balance": new_balance,
-            "applied": True,
-            "plan_code": plan_code,
-            "rule": "set_min_balance_to_plan_target",
-        }
-
-    return {
-        "ok": True,
-        "account_id": account_id,
-        "balance": current,
-        "applied": False,
-        "plan_code": plan_code,
-        "rule": "already_at_or_above_target",
-    }
+        return True, None
+    except Exception as e:
+        return False, f"Failed to set credit balance: {e}"
 
 
-def deduct_credits(account_id: str, amount: int, reason: str, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def init_credits_for_plan(account_id: str, plan_code: str) -> Tuple[bool, Optional[str], int]:
     """
-    Safe-ish deduction:
-      - ensure balance row exists
-      - if insufficient -> fail
-      - update balance
-      - log ledger event (best effort)
+    Called when subscription activates.
+    - Reads plan ai_credits_total from plans
+    - Sets ai_credit_balances.balance = ai_credits_total (overwrite baseline)
+    - Logs an event
+
+    Returns: (ok, error, credits_set)
     """
-    amount = _safe_int(amount, 0)
-    if amount <= 0:
-        return {"ok": False, "error": "invalid_amount"}
+    account_id = (account_id or "").strip()
+    plan_code = (plan_code or "").strip()
 
-    bal = get_credit_balance(account_id)
-    if not bal.get("ok"):
-        return bal
+    if not account_id:
+        return False, "Missing account_id", 0
+    if not plan_code:
+        return False, "Missing plan_code", 0
 
-    current = _safe_int(bal.get("balance"), 0)
-    if current < amount:
-        return {"ok": False, "error": "insufficient_credits", "balance": current}
+    credits, err = get_plan_credits(plan_code)
+    if err:
+        return False, err, 0
 
-    new_balance = current - amount
-    if not _upsert_balance(account_id, new_balance):
-        return {"ok": False, "error": "failed_to_update_balance"}
+    ok, err2 = set_credit_balance(
+        account_id,
+        credits,
+        meta={"plan_code": plan_code, "source": "subscription_activation"},
+    )
+    if not ok:
+        return False, err2, 0
 
-    _log_ledger_event(account_id, -amount, reason=reason, meta=meta)
-    return {"ok": True, "balance": new_balance}
+    return True, None, credits
+
+
+def ensure_credit_row(account_id: str) -> Tuple[bool, Optional[str]]:
+    """
+    Ensures a balance row exists (0) so downstream queries don't fail.
+    Safe to call during /me.
+    """
+    account_id = (account_id or "").strip()
+    if not account_id:
+        return False, "Missing account_id"
+
+    bal, err = get_credit_balance(account_id)
+    if err:
+        return False, err
+
+    # If row exists, do nothing; if not, create it with 0
+    if bal != 0:
+        return True, None
+
+    try:
+        payload = {
+            BAL_COL_ACCOUNT_ID: account_id,
+            BAL_COL_BALANCE: 0,
+            BAL_COL_UPDATED_AT: _iso(_now_utc()),
+        }
+        supabase.table(CREDIT_BALANCES_TABLE).upsert(payload).execute()
+        return True, None
+    except Exception as e:
+        return False, f"Failed to ensure credit row: {e}"
+
+
+# ------------------------------------------------------------
+# Internal
+# ------------------------------------------------------------
+def _log_credit_event(account_id: str, event_type: str, amount: int, meta: Dict[str, Any]) -> None:
+    """
+    Best-effort event log. If your table schema differs, you can disable by removing this.
+    """
+    try:
+        payload = {
+            EV_COL_ACCOUNT_ID: account_id,
+            EV_COL_EVENT_TYPE: (event_type or "").strip(),
+            EV_COL_AMOUNT: int(amount),
+            EV_COL_META: meta or {},
+            EV_COL_CREATED_AT: _iso(_now_utc()),
+        }
+        supabase.table(CREDIT_EVENTS_TABLE).insert(payload).execute()
+    except Exception:
+        # best effort
+        pass
