@@ -2,29 +2,27 @@
 from __future__ import annotations
 
 from functools import wraps
-from typing import Callable, Optional, Any, Dict, Tuple
+from typing import Any, Callable
 
-from flask import request, jsonify, g
+from flask import jsonify, g, request
 
-from ..services.web_tokens_service import (
-    validate_token,
-    extract_bearer_token,
-)
+from app.services.web_tokens_service import extract_bearer_token, validate_token
 
 
 def require_auth(fn: Callable[..., Any]) -> Callable[..., Any]:
     """
-    Auth guard for protected routes.
+    Protect routes with a web session token.
 
-    Accepts token from:
+    Token sources:
       - Authorization: Bearer <token>
       - X-Auth-Token: <token> (fallback)
 
     On success:
-      g.account_id = <uuid>
-      g.auth_token = <token>
-      g.token_row = <dict row from web_tokens>
+      g.account_id
+      g.auth_token
+      g.token_row
     """
+
     @wraps(fn)
     def _wrapped(*args: Any, **kwargs: Any):
         token = extract_bearer_token(request)
@@ -33,7 +31,6 @@ def require_auth(fn: Callable[..., Any]) -> Callable[..., Any]:
 
         ok, payload, err = validate_token(token)
         if not ok:
-            # err is safe + generic
             return jsonify({"ok": False, "error": err or "Unauthorized"}), 401
 
         g.account_id = payload["account_id"]
