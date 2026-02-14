@@ -12,12 +12,13 @@ from __future__ import annotations
 
 from typing import Any, Optional
 from supabase import create_client
+
 from .config import SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
 
 _client: Optional[Any] = None
 
 
-def supabase() -> Any:
+def get_supabase() -> Any:
     """
     Returns a singleton Supabase client using SERVICE ROLE key.
     Server-side only. Never expose to frontend.
@@ -34,3 +35,8 @@ def supabase() -> Any:
 
     _client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
     return _client
+
+
+# Backwards-compatible import style:
+# from app.core.supabase_client import supabase
+supabase = get_supabase()
