@@ -12,7 +12,6 @@ from app.routes.webhooks import bp as webhooks_bp
 from app.routes.plans import bp as plans_bp
 from app.routes.link_tokens import bp as link_tokens_bp
 from app.routes.whatsapp import bp as whatsapp_bp
-from app.routes.telegram import bp as telegram_bp  # if you created it
 from app.routes.admin_link_tokens import bp as admin_link_tokens_bp
 from app.routes.debug_routes import bp as debug_routes_bp
 from app.routes.accounts_admin import bp as accounts_admin_bp
@@ -21,9 +20,18 @@ from app.routes.email_link import bp as email_link_bp
 from app.routes.cron import bp as cron_bp
 from app.routes.web_auth import bp as web_auth_bp
 
+# ✅ NEW: /me + logout
+from app.routes.web_session import bp as web_session_bp
+
 # Paystack
 from app.routes.paystack import paystack_bp
 from app.routes.paystack_webhook import bp as paystack_webhook_bp
+
+# Telegram optional import (won't crash boot if file doesn't exist)
+try:
+    from app.routes.telegram import bp as telegram_bp
+except Exception:
+    telegram_bp = None
 
 
 def create_app() -> Flask:
@@ -58,15 +66,20 @@ def create_app() -> Flask:
     # Channel + linking routes
     app.register_blueprint(link_tokens_bp, url_prefix=api_prefix)
     app.register_blueprint(whatsapp_bp, url_prefix=api_prefix)
-    app.register_blueprint(telegram_bp, url_prefix=api_prefix)
+    if telegram_bp:
+        app.register_blueprint(telegram_bp, url_prefix=api_prefix)
+
     app.register_blueprint(admin_link_tokens_bp, url_prefix=api_prefix)
     app.register_blueprint(debug_routes_bp, url_prefix=api_prefix)
     app.register_blueprint(accounts_admin_bp, url_prefix=api_prefix)
     app.register_blueprint(meta_bp, url_prefix=api_prefix)
     app.register_blueprint(email_link_bp, url_prefix=api_prefix)
 
-    # Web auth (DEV OTP + sessions)
-    app.register_blueprint(web_auth_bp, url_prefix="/api")
+    # Web auth (OTP + token issue)
+    app.register_blueprint(web_auth_bp, url_prefix=api_prefix)
+
+    # ✅ NEW: Web session (me + logout)
+    app.register_blueprint(web_session_bp, url_prefix=api_prefix)
 
     # Cron (usually not under /api unless you want it)
     app.register_blueprint(cron_bp)
