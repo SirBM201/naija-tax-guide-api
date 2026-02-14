@@ -1,159 +1,133 @@
-# app/core/auth.py
+from __future__ import annotations
+
 import os
 import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from functools import wraps
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from flask import request, jsonify, g
+from werkzeug.exceptions import Unauthorized
 
 from app.core.supabase_client import supabase
 
 
-# ------------------------------------------------------------
-# Config helpers
-# ------------------------------------------------------------
-def _env(name: str, default: str = "") -> str:
-    return (os.getenv(name, default) or "").strip()
+# -----------------------------------------------------------------------------
+# Config (matches your Supabase schema)
+# -----------------------------------------------------------------------------
+WEB_TOKEN_PEPPER = (os.getenv("WEB_TOKEN_PEPPER") or "").strip()
+WEB_SESSIONS_TABLE = (os.getenv("WEB_SESSIONS_TABLE") or "web_sessions").strip()
+
+# Column names (your schema)
+COL_TOKEN_HASH = (os.getenv("WEB_SESSIONS_COL_TOKEN_HASH") or "token_hash").strip()
+COL_ACCOUNT_ID = (os.getenv("WEB_SESSIONS_COL_ACCOUNT_ID") or "account_id").strip()
+COL_EXPIRES_AT = (os.getenv("WEB_SESSIONS_COL_EXPIRES_AT") or "expires_at").strip()
+COL_REVOKED_AT = (os.getenv("WEB_SESSIONS_COL_REVOKED_AT") or "revoked_at").strip()
 
 
-WEB_TOKEN_TABLE = _env("WEB_TOKEN_TABLE", "web_sessions")
-WEB_TOKEN_COL_TOKEN = _env("WEB_TOKEN_COL_TOKEN", "token_hash")
-WEB_TOKEN_COL_ACCOUNT_ID = _env("WEB_TOKEN_COL_ACCOUNT_ID", "account_id")
-WEB_TOKEN_COL_EXPIRES_AT = _env("WEB_TOKEN_COL_EXPIRES_AT", "expires_at")
-WEB_TOKEN_COL_REVOKED_AT = _env("WEB_TOKEN_COL_REVOKED_AT", "revoked_at")
-
-# MUST match the value used when you created token_hash in verify-otp
-WEB_TOKEN_PEPPER = _env("WEB_TOKEN_PEPPER", "")
-
-
-# ------------------------------------------------------------
-# Types
-# ------------------------------------------------------------
 @dataclass
 class AuthContext:
-    ok: bool
-    account_id: Optional[str] = None
-    token: Optional[str] = None
-    error: Optional[str] = None
+    account_id: str
+    token: str
 
 
-# ------------------------------------------------------------
-# Core logic
-# ------------------------------------------------------------
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _parse_iso(value: Optional[str]) -> Optional[datetime]:
-    if not value:
-        return None
-    try:
-        v = value.replace("Z", "+00:00")
-        return datetime.fromisoformat(v)
-    except Exception:
-        return None
-
-
 def _hash_token(raw_token: str) -> str:
     """
-    Hash token exactly the same way you did during verify-otp.
-    If your verify-otp used sha256(token + pepper), this must match.
+    Server stores token_hash in DB, not the raw token.
+    We compute sha256(pepper + ":" + token).
     """
-    if not raw_token:
-        return ""
     if not WEB_TOKEN_PEPPER:
-        # If pepper is empty, your hashing will not match production tokens.
-        # Better to fail explicitly.
-        raise RuntimeError("WEB_TOKEN_PEPPER is not set")
-    payload = (raw_token + WEB_TOKEN_PEPPER).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
+        # Fail closed: if you didn't set WEB_TOKEN_PEPPER, auth must not work.
+        raise RuntimeError("WEB_TOKEN_PEPPER is not set in environment.")
+    msg = f"{WEB_TOKEN_PEPPER}:{raw_token}".encode("utf-8")
+    return hashlib.sha256(msg).hexdigest()
 
 
-def _extract_bearer_token() -> Optional[str]:
-    """
-    Accepts:
-      Authorization: Bearer <token>
-    """
+def _get_bearer_token() -> Optional[str]:
     auth = (request.headers.get("Authorization") or "").strip()
     if not auth:
         return None
-    parts = auth.split()
-    if len(parts) == 2 and parts[0].lower() == "bearer":
-        return parts[1].strip() or None
+    if auth.lower().startswith("bearer "):
+        token = auth.split(" ", 1)[1].strip()
+        return token or None
     return None
 
 
-def _load_session_from_db(token_hash: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """
-    Returns (row, error_message)
-    """
-    try:
-        res = (
-            supabase.table(WEB_TOKEN_TABLE)
-            .select(f"{WEB_TOKEN_COL_ACCOUNT_ID},{WEB_TOKEN_COL_EXPIRES_AT},{WEB_TOKEN_COL_REVOKED_AT}")
-            .eq(WEB_TOKEN_COL_TOKEN, token_hash)
-            .order("created_at", desc=True)
-            .limit(1)
-            .execute()
-        )
-        rows = res.data or []
-        if not rows:
-            return None, "Invalid token"
-        return rows[0], None
-    except Exception as e:
-        return None, f"Auth lookup failed: {e}"
+def _find_active_session_by_token(raw_token: str) -> Optional[Dict[str, Any]]:
+    token_hash = _hash_token(raw_token)
+
+    # Find session by token_hash and not revoked
+    q = (
+        supabase.table(WEB_SESSIONS_TABLE)
+        .select(f"{COL_ACCOUNT_ID},{COL_EXPIRES_AT},{COL_REVOKED_AT}")
+        .eq(COL_TOKEN_HASH, token_hash)
+        .is_(COL_REVOKED_AT, None)
+        .limit(1)
+    )
+    res = q.execute()
+    rows = (res.data or []) if hasattr(res, "data") else []
+    if not rows:
+        return None
+
+    row = rows[0]
+    # Expiry check
+    expires_at = row.get(COL_EXPIRES_AT)
+    if expires_at:
+        try:
+            dt = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+            if dt <= _now_utc():
+                return None
+        except Exception:
+            # If expiry is malformed, treat as invalid
+            return None
+
+    return row
 
 
-def validate_request_auth() -> AuthContext:
-    raw = _extract_bearer_token()
-    if not raw:
-        return AuthContext(ok=False, error="Missing bearer token")
+def require_auth() -> AuthContext:
+    raw_token = _get_bearer_token()
+    if not raw_token:
+        raise Unauthorized("Missing bearer token")
 
-    try:
-        token_hash = _hash_token(raw)
-    except Exception as e:
-        return AuthContext(ok=False, error=str(e))
+    row = _find_active_session_by_token(raw_token)
+    if not row:
+        raise Unauthorized("Unauthorized")
 
-    row, err = _load_session_from_db(token_hash)
-    if err:
-        return AuthContext(ok=False, error=err)
-
-    revoked_at = _parse_iso(row.get(WEB_TOKEN_COL_REVOKED_AT))
-    if revoked_at:
-        return AuthContext(ok=False, error="Token revoked")
-
-    expires_at = _parse_iso(row.get(WEB_TOKEN_COL_EXPIRES_AT))
-    if expires_at and expires_at <= _now_utc():
-        return AuthContext(ok=False, error="Token expired")
-
-    account_id = row.get(WEB_TOKEN_COL_ACCOUNT_ID)
+    account_id = (row.get(COL_ACCOUNT_ID) or "").strip()
     if not account_id:
-        return AuthContext(ok=False, error="Token missing account_id")
+        raise Unauthorized("Unauthorized")
 
-    return AuthContext(ok=True, account_id=account_id, token=raw)
-
-
-# ------------------------------------------------------------
-# Decorators
-# ------------------------------------------------------------
-def require_auth(fn: Callable) -> Callable:
-    @wraps(fn)
-    def wrapper(*args, **kwargs):
-        ctx = validate_request_auth()
-        if not ctx.ok:
-            return jsonify({"ok": False, "error": "Unauthorized", "detail": ctx.error}), 401
-        g.account_id = ctx.account_id
-        g.token = ctx.token
-        return fn(*args, **kwargs)
-
-    return wrapper
+    return AuthContext(account_id=account_id, token=raw_token)
 
 
-def require_auth_plus(fn: Callable) -> Callable:
+def require_auth_plus() -> Dict[str, Any]:
     """
-    Same as require_auth, but leaves room to attach subscription/credits later.
-    For now it simply authenticates and sets g.account_id.
+    Returns auth + subscription + credit balance (for /api/billing/me etc.).
     """
-    return require_auth(fn)
+    ctx = require_auth()
+
+    # Lazy imports avoid circular dependencies
+    from app.services.subscriptions_service import get_subscription_status
+    from app.services.credits_service import get_credit_balance
+
+    sub = get_subscription_status(ctx.account_id)
+    credits = get_credit_balance(ctx.account_id)
+
+    return {
+        "account_id": ctx.account_id,
+        "subscription": sub,
+        "credits": {"balance": credits},
+    }
+
+
+def attach_auth_handlers(app) -> None:
+    """
+    Optional: standardized 401 JSON.
+    """
+    @app.errorhandler(Unauthorized)
+    def _unauth(err):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
