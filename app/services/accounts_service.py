@@ -49,11 +49,8 @@ def _is_uuid(value: str) -> bool:
 
 # ---------------------------------------------------------
 # Provider normalization (must match DB constraint list)
-# IMPORTANT: your DB currently shows provider check includes:
-#   wa, web, tg, ig, email
-# If you haven't added msgr yet, leave it out for now.
 # ---------------------------------------------------------
-ALLOWED_PROVIDERS = {"wa", "tg", "ig", "email", "web"}  # add "msgr" only AFTER DB constraint updated
+ALLOWED_PROVIDERS = {"wa", "tg", "msgr", "ig", "email", "web"}
 
 PROVIDER_ALIASES = {
     # WhatsApp
@@ -63,6 +60,13 @@ PROVIDER_ALIASES = {
     # Telegram
     "tg": "tg",
     "telegram": "tg",
+    # Messenger
+    "msgr": "msgr",
+    "messenger": "msgr",
+    "facebook_messenger": "msgr",
+    "fb_messenger": "msgr",
+    "fb messenger": "msgr",
+    "facebook messenger": "msgr",
     # Instagram
     "ig": "ig",
     "instagram": "ig",
@@ -74,12 +78,6 @@ PROVIDER_ALIASES = {
     # Web
     "web": "web",
     "website": "web",
-    # Messenger (keep alias, but will fail validation until DB supports msgr)
-    "msgr": "msgr",
-    "messenger": "msgr",
-    "facebook_messenger": "msgr",
-    "fb_messenger": "msgr",
-    "facebook messenger": "msgr",
 }
 
 
@@ -91,7 +89,7 @@ def _norm_provider(provider: str) -> str:
 def _validate_provider_and_id(provider: str, provider_user_id: str) -> Optional[str]:
     provider = _norm_provider(provider)
     if provider not in ALLOWED_PROVIDERS:
-        return f"provider must be one of: {', '.join(sorted(ALLOWED_PROVIDERS))}"
+        return "provider must be one of: wa, tg, msgr, ig, email, web"
     if not provider_user_id:
         return "provider_user_id required"
 
@@ -104,7 +102,7 @@ def _validate_provider_and_id(provider: str, provider_user_id: str) -> Optional[
 
 
 # ---------------------------------------------------------
-# Accounts: upsert / lookup
+# Accounts: upsert / link / lookup
 # ---------------------------------------------------------
 def upsert_account(
     *,
@@ -112,14 +110,10 @@ def upsert_account(
     provider_user_id: str,
     display_name: Optional[str] = None,
     phone: Optional[str] = None,
-    phone_e164: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Creates or updates an account row.
-
-    - Keeps your current style: returns {"ok": True, "account": row}
-    - phone_e164 is OPTIONAL and safe:
-        If accounts table doesn't have the column yet, it retries without it.
+    Creates or updates an account row WITHOUT auth_user_id (pre-link state).
+    Used when a message arrives before linking.
     """
     provider = _norm_provider(provider)
     provider_user_id = (provider_user_id or "").strip()
@@ -128,7 +122,7 @@ def upsert_account(
     if err:
         return {"ok": False, "error": err}
 
-    payload: Dict[str, Any] = {
+    payload = {
         "provider": provider,
         "provider_user_id": provider_user_id,
         "display_name": (display_name or None),
@@ -136,34 +130,17 @@ def upsert_account(
         "updated_at": _now_iso(),
     }
 
-    # include phone_e164 only if provided
-    if phone_e164:
-        payload["phone_e164"] = phone_e164
-
     try:
         res = supabase().table("accounts").upsert(
             payload,
             on_conflict="provider,provider_user_id",
             returning="representation",
         ).execute()
-        row = (res.data or [None])[0]
-        return {"ok": True, "account": row}
     except Exception as e:
-        # If accounts table doesn't have phone_e164, retry without it
-        msg = str(e)
-        if "phone_e164" in msg and "does not exist" in msg:
-            payload.pop("phone_e164", None)
-            try:
-                res2 = supabase().table("accounts").upsert(
-                    payload,
-                    on_conflict="provider,provider_user_id",
-                    returning="representation",
-                ).execute()
-                row2 = (res2.data or [None])[0]
-                return {"ok": True, "account": row2, "note": "phone_e164 ignored (column missing)"}
-            except Exception as e2:
-                return {"ok": False, "error": f"DB error: {str(e2)}"}
-        return {"ok": False, "error": f"DB error: {msg}"}
+        return {"ok": False, "error": f"DB error: {str(e)}"}
+
+    row = (res.data or [None])[0]
+    return {"ok": True, "account": row}
 
 
 def lookup_account(
@@ -171,6 +148,9 @@ def lookup_account(
     provider: str,
     provider_user_id: str,
 ) -> Dict[str, Any]:
+    """
+    Returns mapping from (provider, provider_user_id) -> auth_user_id (if linked)
+    """
     provider = _norm_provider(provider)
     provider_user_id = (provider_user_id or "").strip()
 
@@ -205,47 +185,75 @@ def lookup_account(
     }
 
 
-def ensure_account_id(
+def upsert_account_link(
     *,
     provider: str,
     provider_user_id: str,
+    auth_user_id: str,
     display_name: Optional[str] = None,
     phone: Optional[str] = None,
-    phone_e164: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Convenience for web_auth and channel handlers.
+    Upserts an account row AND binds it to auth_user_id (linked state).
 
-    Returns:
-      { ok: bool, account_id: str|None, created: bool, error?: str, account?: dict }
+    Safety rule:
+    - If the channel is already linked to ANOTHER auth_user_id, block.
+    - If linked to SAME auth_user_id, idempotent OK.
     """
     provider = _norm_provider(provider)
     provider_user_id = (provider_user_id or "").strip()
+    auth_user_id = (auth_user_id or "").strip()
 
+    err = _validate_provider_and_id(provider, provider_user_id)
+    if err:
+        return {"ok": False, "error": err}
+    if not auth_user_id:
+        return {"ok": False, "error": "auth_user_id required"}
+    if not _is_uuid(auth_user_id):
+        return {"ok": False, "error": "auth_user_id must be a valid uuid"}
+
+    # Guard: do not overwrite existing link to another user
     existing = lookup_account(provider=provider, provider_user_id=provider_user_id)
-    if not existing.get("ok"):
-        return {"ok": False, "account_id": None, "created": False, "error": existing.get("error")}
+    if existing.get("ok") and existing.get("found"):
+        old = (existing.get("auth_user_id") or "").strip()
+        if old and old != auth_user_id:
+            return {
+                "ok": False,
+                "error": "This channel is already linked to another account.",
+                "reason": "channel_already_linked",
+            }
 
-    if existing.get("found") and existing.get("account"):
-        return {"ok": True, "account_id": existing["account"]["id"], "created": False, "account": existing["account"]}
+    payload = {
+        "provider": provider,
+        "provider_user_id": provider_user_id,
+        "auth_user_id": auth_user_id,
+        "display_name": (display_name or None),
+        "phone": (phone or None),
+        "updated_at": _now_iso(),
+    }
 
-    created = upsert_account(
-        provider=provider,
-        provider_user_id=provider_user_id,
-        display_name=display_name,
-        phone=phone,
-        phone_e164=phone_e164,
-    )
-    if not created.get("ok") or not created.get("account"):
-        return {"ok": False, "account_id": None, "created": False, "error": created.get("error")}
+    try:
+        res = supabase().table("accounts").upsert(
+            payload,
+            on_conflict="provider,provider_user_id",
+            returning="representation",
+        ).execute()
+    except Exception as e:
+        return {"ok": False, "error": f"DB error: {str(e)}"}
 
-    return {"ok": True, "account_id": created["account"]["id"], "created": True, "account": created["account"]}
+    row = (res.data or [None])[0]
+    return {"ok": True, "account": row}
 
 
 # ---------------------------------------------------------
 # Plan status: YOUR DB (public.subscriptions) FIRST
 # ---------------------------------------------------------
 def _plan_from_subscriptions_table(auth_user_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """
+    Your actual table: public.subscriptions
+    Columns seen:
+      user_id, plan, status, start_at, end_at, updated_at, id ...
+    """
     try:
         res = (
             supabase()
@@ -286,9 +294,14 @@ def _plan_from_subscriptions_table(auth_user_id: str) -> Tuple[Optional[Dict[str
 
 
 def _try_fetch_plan_from_table_guess(table_name: str, auth_user_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """
+    Best-effort fallback for other possible tables if you create them later.
+    Tries BOTH auth_user_id and user_id columns.
+    """
     auth_err = None
     user_err = None
 
+    # try auth_user_id first
     try:
         res = (
             supabase()
@@ -322,6 +335,7 @@ def _try_fetch_plan_from_table_guess(table_name: str, auth_user_id: str) -> Tupl
     except Exception as e:
         auth_err = str(e)
 
+    # then try user_id
     try:
         res2 = (
             supabase()
@@ -354,6 +368,12 @@ def _try_fetch_plan_from_table_guess(table_name: str, auth_user_id: str) -> Tupl
 
 
 def get_plan_status(auth_user_id: Optional[str]) -> Dict[str, Any]:
+    """
+    Best-practice plan status lookup for your current DB.
+    - First checks: public.subscriptions(user_id,...)
+    - Then tries: user_subscriptions / user_plans / plans (future compatibility)
+    - NEVER breaks your API if tables/columns differ.
+    """
     auth_user_id = (auth_user_id or "").strip()
     if not auth_user_id:
         return {"ok": True, "known": False, "is_active": False, "plan": None, "status": None, "plan_expiry": None}
