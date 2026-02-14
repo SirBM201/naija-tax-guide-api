@@ -2,125 +2,123 @@
 from __future__ import annotations
 
 import hashlib
-import secrets
+import random
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, Any, Tuple
+from typing import Any, Dict, Optional, Tuple
 
-from ..core.config import ENV, OTP_TTL_SECONDS, OTP_RESEND_COOLDOWN_SECONDS
 from ..core.supabase_client import supabase
+from ..core.config import WEB_OTP_TTL_MINUTES, WEB_OTP_COOLDOWN_SECONDS
+
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
-def _hash_code(code: str) -> str:
-    # stable hash for OTP compare
-    return hashlib.sha256(code.encode("utf-8")).hexdigest()
 
-def _make_code() -> str:
-    # 6-digit numeric
-    return f"{secrets.randbelow(1_000_000):06d}"
+def _sha256_hex(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
-def normalize_contact(contact: str) -> str:
-    c = (contact or "").strip()
-    # basic normalize: remove spaces
-    c = c.replace(" ", "")
-    return c
 
-def can_resend(contact: str) -> bool:
-    # cooldown check (only for unused otps)
-    resp = (
+def _gen_code() -> str:
+    # 6-digit OTP
+    return f"{random.randint(0, 999999):06d}"
+
+
+def otp_request_cooldown_ok(contact: str, purpose: str) -> bool:
+    """
+    Prevent hammering: ensure last request is older than WEB_OTP_COOLDOWN_SECONDS.
+    """
+    res = (
         supabase.table("web_otps")
         .select("created_at")
         .eq("contact", contact)
-        .is_("used_at", None)
+        .eq("purpose", purpose)
         .order("created_at", desc=True)
         .limit(1)
         .execute()
     )
-    rows = resp.data or []
-    if not rows:
+    row = (res.data or [None])[0]
+    if not row:
         return True
 
     try:
-        created_at = rows[0]["created_at"].replace("Z", "+00:00")
-        created_dt = datetime.fromisoformat(created_at)
+        last = datetime.fromisoformat(row["created_at"].replace("Z", "+00:00"))
     except Exception:
         return True
 
-    return (_now_utc() - created_dt).total_seconds() >= OTP_RESEND_COOLDOWN_SECONDS
+    return (_now_utc() - last).total_seconds() >= WEB_OTP_COOLDOWN_SECONDS
 
-def create_otp(contact: str) -> Tuple[str, datetime]:
-    code = _make_code()
-    expires_at = _now_utc() + timedelta(seconds=OTP_TTL_SECONDS)
 
-    row = {
-        "contact": contact,
-        "purpose": "login",
-        "code_hash": _hash_code(code),
+def create_otp(contact: str, purpose: str = "web_login") -> Dict[str, Any]:
+    code_plain = _gen_code()
+    code_hash = _sha256_hex(code_plain)
+    expires_at = _now_utc() + timedelta(minutes=WEB_OTP_TTL_MINUTES)
+
+    ins = (
+        supabase.table("web_otps")
+        .insert(
+            {
+                "contact": contact,
+                "purpose": purpose,
+                "code_plain": code_plain,   # DEV-friendly (you already have it)
+                "code_hash": code_hash,
+                "expires_at": expires_at.isoformat(),
+                "used": False,
+                "phone_e164": contact,      # keep in sync with your extra column
+                "otp_code": code_plain,     # keep in sync with your extra column
+            }
+        )
+        .execute()
+    )
+
+    row = (ins.data or [{}])[0]
+    return {
+        "ok": True,
+        "otp_id": row.get("id"),
         "expires_at": expires_at.isoformat(),
-        "used_at": None,
+        "code_plain": code_plain,
     }
 
-    # DEV ONLY: store plaintext for convenience (also returned by /start)
-    if ENV.lower() != "prod":
-        row["code_plain"] = code
-    else:
-        row["code_plain"] = None
 
-    supabase.table("web_otps").insert(row).execute()
-    return code, expires_at
+def verify_otp(contact: str, code_plain: str, purpose: str = "web_login") -> Tuple[bool, str]:
+    """
+    Returns (ok, reason)
+    reason: ok | invalid | expired | used
+    """
+    code_hash = _sha256_hex(code_plain)
 
-def verify_otp(contact: str, code: str) -> bool:
-    code = (code or "").strip()
-    if not code:
-        return False
-
-    # grab latest unused OTP for contact
-    resp = (
+    res = (
         supabase.table("web_otps")
-        .select("id, code_hash, expires_at, used_at")
+        .select("*")
         .eq("contact", contact)
-        .is_("used_at", None)
+        .eq("purpose", purpose)
+        .eq("code_hash", code_hash)
         .order("created_at", desc=True)
         .limit(1)
         .execute()
     )
-    rows = resp.data or []
-    if not rows:
-        return False
 
-    otp = rows[0]
-    otp_id = otp["id"]
+    row = (res.data or [None])[0]
+    if not row:
+        return False, "invalid"
 
-    # expiry check
+    if row.get("used") is True or row.get("used_at"):
+        return False, "used"
+
+    expires_at = row.get("expires_at")
+    if not expires_at:
+        return False, "expired"
+
     try:
-        exp = otp["expires_at"].replace("Z", "+00:00")
-        exp_dt = datetime.fromisoformat(exp)
-        if _now_utc() > exp_dt:
-            return False
+        exp = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
     except Exception:
-        return False
+        return False, "expired"
 
-    if _hash_code(code) != (otp.get("code_hash") or ""):
-        return False
+    if exp <= _now_utc():
+        return False, "expired"
 
     # mark used
-    supabase.table("web_otps").update({"used_at": _now_utc().isoformat()}).eq("id", otp_id).execute()
-    return True
+    supabase.table("web_otps").update(
+        {"used": True, "used_at": _now_utc().isoformat()}
+    ).eq("id", row["id"]).execute()
 
-def dev_last_otp(contact: str) -> Optional[str]:
-    if ENV.lower() == "prod":
-        return None
-
-    resp = (
-        supabase.table("web_otps")
-        .select("code_plain, created_at")
-        .eq("contact", contact)
-        .order("created_at", desc=True)
-        .limit(1)
-        .execute()
-    )
-    rows = resp.data or []
-    if not rows:
-        return None
-    return rows[0].get("code_plain")
+    return True, "ok"
