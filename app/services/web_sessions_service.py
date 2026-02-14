@@ -1,119 +1,146 @@
 # app/services/web_sessions_service.py
 from __future__ import annotations
 
-import hashlib
+import os
 import secrets
-from datetime import datetime, timedelta, timezone
+import hashlib
 from typing import Any, Dict, Optional, Tuple
+from datetime import datetime, timezone, timedelta
 
-from ..core.supabase_client import supabase
-from ..core.config import WEB_SESSION_TTL_DAYS
+from app.core.supabase_client import supabase
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int((os.getenv(name, str(default)) or str(default)).strip())
+    except Exception:
+        return default
+
+
+WEB_SESSION_TTL_DAYS = _env_int("WEB_SESSION_TTL_DAYS", 30)
 
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _sha256_hex(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+def _iso(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def create_web_session(
-    account_id: str,
-    ip: Optional[str] = None,
-    user_agent: Optional[str] = None,
-) -> Dict[str, Any]:
-    """
-    Creates a new web session and returns:
-      { ok, token, session_id, expires_at }
-    Stores only token_hash in DB.
-    """
-    token_plain = secrets.token_urlsafe(32)
-    token_hash = _sha256_hex(token_plain)
+def _parse_dt(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str):
+        try:
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            return None
+    return None
 
-    expires_at = _now_utc() + timedelta(days=WEB_SESSION_TTL_DAYS)
 
-    ins = (
-        supabase.table("web_sessions")
-        .insert(
-            {
-                "account_id": account_id,
-                "token_hash": token_hash,
-                "expires_at": expires_at.isoformat(),
-                "ip": ip,
-                "user_agent": user_agent,
-            }
-        )
-        .execute()
-    )
+def _hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
-    # Supabase python returns .data list
-    session_row = (ins.data or [{}])[0]
-    return {
-        "ok": True,
-        "token": token_plain,
-        "session_id": session_row.get("id"),
-        "expires_at": expires_at.isoformat(),
+
+def _gen_token() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def create_web_session(*, account_id: str, ip: str | None = None, user_agent: str | None = None) -> Dict[str, Any]:
+    token = _gen_token()
+    token_hash = _hash_token(token)
+
+    now = _now_utc()
+    expires = now + timedelta(days=WEB_SESSION_TTL_DAYS)
+
+    payload = {
+        "account_id": account_id,
+        "token_hash": token_hash,
+        "token_plain": token,  # keep for dev/debug (your table may include it)
+        "expires_at": _iso(expires),
+        "revoked_at": None,
+        "last_seen_at": _iso(now),
+        "ip": ip,
+        "user_agent": user_agent,
+        "created_at": _iso(now),
     }
 
+    # Insert best-effort; if some columns don't exist, retry with minimal set
+    try:
+        supabase().table("web_sessions").insert(payload).execute()
+    except Exception:
+        minimal = {
+            "account_id": account_id,
+            "token_hash": token_hash,
+            "expires_at": _iso(expires),
+            "created_at": _iso(now),
+        }
+        try:
+            supabase().table("web_sessions").insert(minimal).execute()
+        except Exception as e:
+            return {"ok": False, "error": f"db_error:{str(e)}"}
 
-def get_session_by_token(token_plain: str) -> Optional[Dict[str, Any]]:
-    token_hash = _sha256_hex(token_plain)
-
-    res = (
-        supabase.table("web_sessions")
-        .select("*")
-        .eq("token_hash", token_hash)
-        .limit(1)
-        .execute()
-    )
-    row = (res.data or [None])[0]
-    return row
+    return {"ok": True, "token": token, "expires_at": _iso(expires)}
 
 
-def validate_web_session(token_plain: str) -> Tuple[bool, Optional[str], str]:
+def validate_web_session(token: str) -> Tuple[bool, Optional[str], str]:
     """
     Returns (ok, account_id, reason)
     """
-    row = get_session_by_token(token_plain)
+    token = (token or "").strip()
+    if not token:
+        return False, None, "missing_token"
+
+    token_hash = _hash_token(token)
+
+    try:
+        res = (
+            supabase()
+            .table("web_sessions")
+            .select("account_id,expires_at,revoked_at")
+            .eq("token_hash", token_hash)
+            .limit(1)
+            .execute()
+        )
+    except Exception as e:
+        return False, None, f"db_error:{str(e)}"
+
+    row = (res.data or [None])[0]
     if not row:
-        return False, None, "invalid_session"
+        return False, None, "invalid_token"
 
     if row.get("revoked_at"):
         return False, None, "revoked"
 
-    expires_at = row.get("expires_at")
-    if not expires_at:
-        return False, None, "expired"
-
-    try:
-        exp = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
-    except Exception:
-        return False, None, "expired"
-
-    if exp <= _now_utc():
+    expires_at = _parse_dt(row.get("expires_at"))
+    if not expires_at or expires_at <= _now_utc():
         return False, None, "expired"
 
     return True, row.get("account_id"), "ok"
 
 
-def touch_session_best_effort(token_plain: str) -> None:
+def touch_session_best_effort(token: str) -> None:
+    token = (token or "").strip()
+    if not token:
+        return
+    token_hash = _hash_token(token)
     try:
-        row = get_session_by_token(token_plain)
-        if not row:
-            return
-        supabase.table("web_sessions").update(
-            {"last_seen_at": _now_utc().isoformat()}
-        ).eq("id", row["id"]).execute()
+        supabase().table("web_sessions").update({"last_seen_at": _iso(_now_utc())}).eq("token_hash", token_hash).execute()
     except Exception:
         return
 
 
-def revoke_session(token_plain: str) -> bool:
-    row = get_session_by_token(token_plain)
-    if not row:
+def revoke_session(token: str) -> bool:
+    token = (token or "").strip()
+    if not token:
         return False
-    supabase.table("web_sessions").update(
-        {"revoked_at": _now_utc().isoformat()}
-    ).eq("id", row["id"]).execute()
-    return True
+    token_hash = _hash_token(token)
+    try:
+        supabase().table("web_sessions").update({"revoked_at": _iso(_now_utc())}).eq("token_hash", token_hash).execute()
+        return True
+    except Exception:
+        return False
