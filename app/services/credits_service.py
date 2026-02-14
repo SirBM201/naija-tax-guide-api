@@ -1,73 +1,138 @@
 # app/services/credits_service.py
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+import os
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional, Tuple
 
 from app.core.supabase_client import supabase
 
+DEFAULT_INITIAL_CREDITS = int((os.getenv("DEFAULT_INITIAL_CREDITS", "0") or "0").strip())
 
-def init_credits_for_plan(*, account_id: str, plan_code: str) -> Dict[str, Any]:
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _iso(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def get_credit_balance(account_id: str) -> Dict[str, Any]:
     """
-    Resets credits to plan's ai_credits_total.
-    Called on subscription activation/renewal.
-    Uses DB RPC for consistency.
+    Reads from: public.ai_credit_balances
+    Expected columns (typical):
+      - account_id (uuid)
+      - balance (int) OR credits (int) (we handle both)
+      - updated_at (timestamptz optional)
+
+    Returns:
+      { ok: True, account_id, balance, source: "existing"|"created" }
     """
     account_id = (account_id or "").strip()
-    plan_code = (plan_code or "").strip()
+    if not account_id:
+        return {"ok": False, "error": "no_account_id"}
 
-    if not account_id or not plan_code:
-        return {"ok": False, "error": "missing_account_id_or_plan_code"}
-
+    # 1) Try read
     try:
         res = (
-            supabase()
-            .rpc("init_ai_credits_for_plan", {"p_account_id": account_id, "p_plan_code": plan_code})
+            supabase.table("ai_credit_balances")
+            .select("*")
+            .eq("account_id", account_id)
+            .limit(1)
             .execute()
         )
-        # Supabase returns in res.data
-        data = res.data
-        if isinstance(data, dict):
-            return data
-        if isinstance(data, list) and data:
-            return data[0]
-        return {"ok": True, "raw": data}
-    except Exception as e:
-        return {"ok": False, "error": f"RPC error: {str(e)}"}
+        rows = (res.data or []) if hasattr(res, "data") else []
+        row = rows[0] if rows else None
+    except Exception:
+        row = None
 
+    if row:
+        bal = row.get("balance")
+        if bal is None:
+            bal = row.get("credits")
+        try:
+            bal_int = int(bal or 0)
+        except Exception:
+            bal_int = 0
+        return {"ok": True, "account_id": account_id, "balance": bal_int, "source": "existing"}
 
-def consume_one_credit(
-    *,
-    account_id: str,
-    plan_code: Optional[str],
-    reason: str = "ask",
-    meta: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """
-    Atomically consumes 1 credit and enforces daily cap in Postgres.
-    Returns:
-      { ok: True, balance, used_today, daily_limit } OR
-      { ok: False, error: 'out_of_credits'|'daily_limit_reached'|... }
-    """
-    account_id = (account_id or "").strip()
-    plan_code = (plan_code or "").strip() if plan_code else ""
-
-    if not account_id:
-        return {"ok": False, "error": "missing_account_id"}
-
-    payload = {
-        "p_account_id": account_id,
-        "p_plan_code": plan_code,
-        "p_reason": reason,
-        "p_meta": meta or {},
-    }
-
+    # 2) Create row if missing (best-effort)
+    payload = {"account_id": account_id, "balance": DEFAULT_INITIAL_CREDITS, "updated_at": _iso(_now_utc())}
     try:
-        res = supabase().rpc("consume_ai_credit", payload).execute()
-        data = res.data
-        if isinstance(data, dict):
-            return data
-        if isinstance(data, list) and data:
-            return data[0]
-        return {"ok": True, "raw": data}
-    except Exception as e:
-        return {"ok": False, "error": f"RPC error: {str(e)}"}
+        supabase.table("ai_credit_balances").insert(payload).execute()
+        return {"ok": True, "account_id": account_id, "balance": DEFAULT_INITIAL_CREDITS, "source": "created"}
+    except Exception:
+        # If your table uses "credits" instead of "balance"
+        payload2 = {"account_id": account_id, "credits": DEFAULT_INITIAL_CREDITS, "updated_at": _iso(_now_utc())}
+        try:
+            supabase.table("ai_credit_balances").insert(payload2).execute()
+            return {"ok": True, "account_id": account_id, "balance": DEFAULT_INITIAL_CREDITS, "source": "created"}
+        except Exception:
+            return {"ok": False, "error": "failed_to_init_balance"}
+
+
+def _update_balance(account_id: str, new_balance: int) -> bool:
+    try:
+        supabase.table("ai_credit_balances").update(
+            {"balance": int(new_balance), "updated_at": _iso(_now_utc())}
+        ).eq("account_id", account_id).execute()
+        return True
+    except Exception:
+        # fallback if column name is "credits"
+        try:
+            supabase.table("ai_credit_balances").update(
+                {"credits": int(new_balance), "updated_at": _iso(_now_utc())}
+            ).eq("account_id", account_id).execute()
+            return True
+        except Exception:
+            return False
+
+
+def _log_ledger_event(account_id: str, delta: int, reason: str, meta: Optional[Dict[str, Any]] = None) -> None:
+    """
+    Optional ledger event log.
+    Uses ai_credit_ledger if available.
+    If your table name differs, ignore this function or rename accordingly.
+    """
+    try:
+        supabase.table("ai_credit_ledger").insert(
+            {
+                "account_id": account_id,
+                "delta": int(delta),
+                "reason": (reason or "unknown")[:120],
+                "meta": meta or {},
+                "created_at": _iso(_now_utc()),
+            }
+        ).execute()
+    except Exception:
+        # silently ignore if ledger table/columns differ
+        pass
+
+
+def deduct_credits(account_id: str, amount: int, reason: str, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Safe-ish deduction:
+      - read current balance
+      - if insufficient -> fail
+      - update balance
+      - log ledger event (best effort)
+    """
+    amount = int(amount or 0)
+    if amount <= 0:
+        return {"ok": False, "error": "invalid_amount"}
+
+    bal = get_credit_balance(account_id)
+    if not bal.get("ok"):
+        return bal
+
+    current = int(bal.get("balance") or 0)
+    if current < amount:
+        return {"ok": False, "error": "insufficient_credits", "balance": current}
+
+    new_balance = current - amount
+    if not _update_balance(account_id, new_balance):
+        return {"ok": False, "error": "failed_to_update_balance"}
+
+    _log_ledger_event(account_id, -amount, reason=reason, meta=meta)
+    return {"ok": True, "balance": new_balance}
