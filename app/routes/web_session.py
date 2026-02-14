@@ -2,10 +2,9 @@
 from __future__ import annotations
 
 from typing import Any, Dict, Optional
+from flask import Blueprint, jsonify, g
 
-from flask import Blueprint, jsonify
-
-from app.core.auth import require_auth_plus, get_auth, get_auth_plus
+from app.core.auth import require_auth_plus
 from app.core.supabase_client import supabase
 from app.services.web_tokens_service import revoke_token
 
@@ -27,84 +26,60 @@ def _get_account(account_id: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def _build_me_payload(account_id: str) -> Dict[str, Any]:
-    acct = _get_account(account_id)
-    if not acct:
-        return {"ok": False, "error": "Unauthorized"}
-
-    phone = (acct.get("phone") or acct.get("provider_user_id") or "").strip()
-
-    auth_plus = get_auth_plus() or {}
-    sub = auth_plus.get("subscription") or {}
-    credits = auth_plus.get("credits") or {}
-
-    return {
-        "ok": True,
-        "account": {
-            "account_id": acct.get("account_id"),
-            "display_name": acct.get("display_name"),
-            "phone_e164": phone,
-            "provider": acct.get("provider"),
-            "provider_user_id": acct.get("provider_user_id"),
-            "created_at": acct.get("created_at"),
-        },
-        # We don't expose token hash / raw token details here.
-        "subscription": sub,
-        "credits": credits,
-    }
-
-
-# -------------------------------------------------------------------
-# Routes
-# -------------------------------------------------------------------
-
+# Support BOTH endpoints (in case you registered blueprints differently)
 @bp.get("/me")
-@require_auth_plus
+@bp.get("/web/auth/me")
+@require_auth_plus  # works as @require_auth_plus or @require_auth_plus()
 def me():
-    auth = get_auth() or {}
-    account_id = (auth.get("account_id") or "").strip()
+    account_id = getattr(g, "account_id", None)
+    token_row = getattr(g, "token_row", {}) or {}
+    sub = getattr(g, "subscription", {}) or {}
+    credits = getattr(g, "credits", {}) or {}
+
     if not account_id:
         return jsonify({"ok": False, "error": "Unauthorized"}), 401
 
-    payload = _build_me_payload(account_id)
-    if not payload.get("ok"):
-        return jsonify(payload), 401
-    return jsonify(payload), 200
-
-
-# Alias to match your /api/_routes output
-@bp.get("/web/auth/me")
-@require_auth_plus
-def web_auth_me():
-    return me()
-
-
-@bp.post("/web/auth/logout")
-@require_auth_plus
-def logout():
-    auth = get_auth() or {}
-    token = (auth.get("token") or "").strip()
-    if not token:
+    acct = _get_account(account_id)
+    if not acct:
         return jsonify({"ok": False, "error": "Unauthorized"}), 401
 
-    ok, err = revoke_token(token)
-    if not ok:
-        return jsonify({"ok": False, "error": err or "Failed to logout"}), 500
-    return jsonify({"ok": True}), 200
+    phone = (acct.get("phone") or acct.get("provider_user_id") or "").strip()
+
+    return jsonify(
+        {
+            "ok": True,
+            "account": {
+                "account_id": acct.get("account_id"),
+                "display_name": acct.get("display_name"),
+                "phone_e164": phone,
+                "provider": acct.get("provider"),
+                "provider_user_id": acct.get("provider_user_id"),
+                "created_at": acct.get("created_at"),
+            },
+            "auth": {"token_expires_at": token_row.get("expires_at")},
+            "subscription": sub,
+            "credits": credits,
+        }
+    ), 200
 
 
 @bp.get("/billing/me")
 @require_auth_plus
 def billing_me():
-    """
-    Convenience endpoint for frontend:
-      returns only subscription + credits
-    """
-    auth_plus = get_auth_plus() or {}
     return jsonify(
         {
             "ok": True,
-            "subscription": auth_plus.get("subscription") or {},
-            "credits": auth_plus.get("credits") or {},
+            "subscription": getattr(g, "subscription", {}) or {},
+            "credits": getattr(g, "credits", {}) or {},
         }
     ), 200
+
+
+@bp.post("/web/auth/logout")
+@require_auth_plus
+def logout():
+    token = getattr(g, "auth_token", "") or ""
+    ok, err = revoke_token(token)
+    if not ok:
+        return jsonify({"ok": False, "error": err or "Failed to logout"}), 500
+    return jsonify({"ok": True}), 200
