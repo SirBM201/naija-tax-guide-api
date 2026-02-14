@@ -32,18 +32,21 @@ WEB_DEV_RETURN_OTP = env("WEB_DEV_RETURN_OTP", "0").lower() in ("1", "true", "ye
 
 # -----------------------------
 # OTP knobs (COMPATIBILITY)
-# Your web_otp_service.py expects:
+# web_otp_service.py expects:
 #   WEB_OTP_TTL_MINUTES
 #   WEB_OTP_COOLDOWN_SECONDS
 # -----------------------------
-WEB_OTP_TTL_MINUTES = int(env("WEB_OTP_TTL_MINUTES", "10") or "10")              # 10 mins default
-WEB_OTP_COOLDOWN_SECONDS = int(env("WEB_OTP_COOLDOWN_SECONDS", "60") or "60")   # 60s default
+WEB_OTP_TTL_MINUTES = int(env("WEB_OTP_TTL_MINUTES", "10") or "10")              # default 10 mins
+WEB_OTP_COOLDOWN_SECONDS = int(env("WEB_OTP_COOLDOWN_SECONDS", "60") or "60")   # default 60s
 
-# -----------------------------
-# Optional: also expose seconds-based values
-# (kept so future services can use seconds directly)
-# -----------------------------
+# Optional seconds-based aliases (for future services)
 OTP_TTL_SECONDS = int(env("OTP_TTL_SECONDS", str(WEB_OTP_TTL_MINUTES * 60)) or str(WEB_OTP_TTL_MINUTES * 60))
 OTP_COOLDOWN_SECONDS = int(env("OTP_COOLDOWN_SECONDS", str(WEB_OTP_COOLDOWN_SECONDS)) or str(WEB_OTP_COOLDOWN_SECONDS))
 
-WEB_SESSION_TTL_SECONDS = int(env("WEB_SESSION_TTL_SECONDS", "2592000") or "2592000")  # 30 days
+# -----------------------------
+# Web Session TTL (COMPATIBILITY)
+# web_sessions_service.py expects:
+#   WEB_SESSION_TTL_DAYS
+# -----------------------------
+WEB_SESSION_TTL_DAYS = int(env("WEB_SESSION_TTL_DAYS", "30") or "30")  # default 30 days
+WEB_SESSION_TTL_SECONDS = int(env("WEB_SESSION_TTL_SECONDS", str(WEB_SESSION_TTL_DAYS * 86400)) or str(WEB_SESSION_TTL_DAYS * 86400))
