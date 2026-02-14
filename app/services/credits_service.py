@@ -1,7 +1,8 @@
+# app/services/credits_service.py
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from app.core.supabase_client import supabase
 
@@ -29,7 +30,7 @@ def get_credit_balance(account_id: str) -> int:
 
     res = (
         supabase.table(BAL_TABLE)
-        .select(f"{BAL_COL_BALANCE}")
+        .select(BAL_COL_BALANCE)
         .eq(BAL_COL_ACCOUNT, account_id)
         .limit(1)
         .execute()
@@ -37,6 +38,7 @@ def get_credit_balance(account_id: str) -> int:
     rows = (res.data or []) if hasattr(res, "data") else []
     if not rows:
         return 0
+
     try:
         return int(rows[0].get(BAL_COL_BALANCE) or 0)
     except Exception:
@@ -68,7 +70,6 @@ def init_credits_for_plan(account_id: str, plan_code: str) -> Dict[str, Any]:
     if not account_id or not plan_code:
         return {"ok": False, "error": "missing account_id or plan_code"}
 
-    # Get plan credits
     pres = (
         supabase.table(PLANS_TABLE)
         .select("plan_code, ai_credits_total")
@@ -81,7 +82,6 @@ def init_credits_for_plan(account_id: str, plan_code: str) -> Dict[str, Any]:
         return {"ok": False, "error": f"unknown plan_code: {plan_code}"}
 
     total = int(prows[0].get("ai_credits_total") or 0)
-
     _set_credit_balance(account_id, total)
 
     return {"ok": True, "account_id": account_id, "plan_code": plan_code, "balance": total}
