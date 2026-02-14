@@ -2,83 +2,96 @@
 from __future__ import annotations
 
 from flask import Blueprint, jsonify, request
-from ..core.config import ENV
-from ..services.web_otp_service import (
-    normalize_contact,
-    can_resend,
-    create_otp,
-    verify_otp,
-    dev_last_otp,
+
+from app.services.web_auth_service import (
+    request_web_otp,
+    verify_web_otp,
+    require_web_session,
+    logout_web_session,
 )
-from ..services.accounts_web_link_service import get_or_create_account_for_web
-from ..services.web_auth_tokens import issue_access_token
 
 bp = Blueprint("web_auth", __name__)
 
-@bp.post("/web/auth/start")
-def web_auth_start():
+
+@bp.post("/web/auth/request-otp")
+def web_request_otp():
+    """
+    Request OTP for Web login.
+    Body:
+      {
+        "phone_e164": "+2348012345678",
+        "device_id": "optional-string",
+        "shared_secret": "optional-dev-secret"
+      }
+
+    DEV behavior:
+      - Stores OTP in web_otps (hashed)
+      - Returns otp in response ONLY if DEV OTP is enabled
+    """
     body = request.get_json(silent=True) or {}
-    contact = normalize_contact(body.get("contact") or "")
+    phone_e164 = (body.get("phone_e164") or "").strip()
+    device_id = (body.get("device_id") or "").strip() or None
+    shared_secret = (body.get("shared_secret") or "").strip() or None
 
-    if not contact:
-        return jsonify({"ok": False, "error": "Missing contact"}), 400
+    if not phone_e164:
+        return jsonify({"ok": False, "error": "phone_e164 is required"}), 400
 
-    # Basic guard: in your product, this should be phone_e164 like +234...
-    if not contact.startswith("+") and "@" not in contact:
-        return jsonify({"ok": False, "error": "Contact must be phone_e164 (+...) or email"}), 400
+    result = request_web_otp(phone_e164=phone_e164, device_id=device_id, shared_secret=shared_secret)
+    status = 200 if result.get("ok") else 400
+    return jsonify(result), status
 
-    if not can_resend(contact):
-        return jsonify({"ok": False, "error": "Please wait a few seconds before requesting another OTP"}), 429
 
-    # Ensure account exists early (so verify step is clean)
-    account_id = get_or_create_account_for_web(contact)
+@bp.post("/web/auth/verify-otp")
+def web_verify_otp():
+    """
+    Verify OTP and create a web session.
+    Body:
+      {
+        "phone_e164": "+2348012345678",
+        "otp": "123456",
+        "device_id": "optional-string"
+      }
 
-    code, expires_at = create_otp(contact)
-
-    resp = {
-        "ok": True,
-        "contact": contact,
-        "expires_at": expires_at.isoformat(),
-        "account_id": account_id if ENV.lower() != "prod" else None,  # DEV convenience
-    }
-
-    # DEV ONLY: return OTP to frontend so you spend $0 now
-    if ENV.lower() != "prod":
-        resp["dev_otp"] = code
-
-    return jsonify(resp)
-
-@bp.post("/web/auth/verify")
-def web_auth_verify():
+    Returns:
+      {
+        ok: true,
+        session_token: "...",
+        account_id: "...",
+        expires_at: "..."
+      }
+    """
     body = request.get_json(silent=True) or {}
-    contact = normalize_contact(body.get("contact") or "")
-    code = (body.get("code") or "").strip()
+    phone_e164 = (body.get("phone_e164") or "").strip()
+    otp = (body.get("otp") or "").strip()
+    device_id = (body.get("device_id") or "").strip() or None
 
-    if not contact or not code:
-        return jsonify({"ok": False, "error": "Missing contact or code"}), 400
+    if not phone_e164 or not otp:
+        return jsonify({"ok": False, "error": "phone_e164 and otp are required"}), 400
 
-    ok = verify_otp(contact, code)
-    if not ok:
-        return jsonify({"ok": False, "error": "Invalid or expired OTP"}), 401
+    result = verify_web_otp(phone_e164=phone_e164, otp=otp, device_id=device_id)
+    status = 200 if result.get("ok") else 401
+    return jsonify(result), status
 
-    account_id = get_or_create_account_for_web(contact)
-    token = issue_access_token({"account_id": account_id, "channel": "web"})
 
-    return jsonify({
-        "ok": True,
-        "account_id": account_id,
-        "access_token": token,
-    })
+@bp.get("/web/auth/me")
+def web_me():
+    """
+    Validate current session and return account info.
+    Header: Authorization: Bearer <session_token>
+    """
+    auth = request.headers.get("Authorization") or ""
+    result = require_web_session(auth_header=auth)
+    status = 200 if result.get("ok") else 401
+    return jsonify(result), status
 
-@bp.get("/web/auth/dev_last_otp")
-def web_auth_dev_last_otp():
-    # optional helper to quickly fetch OTP in dev
-    if ENV.lower() == "prod":
-        return jsonify({"ok": False, "error": "Not allowed"}), 403
 
-    contact = normalize_contact(request.args.get("contact") or "")
-    if not contact:
-        return jsonify({"ok": False, "error": "Missing contact"}), 400
-
-    otp = dev_last_otp(contact)
-    return jsonify({"ok": True, "contact": contact, "dev_otp": otp})
+@bp.post("/web/auth/logout")
+def web_logout():
+    """
+    Logout: revoke current session token.
+    Header: Authorization: Bearer <session_token>
+    """
+    auth = request.headers.get("Authorization") or ""
+    result = logout_web_session(auth_header=auth)
+    status = 200 if result.get("ok") else 401
+    return jsonify(result), status
