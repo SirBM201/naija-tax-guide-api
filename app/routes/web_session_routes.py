@@ -1,22 +1,18 @@
-# app/routes/web_session_routes.py
+# app/routes/web_session.py
 from __future__ import annotations
 
 from typing import Any, Dict, Optional
-from flask import Blueprint, jsonify, g, request
 
-from ..core.auth import require_auth
-from ..core.supabase_client import supabase
-from ..services.web_tokens_service import revoke_token
+from flask import Blueprint, jsonify, g
 
+from app.core.auth import require_auth
+from app.core.supabase_client import supabase
+from app.services.web_tokens_service import revoke_token
 
 bp = Blueprint("web_session", __name__)
 
 
 def _get_account(account_id: str) -> Optional[Dict[str, Any]]:
-    """
-    Expects an 'accounts' table.
-    We return safe public fields only.
-    """
     try:
         res = (
             supabase.table("accounts")
@@ -34,10 +30,6 @@ def _get_account(account_id: str) -> Optional[Dict[str, Any]]:
 @bp.get("/me")
 @require_auth
 def me():
-    """
-    Protected endpoint for frontend bootstrapping.
-    Requires Bearer token.
-    """
     account_id = getattr(g, "account_id", None)
     token_row = getattr(g, "token_row", {}) or {}
 
@@ -46,10 +38,9 @@ def me():
 
     acct = _get_account(account_id)
     if not acct:
-        # Token valid but account missing -> still unauthorized in practice
         return jsonify({"ok": False, "error": "Unauthorized"}), 401
 
-    # Normalize the phone field for web UI friendliness
+    # Prefer explicit phone column; fallback to provider_user_id
     phone = (acct.get("phone") or acct.get("provider_user_id") or "").strip()
 
     return jsonify(
@@ -73,11 +64,7 @@ def me():
 @bp.post("/web/auth/logout")
 @require_auth
 def logout():
-    """
-    Logout (revoke current token).
-    Idempotent: returns ok even if token doesn't exist anymore.
-    """
-    token = getattr(g, "auth_token", None) or ""
+    token = getattr(g, "auth_token", "") or ""
     ok, err = revoke_token(token)
     if not ok:
         return jsonify({"ok": False, "error": err or "Failed to logout"}), 500
