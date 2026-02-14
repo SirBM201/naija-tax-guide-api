@@ -89,3 +89,4 @@ def create_app() -> Flask:
     app.register_blueprint(paystack_webhook_bp, url_prefix=api_prefix)
 
     return app
+
