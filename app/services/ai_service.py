@@ -165,3 +165,28 @@ def ask_ai_chat(messages: list[dict[str, str]], lang: str = "en") -> Optional[st
 
         _set_last_error(f"OpenAI request failed: {type(e).__name__}")
         return None
+
+# add to app/services/ai_service.py (keep your existing ask_ai intact)
+from typing import List, Dict
+
+def ask_ai_chat(messages: List[Dict[str, str]]) -> str:
+    """
+    Chat-style call with history.
+    messages = [{role:'system'|'user'|'assistant', content:'...'}]
+    """
+    try:
+        # If you already use OpenAI client in this file, reuse it.
+        resp = client.responses.create(
+            model=MODEL_TEXT,
+            input=[{"role": m["role"], "content": [{"type": "input_text", "text": m["content"]}]} for m in messages],
+        )
+        # best-effort extraction
+        out = ""
+        for item in getattr(resp, "output", []) or []:
+            for c in getattr(item, "content", []) or []:
+                if getattr(c, "type", "") in ("output_text", "text") and getattr(c, "text", None):
+                    out += c.text
+        return (out or "").strip() or "Sorry — I couldn't generate a response right now."
+    except Exception as e:
+        return "Sorry — the assistant is temporarily unavailable."
+
