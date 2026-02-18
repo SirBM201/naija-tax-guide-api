@@ -69,3 +69,11 @@ WEB_TOKEN_COL_TOKEN = env("WEB_TOKEN_COL_TOKEN", "token_hash")
 WEB_TOKEN_COL_ACCOUNT_ID = env("WEB_TOKEN_COL_ACCOUNT_ID", "account_id")
 WEB_TOKEN_COL_EXPIRES_AT = env("WEB_TOKEN_COL_EXPIRES_AT", "expires_at")
 WEB_TOKEN_COL_REVOKED_AT = env("WEB_TOKEN_COL_REVOKED_AT", "revoked_at")
+
+# ------------------------------------------------------------
+# Optional table names (web portal)
+# ------------------------------------------------------------
+WEB_OTPS_TABLE = env("WEB_OTPS_TABLE", "web_otps")
+WEB_SESSIONS_TABLE = env("WEB_SESSIONS_TABLE", "web_sessions")
+WEB_CHAT_SESSIONS_TABLE = env("WEB_CHAT_SESSIONS_TABLE", "web_chat_sessions")
+WEB_CHAT_MESSAGES_TABLE = env("WEB_CHAT_MESSAGES_TABLE", "web_chat_messages")
