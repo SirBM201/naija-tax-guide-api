@@ -1,131 +1,142 @@
-# app/services/web_chat_service.py
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List
 
-from ..core.supabase_client import supabase
-from ..services.ask_service import ask_guarded
+from app.core.supabase_client import supabase
+from app.services.ask_service import ask_guarded
 
-SESSION_TABLE = "web_chat_sessions"
-MSG_TABLE = "web_chat_messages"
 
-def _now_iso() -> str:
+def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
-def create_session(account_id: str, title: Optional[str] = None) -> Dict[str, Any]:
-    db = supabase()
-    payload = {
-        "account_id": account_id,
-        "title": (title or "").strip() or None,
-        "updated_at": _now_iso(),
-    }
-    res = db.table(SESSION_TABLE).insert(payload).execute()
-    row = res.data[0] if res.data else payload
-    return row
 
-def list_sessions(account_id: str, limit: int = 50) -> List[Dict[str, Any]]:
-    db = supabase()
+def list_sessions(account_id: str) -> List[Dict[str, Any]]:
     res = (
-        db.table(SESSION_TABLE)
-        .select("id,account_id,title,created_at,updated_at")
+        supabase.table("web_chat_sessions")
+        .select("id, title, created_at, updated_at")
         .eq("account_id", account_id)
         .order("updated_at", desc=True)
-        .limit(int(limit))
         .execute()
     )
     return res.data or []
 
-def get_session(account_id: str, session_id: str) -> Optional[Dict[str, Any]]:
-    db = supabase()
+
+def create_session(account_id: str, title: str) -> Dict[str, Any]:
+    now = _iso_now()
     res = (
-        db.table(SESSION_TABLE)
-        .select("id,account_id,title,created_at,updated_at")
+        supabase.table("web_chat_sessions")
+        .insert(
+            {
+                "account_id": account_id,
+                "title": title,
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
+        .select("id, title, created_at, updated_at")
+        .execute()
+    )
+    return (res.data or [{}])[0]
+
+
+def get_messages(account_id: str, session_id: str) -> List[Dict[str, Any]]:
+    # enforce ownership
+    s = (
+        supabase.table("web_chat_sessions")
+        .select("id")
         .eq("id", session_id)
         .eq("account_id", account_id)
         .limit(1)
         .execute()
     )
-    return (res.data[0] if res.data else None)
-
-def list_messages(account_id: str, session_id: str, limit: int = 200) -> List[Dict[str, Any]]:
-    db = supabase()
-    # Ensure session belongs to account
-    sess = get_session(account_id, session_id)
-    if not sess:
+    if not (s.data or []):
         return []
 
     res = (
-        db.table(MSG_TABLE)
-        .select("id,session_id,account_id,role,content,created_at")
+        supabase.table("web_chat_messages")
+        .select("id, role, content, created_at")
         .eq("session_id", session_id)
+        .eq("account_id", account_id)
         .order("created_at", desc=False)
-        .limit(int(limit))
         .execute()
     )
     return res.data or []
 
-def add_message(account_id: str, session_id: str, role: str, content: str) -> Dict[str, Any]:
-    db = supabase()
+
+def _append_message(account_id: str, session_id: str, role: str, content: str) -> None:
+    supabase.table("web_chat_messages").insert(
+        {
+            "account_id": account_id,
+            "session_id": session_id,
+            "role": role,
+            "content": content,
+        }
+    ).execute()
+
+    supabase.table("web_chat_sessions").update(
+        {"updated_at": _iso_now()}
+    ).eq("id", session_id).eq("account_id", account_id).execute()
+
+
+def send_message(account_id: str, session_id: str, text: str) -> Dict[str, Any]:
+    # enforce ownership
+    s = (
+        supabase.table("web_chat_sessions")
+        .select("id")
+        .eq("id", session_id)
+        .eq("account_id", account_id)
+        .limit(1)
+        .execute()
+    )
+    if not (s.data or []):
+        # create session automatically if missing (optional behavior)
+        new_s = create_session(account_id, title="New chat")
+        session_id = new_s["id"]
+
+    # store user message
+    _append_message(account_id, session_id, "user", text)
+
+    # build lightweight context from last 12 messages
+    history = (
+        supabase.table("web_chat_messages")
+        .select("role, content")
+        .eq("session_id", session_id)
+        .eq("account_id", account_id)
+        .order("created_at", desc=True)
+        .limit(12)
+        .execute()
+    ).data or []
+
+    history = list(reversed(history))
+    context_lines = []
+    for m in history:
+        role = m.get("role")
+        content = (m.get("content") or "").strip()
+        if not content:
+            continue
+        prefix = "User" if role == "user" else "Assistant"
+        context_lines.append(f"{prefix}: {content}")
+
+    combined = "\n".join(context_lines).strip()
+
+    # reuse your guarded ask pipeline (cache, policy, etc.)
     payload = {
-        "session_id": session_id,
         "account_id": account_id,
-        "role": role,
-        "content": content,
+        "question": combined,   # conversation as a single prompt
+        "source": "web_chat",
     }
-    res = db.table(MSG_TABLE).insert(payload).execute()
-    row = res.data[0] if res.data else payload
 
-    # touch session updated_at
-    try:
-        db.table(SESSION_TABLE).update({"updated_at": _now_iso()}).eq("id", session_id).eq("account_id", account_id).execute()
-    except Exception:
-        pass
+    result, status = ask_guarded(payload)
+    if status != 200:
+        # store failure as assistant message (so UI shows something)
+        msg = result.get("error") or "Unable to answer right now."
+        _append_message(account_id, session_id, "assistant", msg)
+        return {"session_id": session_id, "answer": msg, "raw": result}
 
-    return row
+    answer = result.get("answer") or result.get("message") or ""
+    answer = str(answer).strip() or "Okay."
 
-def chat_send(account_id: str, session_id: str, user_text: str) -> Dict[str, Any]:
-    user_text = (user_text or "").strip()
-    if not user_text:
-        return {"ok": False, "error": "missing_message"}
+    _append_message(account_id, session_id, "assistant", answer)
 
-    sess = get_session(account_id, session_id)
-    if not sess:
-        return {"ok": False, "error": "session_not_found"}
-
-    # Store user message
-    user_msg = add_message(account_id, session_id, "user", user_text)
-
-    # Generate assistant reply (single-turn for now; history available for future use)
-    ai = ask_guarded(question=user_text, account_id=account_id, mode="web_chat")
-
-    if not ai.get("ok"):
-        return {"ok": False, "error": ai.get("error") or "ask_failed"}
-
-    assistant_text = (ai.get("answer") or "").strip() or "Sorry — I couldn’t generate a response."
-
-    # Store assistant message
-    assistant_msg = add_message(account_id, session_id, "assistant", assistant_text)
-
-    return {
-        "ok": True,
-        "session": {
-            "id": sess.get("id"),
-            "title": sess.get("title"),
-            "updated_at": _now_iso(),
-        },
-        "messages": [
-            {
-                "role": "user",
-                "content": user_msg.get("content"),
-                "created_at": user_msg.get("created_at"),
-            },
-            {
-                "role": "assistant",
-                "content": assistant_msg.get("content"),
-                "created_at": assistant_msg.get("created_at"),
-            },
-        ],
-        # non-sensitive hint only
-        "meta": {"source": ai.get("source"), "cached": bool(ai.get("cached"))},
-    }
+    return {"session_id": session_id, "answer": answer, "raw": result}
