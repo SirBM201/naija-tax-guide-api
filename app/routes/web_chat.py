@@ -1,52 +1,33 @@
+# app/routes/web_ask.py
 from __future__ import annotations
 
 from flask import Blueprint, request, jsonify, g
 
-from app.core.auth import require_web_auth
-from app.services.web_chat_service import (
-    list_sessions,
-    create_session,
-    get_messages,
-    send_message,
-)
+from app.routes.web_session import require_web_token
+from app.services.ask_service import handle_ask
 
-bp = Blueprint("web_chat", __name__)
+bp = Blueprint("web_ask", __name__)
 
-@bp.route("/web/chat/sessions", methods=["GET"])
-def web_chat_list_sessions():
-    ok, resp = require_web_auth()
-    if not ok:
-        return resp
-    data = list_sessions(g.account_id)
-    return jsonify({"ok": True, "sessions": data}), 200
+@bp.post("/web/ask")
+@require_web_token
+def web_ask():
+    data = request.get_json(silent=True) or {}
+    q = (data.get("question") or "").strip()
 
-@bp.route("/web/chat/sessions", methods=["POST"])
-def web_chat_create_session():
-    ok, resp = require_web_auth()
-    if not ok:
-        return resp
-    body = request.get_json(silent=True) or {}
-    title = (body.get("title") or "").strip() or "New chat"
-    s = create_session(g.account_id, title=title)
-    return jsonify({"ok": True, "session": s}), 201
+    if not q:
+        return jsonify({"ok": False, "error": "missing_question"}), 400
 
-@bp.route("/web/chat/sessions/<session_id>/messages", methods=["GET"])
-def web_chat_messages(session_id: str):
-    ok, resp = require_web_auth()
-    if not ok:
-        return resp
-    msgs = get_messages(g.account_id, session_id)
-    return jsonify({"ok": True, "messages": msgs}), 200
+    account_id = getattr(g, "account_id", None)
+    if not account_id:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
 
-@bp.route("/web/chat/sessions/<session_id>/messages", methods=["POST"])
-def web_chat_send(session_id: str):
-    ok, resp = require_web_auth()
-    if not ok:
-        return resp
-    body = request.get_json(silent=True) or {}
-    text = (body.get("message") or "").strip()
-    if not text:
-        return jsonify({"ok": False, "error": "message_required"}), 400
+    res = handle_ask(
+        question=q,
+        account_id=account_id,
+        provider="web",
+        provider_user_id=str(account_id),
+        meta={"channel": "web", "mode": "ask"},
+    )
 
-    out = send_message(g.account_id, session_id, text)
-    return jsonify({"ok": True, **out}), 200
+    res["ok"] = True
+    return jsonify(res), 200
