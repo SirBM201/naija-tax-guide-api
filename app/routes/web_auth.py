@@ -3,133 +3,67 @@ from __future__ import annotations
 
 from flask import Blueprint, jsonify, request
 
-from ..core.config import WEB_DEV_RETURN_OTP
-from ..services.accounts_service import ensure_account_id
-from ..services.web_otp_service import create_otp, verify_otp, otp_request_cooldown_ok
-from ..services.web_sessions_service import (
-    create_web_session,
-    validate_web_session,
-    touch_session_best_effort,
-    revoke_session,
-)
+from ..core.config import ENV
+from ..services.web_otp_service import request_web_login_otp, verify_web_login_otp
+from ..services.web_sessions_service import validate_web_session, touch_session_best_effort
 
 bp = Blueprint("web_auth", __name__)
 
-
-def _get_ip() -> str | None:
-    return request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or request.remote_addr
-
-
-def _get_ua() -> str | None:
-    return request.headers.get("User-Agent")
-
-
-def _bearer_token() -> str | None:
-    auth = (request.headers.get("Authorization") or "").strip()
-    if not auth:
-        return None
-    if auth.lower().startswith("bearer "):
-        return auth.split(" ", 1)[1].strip() or None
-    return None
-
-
 @bp.post("/web/auth/request-otp")
-def request_otp():
-    body = request.get_json(silent=True) or {}
-    contact = (body.get("phone_e164") or body.get("contact") or "").strip()
+def web_request_otp():
+    data = request.get_json(silent=True) or {}
+    contact = (data.get("contact") or "").strip()
+    purpose = (data.get("purpose") or "web_login").strip()
 
     if not contact:
-        return jsonify({"ok": False, "error": "phone_e164 is required"}), 400
-    if len(contact) < 7:
-        return jsonify({"ok": False, "error": "invalid phone"}), 400
+        return jsonify({"ok": False, "error": "missing_contact"}), 400
 
-    if not otp_request_cooldown_ok(contact, "web_login"):
-        return jsonify({"ok": False, "error": "too_many_requests"}), 429
+    # This generates + stores OTP (hash) in DB; in DEV it can return plain OTP for local testing
+    result = request_web_login_otp(contact=contact, purpose=purpose)
 
-    otp = create_otp(contact=contact, purpose="web_login")
-    resp = {"ok": True, "expires_at": otp["expires_at"]}
-    if WEB_DEV_RETURN_OTP:
-        resp["otp"] = otp["code_plain"]
-    return jsonify(resp)
+    # IMPORTANT: Only return dev_otp in non-prod
+    if (ENV or "").lower() != "prod":
+        return jsonify(
+            {
+                "ok": True,
+                "contact": contact,
+                "purpose": purpose,
+                "dev_otp": result.get("dev_otp"),  # <--- shown only in DEV
+            }
+        )
+
+    return jsonify({"ok": True, "contact": contact, "purpose": purpose})
 
 
 @bp.post("/web/auth/verify-otp")
-def verify_otp_route():
-    body = request.get_json(silent=True) or {}
-    contact = (body.get("phone_e164") or body.get("contact") or "").strip()
-    code = (body.get("otp") or body.get("code") or "").strip()
+def web_verify_otp():
+    data = request.get_json(silent=True) or {}
+    contact = (data.get("contact") or "").strip()
+    otp = (data.get("otp") or "").strip()
+    purpose = (data.get("purpose") or "web_login").strip()
 
-    if not contact or not code:
-        return jsonify({"ok": False, "error": "phone_e164 and otp are required"}), 400
+    if not contact or not otp:
+        return jsonify({"ok": False, "error": "missing_contact_or_otp"}), 400
 
-    ok, reason = verify_otp(contact=contact, code_plain=code, purpose="web_login")
-    if not ok:
-        return jsonify({"ok": False, "error": reason}), 401
+    # returns token if ok
+    res = verify_web_login_otp(contact=contact, otp=otp, purpose=purpose)
+    if not res.get("ok"):
+        return jsonify(res), 401
 
-    # Create/Find account (provider=web, provider_user_id=phone)
-    acc = ensure_account_id(
-        provider="web",
-        provider_user_id=contact,
-        display_name=None,
-        phone=contact,
-        phone_e164=contact,
-    )
-    if not acc.get("ok") or not acc.get("account_id"):
-        return jsonify({"ok": False, "error": acc.get("error") or "account_create_failed"}), 500
-
-    sess = create_web_session(
-        account_id=acc["account_id"],
-        ip=_get_ip(),
-        user_agent=_get_ua(),
-    )
-
-    return jsonify(
-        {
-            "ok": True,
-            "account_id": acc["account_id"],
-            "token": sess["token"],
-            "expires_at": sess["expires_at"],
-        }
-    )
+    return jsonify(res)
 
 
-# ------------------------------------------------------------
-# Existing "me" endpoint (keep)
-# ------------------------------------------------------------
 @bp.get("/web/auth/me")
-def me_auth():
-    token = _bearer_token()
+def web_me():
+    auth = (request.headers.get("Authorization") or "").strip()
+    token = auth.split(" ", 1)[1].strip() if auth.lower().startswith("bearer ") else None
     if not token:
         return jsonify({"ok": False, "error": "missing_token"}), 401
 
     ok, account_id, reason = validate_web_session(token)
-    if not ok:
+    if not ok or not account_id:
         return jsonify({"ok": False, "error": reason}), 401
 
     touch_session_best_effort(token)
+
     return jsonify({"ok": True, "account_id": account_id})
-
-
-# ✅ NEW alias: matches frontend call "/api/web/me"
-@bp.get("/web/me")
-def me_alias():
-    return me_auth()
-
-
-# ------------------------------------------------------------
-# Existing logout endpoint (keep)
-# ------------------------------------------------------------
-@bp.post("/web/auth/logout")
-def logout_auth():
-    token = _bearer_token()
-    if not token:
-        return jsonify({"ok": False, "error": "missing_token"}), 401
-
-    revoked = revoke_session(token)
-    return jsonify({"ok": True, "revoked": revoked})
-
-
-# ✅ NEW alias: stable endpoint "/api/web/logout" if you want it later
-@bp.post("/web/logout")
-def logout_alias():
-    return logout_auth()
