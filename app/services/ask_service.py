@@ -1,315 +1,265 @@
 # app/services/ask_service.py
 from __future__ import annotations
 
-from typing import Dict, Any, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 from datetime import date
 import time
 
 from ..core.supabase_client import supabase
 
-from .qa_cache_service import (
-    find_cached_answer,
-    touch_cache_best_effort,
-    upsert_ai_answer_to_cache_best_effort,
-)
-from .qa_library_service import find_library_answer
-from .qa_logging_service import log_qa_event_best_effort
+from .ai_service import ask_ai, ask_ai_chat, last_ai_error
+from .subscriptions_service import get_subscription_status
 
 
-PAID_CACHE_DAILY_LIMIT = 1000  # paid users cache/day; AI has no daily cap for paid
+# -----------------------------
+# Constants / knobs
+# -----------------------------
+CACHE_TTL_SECONDS = 7 * 24 * 3600  # 7 days
+MAX_QUESTION_CHARS = 2000
 
 
-def _today_utc() -> str:
+# -----------------------------
+# Helpers
+# -----------------------------
+def _today_yyyy_mm_dd() -> str:
     return date.today().isoformat()
 
 
-def _normalize_question(q: str) -> str:
-    return " ".join((q or "").strip().lower().split())
+def _safe_str(v: Any) -> str:
+    return (v or "").strip()
 
 
-def _cost_for_mode(mode: str) -> int:
-    return 1 if mode == "text" else 2
+def _truncate(s: str, n: int) -> str:
+    s = s or ""
+    return s if len(s) <= n else s[:n]
 
 
-# -------------------------
-# Subscription helpers
-# -------------------------
-def _get_subscription_status_best_effort(
-    account_id: str,
-    provider: Optional[str],
-    provider_user_id: Optional[str],
-) -> Dict[str, Any]:
+def _now_epoch() -> int:
+    return int(time.time())
+
+
+# -----------------------------
+# Subscription status (best effort)
+# -----------------------------
+def _get_subscription_status_best_effort(account_id: str, provider: str, provider_user_id: Optional[str]) -> Dict[str, Any]:
     """
-    Best-effort subscription lookup.
-    TODO: wire to your real subscriptions_service if/when needed.
+    Wrapper around subscriptions_service.get_subscription_status.
+    If anything fails, return an expired-ish state to be safe.
     """
-    return {
-        "active": True,
-        "state": "active",
-        "reason": "assumed_active",
-    }
-
-
-# -------------------------
-# Daily counters
-# -------------------------
-def _get_or_create_daily_counter(account_id: str, day: str) -> Dict[str, Any]:
-    res = (
-        supabase().table("daily_question_counters")
-        .select("*")
-        .eq("account_id", account_id)
-        .eq("day", day)
-        .limit(1)
-        .execute()
-    )
-    if getattr(res, "data", None):
-        return res.data[0]
-
-    payload = {
-        "account_id": account_id,
-        "day": day,
-        "total_count": 0,
-        "text_count": 0,
-        "voice_count": 0,
-        "cache_count": 0,
-        "ai_count": 0,
-    }
-    ins = supabase().table("daily_question_counters").insert(payload).execute()
-    if getattr(ins, "data", None):
-        return ins.data[0]
-    return payload
-
-
-def _update_daily_counter_best_effort(
-    account_id: str,
-    day: str,
-    *,
-    mode: str,
-    used_cache: bool,
-    used_ai: bool,
-) -> None:
     try:
-        row = _get_or_create_daily_counter(account_id, day)
-        supabase().table("daily_question_counters").update(
+        return get_subscription_status(account_id, provider, provider_user_id)
+    except Exception:
+        return {
+            "active": False,
+            "state": "none",
+            "reason": "subscription_check_failed",
+            "plan_code": None,
+            "expires_at": None,
+            "grace_until": None,
+        }
+
+
+# -----------------------------
+# Credits / Limits (ai_credit_ledger)
+# -----------------------------
+def _consume_ai_credits(account_id: str, cost: int = 1) -> Tuple[bool, str]:
+    """
+    Deduct credits using an RPC if available.
+    Your DB should expose: consume_ai_credits(account_id uuid, cost int)
+    Returns: (ok, reason)
+    """
+    cost = int(cost or 1)
+    if cost < 1:
+        cost = 1
+
+    try:
+        res = supabase().rpc("consume_ai_credits", {"p_account_id": account_id, "p_cost": cost}).execute()
+        data = getattr(res, "data", None)
+
+        # Expecting data like: {"ok": true, "reason": "ok"} OR {"ok": false, "reason":"no_credits"}
+        if isinstance(data, dict):
+            ok = bool(data.get("ok"))
+            reason = _safe_str(data.get("reason")) or ("ok" if ok else "no_credits")
+            return ok, reason
+
+        # If RPC returns boolean directly
+        if isinstance(data, bool):
+            return (data is True), ("ok" if data else "no_credits")
+
+        return False, "credits_rpc_unexpected_response"
+
+    except Exception:
+        return False, "credits_rpc_failed"
+
+
+# -----------------------------
+# QA Cache (qa_cache table)
+# -----------------------------
+def _find_cached_answer(question: str, lang: str = "en") -> Optional[str]:
+    q = _truncate(_safe_str(question), MAX_QUESTION_CHARS)
+    if not q:
+        return None
+
+    try:
+        res = (
+            supabase()
+            .table("qa_cache")
+            .select("answer, created_at")
+            .eq("question", q)
+            .eq("lang", lang)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = getattr(res, "data", None) or []
+        if not rows:
+            return None
+        ans = _safe_str(rows[0].get("answer"))
+        return ans or None
+    except Exception:
+        return None
+
+
+def _store_cached_answer(question: str, answer: str, lang: str = "en") -> None:
+    q = _truncate(_safe_str(question), MAX_QUESTION_CHARS)
+    a = _safe_str(answer)
+    if not q or not a:
+        return
+
+    try:
+        supabase().table("qa_cache").insert(
             {
-                "total_count": int(row.get("total_count") or 0) + 1,
-                "text_count": int(row.get("text_count") or 0) + (1 if mode == "text" else 0),
-                "voice_count": int(row.get("voice_count") or 0) + (1 if mode == "voice" else 0),
-                "cache_count": int(row.get("cache_count") or 0) + (1 if used_cache else 0),
-                "ai_count": int(row.get("ai_count") or 0) + (1 if used_ai else 0),
+                "question": q,
+                "answer": a,
+                "lang": lang,
+                "created_at": _now_epoch(),
+                "ttl_seconds": CACHE_TTL_SECONDS,
             }
-        ).eq("account_id", account_id).eq("day", day).execute()
+        ).execute()
     except Exception:
         return
 
 
-def _paid_cache_used_today(account_id: str, day: str) -> int:
-    try:
-        row = _get_or_create_daily_counter(account_id, day)
-        return int(row.get("cache_count") or 0)
-    except Exception:
-        return 0
-
-
-# -------------------------
-# AI credits
-# -------------------------
-def _consume_ai_credits(account_id: str, cost: int) -> Tuple[bool, str]:
-    cost = int(cost or 0)
-    if cost <= 0:
-        return True, "ok"
-
-    try:
-        spend = supabase().rpc("consume_ai_credits", {"p_account_id": account_id, "p_cost": cost}).execute()
-        data = getattr(spend, "data", None) or {}
-
-        if isinstance(data, list):
-            data = data[0] if data else {}
-
-        if isinstance(data, dict):
-            if data.get("ok") is True:
-                return True, "ok"
-            return False, (data.get("reason") or "out_of_credits")
-
-        if data is True:
-            return True, "ok"
-
-        return False, "out_of_credits"
-    except Exception:
-        return False, "ledger_error"
-
-
+# -----------------------------
+# AI call
+# -----------------------------
 def _call_ai_model(question: str, lang: str = "en") -> str:
-    return f"(AI) I received your question: {question}"
+    ans = ask_ai(question, lang=lang)
+    if not ans:
+        raise RuntimeError(last_ai_error() or "ai_failed")
+    return ans
 
 
-# =========================================================
-# PUBLIC ENTRYPOINT
-# =========================================================
-def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
-    t0 = time.time()
-
-    body = body or {}
-    question = (body.get("question") or "").strip()
-    lang = (body.get("lang") or "en").strip() or "en"
-
-    account_id = (body.get("account_id") or "").strip()
-    provider = (body.get("provider") or "").strip().lower() or None
-    provider_user_id = (body.get("provider_user_id") or "").strip() or None
-
-    mode = (body.get("mode") or "text").strip().lower()
-    if mode not in ("text", "voice"):
-        mode = "text"
-
+# -----------------------------
+# Public: single-turn ask
+# -----------------------------
+def ask_guarded(
+    question: str,
+    account_id: str,
+    channel: str = "web_ask",
+    provider: str = "web",
+    provider_user_id: Optional[str] = None,
+    lang: str = "en",
+) -> Dict[str, Any]:
+    question = _truncate(_safe_str(question), MAX_QUESTION_CHARS)
     if not question:
-        return {"ok": False, "error": "question is required"}
+        return {"ok": False, "error": "question_required", "answer": ""}
 
-    if not account_id:
-        latency = int((time.time() - t0) * 1000)
-        log_qa_event_best_effort(
-            account_id="unknown",
-            mode=mode,
-            lang=lang,
-            question_raw=question,
-            normalized_question="",
-            canonical_key=None,
-            outcome="blocked",
-            reason="missing_account_id",
-            source=None,
-            cache_hit=False,
-            library_hit=False,
-            ai_used=False,
-            ai_credit_cost=0,
-            latency_ms=latency,
-        )
-        return {"ok": False, "error": "account_id is required (or connect provider identity first)"}
-
+    # Subscription check
     sub = _get_subscription_status_best_effort(account_id, provider, provider_user_id)
-    plan_active = bool(sub.get("active", True))
-    is_paid_user = bool(sub.get("active", True))
-
-    day = _today_utc()
-    nq = _normalize_question(question)
-    canonical_key = (body.get("canonical_key") or None)
-
-    # 1) Library
-    lib = find_library_answer(nq, lang=lang, canonical_key=canonical_key)
-    if lib and lib.get("answer"):
-        latency = int((time.time() - t0) * 1000)
-        _update_daily_counter_best_effort(account_id, day, mode=mode, used_cache=True, used_ai=False)
-        log_qa_event_best_effort(
-            account_id=account_id,
-            mode=mode,
-            lang=lang,
-            question_raw=question,
-            normalized_question=nq,
-            canonical_key=canonical_key,
-            outcome="ok",
-            reason=None,
-            source="library",
-            cache_hit=False,
-            library_hit=True,
-            ai_used=False,
-            ai_credit_cost=0,
-            latency_ms=latency,
-        )
-        return {"ok": True, "answer": lib.get("answer"), "cached": True, "source": "library"}
-
-    # 2) Cache (paid limit)
-    cache_allowed = True
-    if is_paid_user and _paid_cache_used_today(account_id, day) >= PAID_CACHE_DAILY_LIMIT:
-        cache_allowed = False
-
-    if cache_allowed:
-        cached = find_cached_answer(nq, lang=lang, canonical_key=canonical_key)
-        if cached and cached.get("answer"):
-            touch_cache_best_effort(str(cached.get("id")))
-            latency = int((time.time() - t0) * 1000)
-            _update_daily_counter_best_effort(account_id, day, mode=mode, used_cache=True, used_ai=False)
-            log_qa_event_best_effort(
-                account_id=account_id,
-                mode=mode,
-                lang=lang,
-                question_raw=question,
-                normalized_question=nq,
-                canonical_key=canonical_key,
-                outcome="ok",
-                reason=None,
-                source="cache",
-                cache_hit=True,
-                library_hit=False,
-                ai_used=False,
-                ai_credit_cost=0,
-                latency_ms=latency,
-            )
-            return {"ok": True, "answer": cached.get("answer"), "cached": True, "source": "cache"}
-
-    # 3) AI (credits only)
-    cost = _cost_for_mode(mode)
-    ok, reason = _consume_ai_credits(account_id, cost)
-
-    if not ok:
-        latency = int((time.time() - t0) * 1000)
-        log_qa_event_best_effort(
-            account_id=account_id,
-            mode=mode,
-            lang=lang,
-            question_raw=question,
-            normalized_question=nq,
-            canonical_key=canonical_key,
-            outcome="blocked",
-            reason="ai_credits_exhausted" if reason in ("out_of_credits", "insufficient_credits") else reason,
-            source=None,
-            cache_hit=False,
-            library_hit=False,
-            ai_used=False,
-            ai_credit_cost=0,
-            latency_ms=latency,
-        )
-
-        if plan_active:
-            return {
-                "ok": False,
-                "error": "AI_TOPUP_REQUIRED",
-                "message": "You’ve reached your AI usage limit for your current plan. Please top up AI credits to continue receiving AI answers.",
-            }
+    if not sub.get("active"):
         return {
             "ok": False,
-            "error": "SUBSCRIPTION_REQUIRED",
-            "message": "Your subscription is not active. Please renew to continue.",
+            "error": "subscription_required",
+            "answer": "Please activate a plan to use NaijaTax Guide.",
+            "meta": {"channel": channel, "subscription": sub},
         }
 
-    ai_answer = _call_ai_model(question, lang=lang)
+    # Cache lookup first (cheap)
+    cached = _find_cached_answer(question, lang=lang)
+    if cached:
+        return {
+            "ok": True,
+            "answer": cached,
+            "meta": {"channel": channel, "mode": "cache"},
+        }
 
-    upsert_ai_answer_to_cache_best_effort(
-        normalized_question=nq,
-        answer=ai_answer,
-        tags=None,
-        source="ai",
-        lang=lang,
-        canonical_key=canonical_key,
-        enabled=True,
-        priority=0,
-    )
+    # Enforce AI credits
+    ok, reason = _consume_ai_credits(account_id=account_id, cost=1)
+    if not ok:
+        return {
+            "ok": False,
+            "error": reason or "no_credits",
+            "answer": "You’ve reached your usage limit for now. Please top up or wait for your next reset.",
+            "meta": {"channel": channel, "mode": "blocked"},
+        }
 
-    latency = int((time.time() - t0) * 1000)
-    _update_daily_counter_best_effort(account_id, day, mode=mode, used_cache=False, used_ai=True)
+    # AI
+    try:
+        answer = _call_ai_model(question, lang=lang)
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e) or "ai_failed",
+            "answer": "Sorry — I couldn’t generate a response right now. Please try again.",
+            "meta": {"channel": channel, "mode": "ai_failed"},
+        }
 
-    log_qa_event_best_effort(
-        account_id=account_id,
-        mode=mode,
-        lang=lang,
-        question_raw=question,
-        normalized_question=nq,
-        canonical_key=canonical_key,
-        outcome="ok",
-        reason=None,
-        source="ai",
-        cache_hit=False,
-        library_hit=False,
-        ai_used=True,
-        ai_credit_cost=cost,
-        latency_ms=latency,
-    )
+    # Store in cache
+    _store_cached_answer(question, answer, lang=lang)
 
-    return {"ok": True, "answer": ai_answer, "cached": False, "source": "ai"}
+    return {
+        "ok": True,
+        "answer": answer,
+        "meta": {"channel": channel, "mode": "ai", "credits_deducted": 1},
+    }
+
+
+# -----------------------------
+# Public: chat ask (sessions + history)
+# -----------------------------
+def ask_chat_guarded(
+    *,
+    messages: list[dict[str, str]],
+    account_id: str,
+    provider: str = "web",
+    lang: str = "en",
+) -> Dict[str, Any]:
+    """
+    Chat-style ask with credit/subscription enforcement.
+
+    - enforces subscription state
+    - deducts 1 AI credit per assistant response
+    - does NOT use QA cache (history makes caching unreliable)
+    """
+    provider = (provider or "web").strip().lower()
+
+    sub = _get_subscription_status_best_effort(account_id, provider, None)
+    if not (sub or {}).get("active"):
+        return {
+            "ok": False,
+            "error": "subscription_required",
+            "answer": "Please activate a plan to use the Tax Assistant Chat.",
+        }
+
+    ok, reason = _consume_ai_credits(account_id=account_id, cost=1)
+    if not ok:
+        return {
+            "ok": False,
+            "error": reason or "no_credits",
+            "answer": "You’ve reached your usage limit for now. Please top up or wait for your next reset.",
+        }
+
+    ans = ask_ai_chat(messages, lang=lang)
+    if not ans:
+        return {
+            "ok": False,
+            "error": last_ai_error() or "ai_failed",
+            "answer": "Sorry — I couldn’t generate a response right now. Please try again.",
+        }
+
+    return {
+        "ok": True,
+        "answer": ans,
+        "meta": {"mode": "chat", "credits_deducted": 1},
+    }
