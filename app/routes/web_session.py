@@ -14,7 +14,8 @@ bp = Blueprint("web_session", __name__)
 def _get_account(account_id: str) -> Optional[Dict[str, Any]]:
     try:
         res = (
-            supabase.table("accounts")
+            supabase()
+            .table("accounts")
             .select("account_id, provider, provider_user_id, display_name, phone, created_at")
             .eq("account_id", account_id)
             .limit(1)
@@ -29,12 +30,10 @@ def _get_account(account_id: str) -> Optional[Dict[str, Any]]:
 # Support BOTH endpoints (in case you registered blueprints differently)
 @bp.get("/me")
 @bp.get("/web/auth/me")
-@require_auth_plus  # works as @require_auth_plus or @require_auth_plus()
+@require_auth_plus
 def me():
     account_id = getattr(g, "account_id", None)
     token_row = getattr(g, "token_row", {}) or {}
-    sub = getattr(g, "subscription", {}) or {}
-    credits = getattr(g, "credits", {}) or {}
 
     if not account_id:
         return jsonify({"ok": False, "error": "Unauthorized"}), 401
@@ -57,8 +56,9 @@ def me():
                 "created_at": acct.get("created_at"),
             },
             "auth": {"token_expires_at": token_row.get("expires_at")},
-            "subscription": sub,
-            "credits": credits,
+            # keep these keys stable even if not yet wired
+            "subscription": getattr(g, "subscription", {}) or {},
+            "credits": getattr(g, "credits", {}) or {},
         }
     ), 200
 
