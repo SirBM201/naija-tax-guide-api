@@ -23,6 +23,13 @@ def _parse_iso(value: str) -> Optional[datetime]:
     except Exception:
         return None
 
+# ---- Backward-compat alias (do not remove) ----
+# Some routes still import this name.
+try:
+    manual_activate_subscription  # noqa: F401
+except NameError:
+    def manual_activate_subscription(*args, **kwargs):
+        return activate_subscription_now(*args, **kwargs)
 
 def _iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
