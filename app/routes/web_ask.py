@@ -1,42 +1,57 @@
 # app/routes/web_ask.py
 from __future__ import annotations
 
-from flask import Blueprint, jsonify, request, g
+from flask import Blueprint, jsonify, request
 
-from app.core.auth import require_auth_plus
-from app.services.ask_service import ask_guarded
+from ..core.auth import require_auth_plus
+from ..services.ask_service import ask_guarded
 
 bp = Blueprint("web_ask", __name__)
 
+def _json() -> dict:
+    try:
+        return request.get_json(force=True) or {}
+    except Exception:
+        return {}
 
 @bp.post("/web/ask")
 @require_auth_plus
 def web_ask():
     """
-    Web-only Ask endpoint (token protected).
-
-    POST /api/web/ask
-    Headers:
-      Authorization: Bearer <token>
-
-    Body:
-      { "question": "<text>", "lang": "en|pcm|yo|ig|ha" (optional), "mode": "text|voice" (optional) }
+    Token-protected web ask endpoint.
+    Frontend: POST /api/web/ask
+    Body: { question: string }
     """
-    body = request.get_json(silent=True) or {}
-    question = (body.get("question") or "").strip()
-    if not question:
-        return jsonify({"ok": False, "error": "question is required"}), 400
-
-    account_id = getattr(g, "account_id", None)
+    account_id = getattr(request, "account_id", None)
     if not account_id:
-        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+        return jsonify({"ok": False, "error": "missing_account_id"}), 401
 
-    payload = {
-        "account_id": account_id,
-        "question": question,
-        "lang": (body.get("lang") or "en").strip() or "en",
-        "mode": (body.get("mode") or "text").strip().lower() or "text",
-    }
+    data = _json()
+    q = (data.get("question") or "").strip()
+    if not q:
+        return jsonify({"ok": False, "error": "missing_question"}), 400
 
-    resp = ask_guarded(payload)
-    return jsonify(resp), 200
+    # Use the same core pipeline: library -> cache -> AI
+    result = ask_guarded(question=q, account_id=account_id, mode="web")
+
+    # Normalize response for frontend (stable keys)
+    if not result.get("ok"):
+        return jsonify(
+            {
+                "ok": False,
+                "error": result.get("error") or "ask_failed",
+            }
+        ), 400
+
+    return jsonify(
+        {
+            "ok": True,
+            "answer": result.get("answer"),
+            "source": result.get("source"),      # "library" | "cache" | "ai"
+            "cached": bool(result.get("cached")),# bool
+            "meta": {
+                # keep minimal + non-sensitive
+                "mode": "web",
+            },
+        }
+    )
