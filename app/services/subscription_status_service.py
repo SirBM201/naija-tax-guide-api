@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
-from app.core.supabase_client import supabase
+from ..core.supabase_client import supabase
 
 
 def _now_utc() -> datetime:
@@ -23,16 +23,9 @@ def _parse_iso(value: Optional[str]) -> Optional[datetime]:
 
 def get_subscription_status(account_id: str) -> Dict[str, Any]:
     """
-    Reads subscription from: public.user_subscriptions
-    Expected columns (typical):
-      - account_id (uuid)
-      - plan_code (text)
-      - expires_at (timestamptz)
-      - grace_until (timestamptz, optional)
-      - active (bool, optional)
-      - created_at/updated_at (optional)
+    Source of truth: public.user_subscriptions
 
-    Returns normalized object:
+    Returns:
       {
         active: bool,
         state: "active"|"grace"|"expired"|"none",
@@ -54,14 +47,16 @@ def get_subscription_status(account_id: str) -> Dict[str, Any]:
         }
 
     try:
+        db = supabase()
         res = (
-            supabase.table("user_subscriptions")
+            db.table("user_subscriptions")
             .select("*")
             .eq("account_id", account_id)
+            .order("created_at", desc=True)
             .limit(1)
             .execute()
         )
-        rows = (res.data or []) if hasattr(res, "data") else []
+        rows = getattr(res, "data", None) or []
         row = rows[0] if rows else None
     except Exception:
         row = None
@@ -78,14 +73,12 @@ def get_subscription_status(account_id: str) -> Dict[str, Any]:
 
     plan_code = row.get("plan_code")
     expires_at = row.get("expires_at")
-    grace_until = row.get("grace_until")  # may be None
-    active_flag = row.get("active")  # may be None
+    grace_until = row.get("grace_until")
 
     now = _now_utc()
     exp_dt = _parse_iso(expires_at)
     grace_dt = _parse_iso(grace_until)
 
-    # If schema has an explicit 'active' bool, respect it as a hint, but time wins.
     if exp_dt and exp_dt > now:
         return {
             "active": True,
@@ -106,7 +99,6 @@ def get_subscription_status(account_id: str) -> Dict[str, Any]:
             "reason": "within_grace",
         }
 
-    # Expired / inactive
     return {
         "active": False,
         "state": "expired",
