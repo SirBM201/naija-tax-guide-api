@@ -1,7 +1,8 @@
+# app/core/security.py
 from __future__ import annotations
 
 from functools import wraps
-from typing import Callable, Optional, Any
+from typing import Any, Callable, Optional, Tuple
 
 from flask import request, jsonify
 
@@ -9,6 +10,11 @@ from app.core.config import ADMIN_API_KEY
 
 
 def _extract_admin_key() -> str:
+    """
+    Accept admin key from:
+      - X-Admin-Key: <key>
+      - Authorization: Bearer <key>
+    """
     key = (request.headers.get("X-Admin-Key") or "").strip()
     if key:
         return key
@@ -20,11 +26,11 @@ def _extract_admin_key() -> str:
     return ""
 
 
-def _check_admin() -> Optional[tuple]:
+def _check_admin() -> Optional[Tuple[Any, int]]:
     """
     Returns:
-      None  -> OK (authorized)
-      (json, status_code) -> error response
+      None -> authorized
+      (json_response, status_code) -> not authorized / not configured
     """
     if not ADMIN_API_KEY:
         return jsonify({"ok": False, "error": "admin_key_not_configured"}), 503
@@ -36,28 +42,17 @@ def _check_admin() -> Optional[tuple]:
     return None
 
 
-def require_admin_key(fn: Callable | None = None):
+def require_admin_key(fn: Callable) -> Callable:
     """
-    Supports BOTH usages:
+    Decorator for admin-only routes.
 
-    1) As decorator:
-        @require_admin_key
-        def route(): ...
-
-    2) As inline guard:
-        guard = require_admin_key()
-        if guard: return guard
+    Usage:
+      @bp.post("/something")
+      @require_admin_key
+      def handler():
+          ...
     """
 
-    # ---------
-    # Inline guard usage: require_admin_key()
-    # ---------
-    if fn is None:
-        return _check_admin()
-
-    # ---------
-    # Decorator usage: @require_admin_key
-    # ---------
     @wraps(fn)
     def wrapper(*args: Any, **kwargs: Any):
         guard = _check_admin()
