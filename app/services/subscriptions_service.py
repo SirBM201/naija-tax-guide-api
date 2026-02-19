@@ -8,6 +8,10 @@ from app.core.supabase_client import supabase
 from app.services.plans_service import get_plan
 
 
+# -------------------------------------------------
+# Helpers
+# -------------------------------------------------
+
 def _sb():
     return supabase() if callable(supabase) else supabase
 
@@ -20,14 +24,26 @@ def _iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _parse_iso(value: str) -> Optional[datetime]:
+    try:
+        return datetime.fromisoformat((value or "").replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+# -------------------------------------------------
+# Status Lookup
+# -------------------------------------------------
+
 def get_subscription_status(
     account_id: Optional[str] = None,
     provider: Optional[str] = None,
     provider_user_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Returns a frontend-safe status object.
+    Returns subscription state for frontend/billing guard.
     """
+
     if not account_id:
         return {
             "account_id": None,
@@ -48,6 +64,7 @@ def get_subscription_status(
             .limit(1)
             .execute()
         )
+
         rows = getattr(res, "data", None) or []
         if not rows:
             return {
@@ -61,23 +78,14 @@ def get_subscription_status(
             }
 
         row = rows[0]
-        expires_at = row.get("expires_at")
-        status = (row.get("status") or "").lower()
-
-        # Best-effort parse expiry
-        exp_dt = None
-        try:
-            exp_dt = datetime.fromisoformat((expires_at or "").replace("Z", "+00:00"))
-        except Exception:
-            exp_dt = None
-
+        exp = _parse_iso(row.get("expires_at"))
         now = _now_utc()
 
-        if status == "active" and exp_dt and exp_dt > now:
+        if exp and exp > now and row.get("status") == "active":
             return {
                 "account_id": account_id,
                 "active": True,
-                "expires_at": expires_at,
+                "expires_at": row.get("expires_at"),
                 "grace_until": None,
                 "plan_code": row.get("plan_code"),
                 "reason": "active",
@@ -87,7 +95,7 @@ def get_subscription_status(
         return {
             "account_id": account_id,
             "active": False,
-            "expires_at": expires_at,
+            "expires_at": row.get("expires_at"),
             "grace_until": None,
             "plan_code": row.get("plan_code"),
             "reason": "expired_or_inactive",
@@ -106,29 +114,149 @@ def get_subscription_status(
         }
 
 
-def activate_subscription_now(account_id: str, plan_code: str, status: str = "active") -> Dict[str, Any]:
-    """
-    Sets subscription for account_id based on plan duration.
-    """
+# -------------------------------------------------
+# Core Activation Logic
+# -------------------------------------------------
+
+def _compute_expiry(plan_code: str) -> str:
     plan = get_plan(plan_code)
     if not plan:
         raise ValueError("invalid_plan")
 
-    duration_days = int(plan.get("duration_days") or 0)
-    if duration_days <= 0:
+    duration = int(plan.get("duration_days") or 0)
+    if duration <= 0:
         raise ValueError("invalid_plan_duration")
 
-    expires = _now_utc() + timedelta(days=duration_days)
+    expires = _now_utc() + timedelta(days=duration)
+    return _iso(expires)
+
+
+# -------------------------------------------------
+# Auto Activation (Paystack / webhook)
+# -------------------------------------------------
+
+def activate_subscription_now(
+    account_id: str,
+    plan_code: str,
+    status: str = "active",
+) -> Dict[str, Any]:
+
+    expires_at = _compute_expiry(plan_code)
 
     row = {
         "account_id": account_id,
-        "plan_code": plan["plan_code"],
+        "plan_code": plan_code,
         "status": status,
-        "expires_at": _iso(expires),
+        "expires_at": expires_at,
         "updated_at": _iso(_now_utc()),
     }
 
-    # Upsert by account_id (requires unique constraint in DB ideally)
-    res = _sb().table("subscriptions").upsert(row, on_conflict="account_id").execute()
+    res = (
+        _sb()
+        .table("subscriptions")
+        .upsert(row, on_conflict="account_id")
+        .execute()
+    )
+
     data = getattr(res, "data", None) or []
     return data[0] if data else row
+
+
+# -------------------------------------------------
+# Manual Activation (Admin Override)
+# -------------------------------------------------
+
+def manual_activate_subscription(
+    account_id: str,
+    plan_code: str,
+    expires_at: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Admin manual activation.
+    Used for:
+      - comp access
+      - migration users
+      - failed webhook recovery
+    """
+
+    if not expires_at:
+        expires_at = _compute_expiry(plan_code)
+
+    row = {
+        "account_id": account_id,
+        "plan_code": plan_code,
+        "status": "active",
+        "expires_at": expires_at,
+        "updated_at": _iso(_now_utc()),
+    }
+
+    res = (
+        _sb()
+        .table("subscriptions")
+        .upsert(row, on_conflict="account_id")
+        .execute()
+    )
+
+    data = getattr(res, "data", None) or []
+    return data[0] if data else row
+
+
+# -------------------------------------------------
+# Extend Subscription
+# -------------------------------------------------
+
+def extend_subscription(account_id: str, extra_days: int) -> Dict[str, Any]:
+
+    res = (
+        _sb()
+        .table("subscriptions")
+        .select("*")
+        .eq("account_id", account_id)
+        .limit(1)
+        .execute()
+    )
+
+    rows = getattr(res, "data", None) or []
+    if not rows:
+        raise ValueError("subscription_not_found")
+
+    row = rows[0]
+    current_exp = _parse_iso(row.get("expires_at")) or _now_utc()
+
+    new_exp = current_exp + timedelta(days=extra_days)
+
+    update = {
+        "expires_at": _iso(new_exp),
+        "updated_at": _iso(_now_utc()),
+    }
+
+    _sb().table("subscriptions").update(update).eq(
+        "account_id", account_id
+    ).execute()
+
+    return {
+        "account_id": account_id,
+        "expires_at": update["expires_at"],
+        "extended_days": extra_days,
+    }
+
+
+# -------------------------------------------------
+# Cancel Subscription
+# -------------------------------------------------
+
+def cancel_subscription(account_id: str) -> Dict[str, Any]:
+
+    update = {
+        "status": "cancelled",
+        "updated_at": _iso(_now_utc()),
+    }
+
+    _sb().table("subscriptions").update(update).eq(
+        "account_id", account_id
+    ).execute()
+
+    return {
+        "account_id": account_id,
+        "cancelled": True,
+    }
