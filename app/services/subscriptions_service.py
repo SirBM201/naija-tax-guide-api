@@ -1,262 +1,274 @@
 # app/services/subscriptions_service.py
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
 from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Optional
 
 from app.core.supabase_client import supabase
-from app.services.plans_service import get_plan
 
 
-# -------------------------------------------------
+# -----------------------------
 # Helpers
-# -------------------------------------------------
-
-def _sb():
-    return supabase() if callable(supabase) else supabase
-
-
+# -----------------------------
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _parse_iso(value: str | None) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        v = value.replace("Z", "+00:00")
+        return datetime.fromisoformat(v)
+    except Exception:
+        return None
 
 
 def _iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _parse_iso(value: str) -> Optional[datetime]:
-    try:
-        return datetime.fromisoformat((value or "").replace("Z", "+00:00"))
-    except Exception:
+def _sb():
+    # support both "supabase instance" and "factory"
+    return supabase() if callable(supabase) else supabase
+
+
+def _find_account_id(
+    account_id: Optional[str],
+    provider: Optional[str],
+    provider_user_id: Optional[str],
+) -> Optional[str]:
+    """
+    If account_id is given -> use it.
+    Else try to find account by (provider, provider_user_id) from accounts table.
+    """
+    if account_id:
+        v = account_id.strip()
+        return v or None
+
+    if not provider or not provider_user_id:
         return None
 
+    sb = _sb()
+    res = (
+        sb.table("accounts")
+        .select("account_id")
+        .eq("provider", provider)
+        .eq("provider_user_id", provider_user_id)
+        .limit(1)
+        .execute()
+    )
+    rows = getattr(res, "data", None) or []
+    if not rows:
+        return None
+    return (rows[0].get("account_id") or "").strip() or None
 
-# -------------------------------------------------
-# Status Lookup
-# -------------------------------------------------
 
+# -----------------------------
+# Core API
+# -----------------------------
 def get_subscription_status(
     account_id: Optional[str] = None,
     provider: Optional[str] = None,
     provider_user_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Returns subscription state for frontend/billing guard.
+    Returns a stable frontend-friendly shape.
     """
+    resolved = _find_account_id(account_id, provider, provider_user_id)
 
-    if not account_id:
-        return {
-            "account_id": None,
-            "active": False,
-            "expires_at": None,
-            "grace_until": None,
-            "plan_code": None,
-            "reason": "missing_account_id",
-            "state": "none",
-        }
+    out = {
+        "account_id": resolved,
+        "active": False,
+        "expires_at": None,
+        "grace_until": None,
+        "plan_code": None,
+        "reason": "none",
+        "state": "none",  # none|active|grace|expired
+    }
 
+    if not resolved:
+        out["reason"] = "no_account"
+        return out
+
+    sb = _sb()
     try:
         res = (
-            _sb()
-            .table("subscriptions")
-            .select("account_id,plan_code,status,expires_at")
-            .eq("account_id", account_id)
+            sb.table("subscriptions")
+            .select("account_id, plan_code, status, expires_at, grace_until, next_plan_code, updated_at")
+            .eq("account_id", resolved)
             .limit(1)
             .execute()
         )
-
         rows = getattr(res, "data", None) or []
         if not rows:
-            return {
-                "account_id": account_id,
-                "active": False,
-                "expires_at": None,
-                "grace_until": None,
-                "plan_code": None,
-                "reason": "no_subscription",
-                "state": "none",
-            }
+            out["reason"] = "no_subscription"
+            return out
 
-        row = rows[0]
-        exp = _parse_iso(row.get("expires_at"))
+        row = rows[0] or {}
+        out["plan_code"] = row.get("plan_code")
+        out["expires_at"] = row.get("expires_at")
+        out["grace_until"] = row.get("grace_until")
+
         now = _now_utc()
+        exp = _parse_iso(row.get("expires_at"))
+        grace = _parse_iso(row.get("grace_until"))
 
-        if exp and exp > now and row.get("status") == "active":
-            return {
-                "account_id": account_id,
-                "active": True,
-                "expires_at": row.get("expires_at"),
-                "grace_until": None,
-                "plan_code": row.get("plan_code"),
-                "reason": "active",
-                "state": "active",
-            }
+        if exp and now <= exp:
+            out["active"] = True
+            out["state"] = "active"
+            out["reason"] = "active"
+            return out
 
-        return {
-            "account_id": account_id,
-            "active": False,
-            "expires_at": row.get("expires_at"),
-            "grace_until": None,
-            "plan_code": row.get("plan_code"),
-            "reason": "expired_or_inactive",
-            "state": "expired",
-        }
+        # expired but still in grace window
+        if grace and now <= grace:
+            out["active"] = True
+            out["state"] = "grace"
+            out["reason"] = "grace"
+            return out
+
+        out["active"] = False
+        out["state"] = "expired"
+        out["reason"] = "expired"
+        return out
 
     except Exception:
-        return {
-            "account_id": account_id,
-            "active": False,
-            "expires_at": None,
-            "grace_until": None,
-            "plan_code": None,
-            "reason": "status_lookup_failed",
-            "state": "none",
-        }
+        out["reason"] = "status_lookup_failed"
+        return out
 
-
-# -------------------------------------------------
-# Core Activation Logic
-# -------------------------------------------------
-
-def _compute_expiry(plan_code: str) -> str:
-    plan = get_plan(plan_code)
-    if not plan:
-        raise ValueError("invalid_plan")
-
-    duration = int(plan.get("duration_days") or 0)
-    if duration <= 0:
-        raise ValueError("invalid_plan_duration")
-
-    expires = _now_utc() + timedelta(days=duration)
-    return _iso(expires)
-
-
-# -------------------------------------------------
-# Auto Activation (Paystack / webhook)
-# -------------------------------------------------
 
 def activate_subscription_now(
     account_id: str,
     plan_code: str,
     status: str = "active",
+    duration_days: Optional[int] = None,
 ) -> Dict[str, Any]:
+    """
+    Activates immediately. If duration_days is None, use defaults:
+      monthly=30, quarterly=90, yearly=365, trial=7
+    """
+    plan_code = (plan_code or "").strip().lower() or "manual"
+    now = _now_utc()
 
-    expires_at = _compute_expiry(plan_code)
+    default_days = {
+        "monthly": 30,
+        "quarterly": 90,
+        "yearly": 365,
+        "trial": 7,
+        "manual": 30,
+    }
+    days = duration_days if isinstance(duration_days, int) and duration_days > 0 else default_days.get(plan_code, 30)
+    expires_at = now + timedelta(days=days)
 
-    row = {
+    sb = _sb()
+    payload = {
         "account_id": account_id,
         "plan_code": plan_code,
         "status": status,
-        "expires_at": expires_at,
-        "updated_at": _iso(_now_utc()),
+        "expires_at": _iso(expires_at),
+        "grace_until": None,
+        "next_plan_code": None,
+        "updated_at": _iso(now),
     }
 
-    res = (
-        _sb()
-        .table("subscriptions")
-        .upsert(row, on_conflict="account_id")
-        .execute()
-    )
+    # upsert by account_id
+    res = sb.table("subscriptions").upsert(payload, on_conflict="account_id").execute()
+    rows = getattr(res, "data", None) or []
+    return rows[0] if rows else payload
 
-    data = getattr(res, "data", None) or []
-    return data[0] if data else row
-
-
-# -------------------------------------------------
-# Manual Activation (Admin Override)
-# -------------------------------------------------
 
 def manual_activate_subscription(
     account_id: str,
-    plan_code: str,
+    plan_code: str = "manual",
     expires_at: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Admin manual activation.
-    Used for:
-      - comp access
-      - migration users
-      - failed webhook recovery
+    Admin tool: set any plan_code + optional exact expiry timestamp.
     """
+    now = _now_utc()
+    exp = _parse_iso(expires_at) if expires_at else None
+    if exp is None:
+        # if not provided, default 30 days
+        exp = now + timedelta(days=30)
 
-    if not expires_at:
-        expires_at = _compute_expiry(plan_code)
-
-    row = {
+    sb = _sb()
+    payload = {
         "account_id": account_id,
-        "plan_code": plan_code,
+        "plan_code": (plan_code or "manual").strip().lower(),
         "status": "active",
-        "expires_at": expires_at,
-        "updated_at": _iso(_now_utc()),
+        "expires_at": _iso(exp),
+        "grace_until": None,
+        "next_plan_code": None,
+        "updated_at": _iso(now),
     }
+    res = sb.table("subscriptions").upsert(payload, on_conflict="account_id").execute()
+    rows = getattr(res, "data", None) or []
+    return rows[0] if rows else payload
 
+
+def start_trial_if_eligible(account_id: str, trial_plan_code: str = "trial") -> Dict[str, Any]:
+    """
+    Starts a trial only if user has no subscription row yet.
+    (You can tighten this later with a 'trial_used' flag if you want.)
+    """
+    sb = _sb()
+    try:
+        res = (
+            sb.table("subscriptions")
+            .select("account_id")
+            .eq("account_id", account_id)
+            .limit(1)
+            .execute()
+        )
+        rows = getattr(res, "data", None) or []
+        if rows:
+            return {"ok": False, "error": "trial_not_eligible", "reason": "already_has_subscription"}
+
+        sub = activate_subscription_now(account_id=account_id, plan_code=trial_plan_code, status="active", duration_days=7)
+        return {"ok": True, "subscription": sub}
+
+    except Exception:
+        return {"ok": False, "error": "trial_failed"}
+
+
+def schedule_plan_change_at_expiry(account_id: str, next_plan_code: str) -> Dict[str, Any]:
+    """
+    Stores next_plan_code on the subscription row. A cron job (or webhook verification)
+    can later apply it when expires_at is reached.
+    """
+    sb = _sb()
+    now = _now_utc()
+
+    # Ensure row exists
     res = (
-        _sb()
-        .table("subscriptions")
-        .upsert(row, on_conflict="account_id")
-        .execute()
-    )
-
-    data = getattr(res, "data", None) or []
-    return data[0] if data else row
-
-
-# -------------------------------------------------
-# Extend Subscription
-# -------------------------------------------------
-
-def extend_subscription(account_id: str, extra_days: int) -> Dict[str, Any]:
-
-    res = (
-        _sb()
-        .table("subscriptions")
-        .select("*")
+        sb.table("subscriptions")
+        .select("account_id, plan_code, status, expires_at, grace_until, next_plan_code")
         .eq("account_id", account_id)
         .limit(1)
         .execute()
     )
-
     rows = getattr(res, "data", None) or []
     if not rows:
-        raise ValueError("subscription_not_found")
+        # create a minimal row (inactive) with immediate next_plan_code
+        payload = {
+            "account_id": account_id,
+            "plan_code": None,
+            "status": "none",
+            "expires_at": None,
+            "grace_until": None,
+            "next_plan_code": (next_plan_code or "").strip().lower(),
+            "updated_at": _iso(now),
+        }
+        up = sb.table("subscriptions").upsert(payload, on_conflict="account_id").execute()
+        data = getattr(up, "data", None) or []
+        return data[0] if data else payload
 
-    row = rows[0]
-    current_exp = _parse_iso(row.get("expires_at")) or _now_utc()
-
-    new_exp = current_exp + timedelta(days=extra_days)
-
-    update = {
-        "expires_at": _iso(new_exp),
-        "updated_at": _iso(_now_utc()),
-    }
-
-    _sb().table("subscriptions").update(update).eq(
-        "account_id", account_id
-    ).execute()
-
-    return {
-        "account_id": account_id,
-        "expires_at": update["expires_at"],
-        "extended_days": extra_days,
-    }
-
-
-# -------------------------------------------------
-# Cancel Subscription
-# -------------------------------------------------
-
-def cancel_subscription(account_id: str) -> Dict[str, Any]:
-
-    update = {
-        "status": "cancelled",
-        "updated_at": _iso(_now_utc()),
-    }
-
-    _sb().table("subscriptions").update(update).eq(
-        "account_id", account_id
-    ).execute()
-
-    return {
-        "account_id": account_id,
-        "cancelled": True,
-    }
+    # update existing
+    upd = (
+        sb.table("subscriptions")
+        .update({"next_plan_code": (next_plan_code or "").strip().lower(), "updated_at": _iso(now)})
+        .eq("account_id", account_id)
+        .execute()
+    )
+    data = getattr(upd, "data", None) or []
+    return data[0] if data else rows[0]
