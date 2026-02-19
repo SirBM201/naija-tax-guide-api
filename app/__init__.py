@@ -23,22 +23,8 @@ from app.routes.cron import bp as cron_bp
 from app.routes.web_auth import bp as web_auth_bp
 from app.routes.web_session import bp as web_session_bp
 
-# ✅ web ask endpoint
-from app.routes.web_ask import bp as web_ask_bp
-
-# ✅ billing endpoint
-from app.routes.billing import bp as billing_bp
-
-# ✅ web chat endpoints (NEW)
-from app.routes.web_chat import bp as web_chat_bp
-
 from app.routes.paystack import paystack_bp
 from app.routes.paystack_webhook import bp as paystack_webhook_bp
-
-try:
-    from app.routes.telegram import bp as telegram_bp
-except Exception:
-    telegram_bp = None
 
 
 def _normalize_api_prefix(v: str) -> str:
@@ -60,6 +46,18 @@ def _parse_origins(origins_raw: str):
     return origins, True
 
 
+def _safe_import_bp(dotted: str, attr: str = "bp"):
+    """
+    Import a blueprint safely.
+    If missing, return None so the server still boots.
+    """
+    try:
+        mod = __import__(dotted, fromlist=[attr])
+        return getattr(mod, attr)
+    except Exception:
+        return None
+
+
 def create_app() -> Flask:
     app = Flask(__name__)
 
@@ -75,34 +73,19 @@ def create_app() -> Flask:
         max_age=86400,
     )
 
-    # Core
+    # Core always-on routes
     app.register_blueprint(health_bp, url_prefix=api_prefix)
     app.register_blueprint(accounts_bp, url_prefix=api_prefix)
     app.register_blueprint(subs_bp, url_prefix=api_prefix)
-
-    # Existing unified ask (kept)
     app.register_blueprint(ask_bp, url_prefix=api_prefix)
 
-    # Web auth + session
     app.register_blueprint(web_auth_bp, url_prefix=api_prefix)
     app.register_blueprint(web_session_bp, url_prefix=api_prefix)
 
-    # ✅ Token-protected web ask
-    app.register_blueprint(web_ask_bp, url_prefix=api_prefix)
-
-    # ✅ Web chat API (sessions + messages)
-    app.register_blueprint(web_chat_bp, url_prefix=api_prefix)
-
-    # ✅ Billing route needed by frontend: /api/billing/me
-    app.register_blueprint(billing_bp, url_prefix=api_prefix)
-
     app.register_blueprint(webhooks_bp, url_prefix=api_prefix)
     app.register_blueprint(plans_bp, url_prefix=api_prefix)
-
     app.register_blueprint(link_tokens_bp, url_prefix=api_prefix)
     app.register_blueprint(whatsapp_bp, url_prefix=api_prefix)
-    if telegram_bp:
-        app.register_blueprint(telegram_bp, url_prefix=api_prefix)
 
     app.register_blueprint(admin_link_tokens_bp, url_prefix=api_prefix)
     app.register_blueprint(debug_routes_bp, url_prefix=api_prefix)
@@ -110,11 +93,28 @@ def create_app() -> Flask:
     app.register_blueprint(meta_bp, url_prefix=api_prefix)
     app.register_blueprint(email_link_bp, url_prefix=api_prefix)
 
-    # Cron
+    # Cron (no /api prefix usually)
     app.register_blueprint(cron_bp)
 
     # Paystack
     app.register_blueprint(paystack_bp, url_prefix=api_prefix)
     app.register_blueprint(paystack_webhook_bp, url_prefix=api_prefix)
+
+    # OPTIONAL routes (won't crash server if missing)
+    telegram_bp = _safe_import_bp("app.routes.telegram")
+    if telegram_bp:
+        app.register_blueprint(telegram_bp, url_prefix=api_prefix)
+
+    web_ask_bp = _safe_import_bp("app.routes.web_ask")
+    if web_ask_bp:
+        app.register_blueprint(web_ask_bp, url_prefix=api_prefix)
+
+    web_chat_bp = _safe_import_bp("app.routes.web_chat")
+    if web_chat_bp:
+        app.register_blueprint(web_chat_bp, url_prefix=api_prefix)
+
+    billing_bp = _safe_import_bp("app.routes.billing")
+    if billing_bp:
+        app.register_blueprint(billing_bp, url_prefix=api_prefix)
 
     return app
