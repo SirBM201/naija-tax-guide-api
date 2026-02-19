@@ -3,9 +3,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Any, Dict, Optional, List
 
 from ..core.supabase_client import supabase
+
 
 # ============================================================
 # Time helpers
@@ -34,10 +35,8 @@ def _iso(dt: datetime) -> str:
 
 def _sb():
     try:
-        # factory style
         return supabase()
     except TypeError:
-        # direct client style
         return supabase
 
 def _table(name: str):
@@ -98,11 +97,8 @@ def _find_account_id(
 def _get_latest_subscription_row(account_id: str) -> Optional[Dict[str, Any]]:
     """
     Reads latest subscription row for account_id.
-    Tries common table/column patterns.
+    Table assumed: subscriptions
     """
-    # Common table name:
-    # - "subscriptions"
-    # You can rename if yours differs, but keep as-is for current architecture.
     try:
         res = (
             _table("subscriptions")
@@ -120,7 +116,7 @@ def _get_latest_subscription_row(account_id: str) -> Optional[Dict[str, Any]]:
 
 def _get_plan_duration_days(plan_code: str) -> Optional[int]:
     """
-    Optional: looks up duration_days from plans table (if you use it).
+    Optional: looks up duration_days from plans table (if present).
     Safe if table doesn't exist.
     """
     try:
@@ -142,7 +138,7 @@ def _get_plan_duration_days(plan_code: str) -> Optional[int]:
 
 
 # ============================================================
-# Core: status normalization (single source of truth)
+# Core: status normalization
 # ============================================================
 
 def get_subscription_status(
@@ -151,14 +147,7 @@ def get_subscription_status(
     provider_user_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Returns normalized subscription state for an account.
-    Output shape matches what frontend + ask_guarded() typically expect.
-
-    States:
-      - none: no sub row or inactive
-      - active: now <= expires_at
-      - grace: expires_at < now <= grace_until
-      - expired: now > grace_until (or expired and no grace)
+    Returns normalized subscription status.
     """
     acc_id = _find_account_id(account_id, provider, provider_user_id)
     if not acc_id:
@@ -184,7 +173,6 @@ def get_subscription_status(
             "state": "none",
         }
 
-    # Support common column names:
     plan_code = row.get("plan_code") or row.get("plan") or row.get("tier")
     active_flag = bool(row.get("active", True))
 
@@ -193,7 +181,6 @@ def get_subscription_status(
 
     now = _now_utc()
 
-    # If explicitly inactive
     if not active_flag:
         return {
             "account_id": acc_id,
@@ -205,8 +192,8 @@ def get_subscription_status(
             "state": "none",
         }
 
-    # If no expiry date, treat as none (safer than infinite access)
     if not expires_at:
+        # safer than granting infinite access
         return {
             "account_id": acc_id,
             "active": False,
@@ -228,7 +215,6 @@ def get_subscription_status(
             "state": "active",
         }
 
-    # expired but maybe within grace
     if grace_until and now <= grace_until:
         return {
             "account_id": acc_id,
@@ -240,7 +226,6 @@ def get_subscription_status(
             "state": "grace",
         }
 
-    # fully expired
     return {
         "account_id": acc_id,
         "active": False,
@@ -253,14 +238,10 @@ def get_subscription_status(
 
 
 # ============================================================
-# Optional: Trial
+# Trial
 # ============================================================
 
 def start_trial_if_eligible(account_id: str, trial_days: int = 7) -> Dict[str, Any]:
-    """
-    Activates a trial if user has no active subscription.
-    Safe implementation: only creates/updates subscription row if none exists.
-    """
     acc_id = (account_id or "").strip()
     if not acc_id:
         return {"ok": False, "error": "missing_account_id"}
@@ -285,8 +266,6 @@ def start_trial_if_eligible(account_id: str, trial_days: int = 7) -> Dict[str, A
     }
 
     try:
-        # Upsert by account_id if your schema supports it; otherwise insert.
-        # We attempt upsert first; if it fails, fallback to insert.
         try:
             _table("subscriptions").upsert(payload, on_conflict="account_id").execute()
         except Exception:
@@ -297,7 +276,7 @@ def start_trial_if_eligible(account_id: str, trial_days: int = 7) -> Dict[str, A
 
 
 # ============================================================
-# Activation after payment
+# Activation / plan change
 # ============================================================
 
 def activate_subscription_now(
@@ -308,13 +287,10 @@ def activate_subscription_now(
     source: str = "payment",
     reference: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Immediate activation after successful payment.
-    If duration_days not provided, tries plans table.
-    """
     acc_id = (account_id or "").strip()
     if not acc_id:
         return {"ok": False, "error": "missing_account_id"}
+
     plan_code = (plan_code or "").strip()
     if not plan_code:
         return {"ok": False, "error": "missing_plan_code"}
@@ -323,8 +299,7 @@ def activate_subscription_now(
         duration_days = _get_plan_duration_days(plan_code)
 
     if not duration_days:
-        # safe default to 30 days if you didn't define plans table yet
-        duration_days = 30
+        duration_days = 30  # safe default
 
     now = _now_utc()
     expires = now + timedelta(days=int(duration_days))
@@ -345,7 +320,6 @@ def activate_subscription_now(
         try:
             _table("subscriptions").upsert(payload, on_conflict="account_id").execute()
         except Exception:
-            # fallback: insert a new row (if your schema is append-only)
             payload["created_at"] = _iso(now)
             _table("subscriptions").insert(payload).execute()
 
@@ -360,15 +334,7 @@ def activate_subscription_now(
         return {"ok": False, "error": f"activate_failed: {e}"}
 
 
-def schedule_plan_change_at_expiry(
-    account_id: str,
-    new_plan_code: str,
-) -> Dict[str, Any]:
-    """
-    Stores requested plan change to be applied later by cron.
-    Safe approach: writes fields on subscription row if columns exist.
-    If your DB doesn't have these columns yet, it won't crash; it returns an error.
-    """
+def schedule_plan_change_at_expiry(account_id: str, new_plan_code: str) -> Dict[str, Any]:
     acc_id = (account_id or "").strip()
     new_plan_code = (new_plan_code or "").strip()
     if not acc_id or not new_plan_code:
@@ -393,15 +359,7 @@ def schedule_plan_change_at_expiry(
         return {"ok": False, "error": f"schedule_change_failed: {e}"}
 
 
-def manual_activate_subscription(
-    account_id: str,
-    plan_code: str,
-    duration_days: int = 30,
-    note: str = "manual",
-) -> Dict[str, Any]:
-    """
-    Admin/manual activation.
-    """
+def manual_activate_subscription(account_id: str, plan_code: str, duration_days: int = 30, note: str = "manual") -> Dict[str, Any]:
     return activate_subscription_now(
         account_id=account_id,
         plan_code=plan_code,
@@ -417,17 +375,12 @@ def manual_activate_subscription(
 # ============================================================
 
 def handle_payment_success(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Webhook bridge: extracts account_id + plan_code and activates subscription.
-    Keep this conservative: if required fields aren't present, do nothing.
-    """
     try:
         data = payload.get("data") or {}
         metadata = data.get("metadata") or {}
 
         account_id = (metadata.get("account_id") or metadata.get("user_id") or "").strip()
         plan_code = (metadata.get("plan_code") or metadata.get("plan") or "").strip()
-
         reference = (data.get("reference") or payload.get("reference") or "").strip() or None
 
         if not account_id or not plan_code:
@@ -446,63 +399,60 @@ def handle_payment_success(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ============================================================
-# CRON: expire overdue subscriptions (FIXES YOUR BOOT CRASH)
+# CRON: expire overdue subscriptions
 # ============================================================
 
-def expire_overdue_subscriptions(limit: int = 500) -> Dict[str, Any]:
+def expire_overdue_subscriptions(batch_limit: int = 500) -> Dict[str, Any]:
     """
     Called by /routes/cron.py
 
-    Goal:
-      - find subscriptions that are no longer valid (past grace_until or past expires_at if no grace)
-      - mark them inactive
+    Finds subscriptions still marked active but past grace/expires.
+    Marks them inactive.
 
-    Works even if you don't have perfect schema:
-      - if update fails, returns error but will not crash the app
+    Returns:
+      { ok, checked, expired, updated, errors? }
     """
     now = _now_utc()
     now_iso = _iso(now)
 
-    # We attempt a simple approach:
-    # 1) Pull a batch of 'active=true' subs
-    # 2) Decide which are overdue
-    # 3) Update them to active=false
+    # 1) Fetch a batch of active subs
     try:
         res = (
             _table("subscriptions")
             .select("account_id, active, expires_at, grace_until, updated_at, plan_code")
             .eq("active", True)
             .order("updated_at", desc=False)
-            .limit(int(limit))
+            .limit(int(batch_limit))
             .execute()
         )
         rows: List[Dict[str, Any]] = getattr(res, "data", None) or []
     except Exception as e:
-        return {"ok": False, "error": f"fetch_subscriptions_failed: {e}", "expired": 0}
+        return {"ok": False, "error": f"fetch_subscriptions_failed: {e}", "checked": 0, "expired": 0, "updated": 0}
 
     overdue_accounts: List[str] = []
+
     for r in rows:
+        acc = r.get("account_id")
         expires_at = _parse_iso(r.get("expires_at"))
         grace_until = _parse_iso(r.get("grace_until"))
+
+        # missing expires -> safest deactivate
         if not expires_at:
-            # If expiry is missing, safest is to deactivate
-            overdue_accounts.append(r.get("account_id"))
+            if acc:
+                overdue_accounts.append(acc)
             continue
 
         if grace_until:
-            if now > grace_until:
-                overdue_accounts.append(r.get("account_id"))
+            if now > grace_until and acc:
+                overdue_accounts.append(acc)
         else:
-            if now > expires_at:
-                overdue_accounts.append(r.get("account_id"))
-
-    overdue_accounts = [a for a in overdue_accounts if a]
+            if now > expires_at and acc:
+                overdue_accounts.append(acc)
 
     if not overdue_accounts:
-        return {"ok": True, "expired": 0, "checked": len(rows)}
+        return {"ok": True, "checked": len(rows), "expired": 0, "updated": 0}
 
-    # Bulk update (best-effort). Supabase doesn't support "IN" everywhere the same way,
-    # but `.in_()` exists in supabase-py v2.
+    # 2) Bulk update best-effort; fallback to per-row updates
     try:
         upd = (
             _table("subscriptions")
@@ -511,9 +461,13 @@ def expire_overdue_subscriptions(limit: int = 500) -> Dict[str, Any]:
             .execute()
         )
         updated_rows = getattr(upd, "data", None) or []
-        return {"ok": True, "expired": len(overdue_accounts), "updated": len(updated_rows)}
+        return {
+            "ok": True,
+            "checked": len(rows),
+            "expired": len(overdue_accounts),
+            "updated": len(updated_rows),
+        }
     except Exception as e:
-        # Fallback: update one-by-one (still safe; avoid total failure)
         success = 0
         errors: List[str] = []
         for acc in overdue_accounts:
@@ -522,4 +476,12 @@ def expire_overdue_subscriptions(limit: int = 500) -> Dict[str, Any]:
                 success += 1
             except Exception as ee:
                 errors.append(f"{acc}: {ee}")
-        return {"ok": success > 0, "expired": len(overdue_accounts), "updated": success, "errors": errors[:10]}
+
+        return {
+            "ok": success > 0,
+            "checked": len(rows),
+            "expired": len(overdue_accounts),
+            "updated": success,
+            "errors": errors[:10],
+            "bulk_error": str(e),
+        }
