@@ -1,79 +1,81 @@
 # app/core/config.py
-from __future__ import annotations
-
 import os
-
 
 def env(name: str, default: str = "") -> str:
     return (os.getenv(name, default) or default).strip()
 
+def env_bool(name: str, default: str = "0") -> bool:
+    v = env(name, default).lower()
+    return v in ("1", "true", "yes", "y", "on")
+
+def env_int(name: str, default: str = "0") -> int:
+    try:
+        return int(env(name, default) or default)
+    except Exception:
+        return int(default)
 
 # ------------------------------------------------------------
-# Core / App
+# Core
 # ------------------------------------------------------------
 ENV = env("ENV", "prod")
 PORT = int(env("PORT", "8000") or "8000")
 
-# ✅ Used by app/core/security.py -> require_admin_key
-ADMIN_API_KEY = env("ADMIN_API_KEY", "")
-
-# ✅ Used by web auth token signing (app/services/web_auth_tokens.py)
-APP_SECRET_KEY = env("APP_SECRET_KEY", "")
-
-# ✅ Access token TTL (seconds). Default: 30 days
-ACCESS_TOKEN_TTL_SECONDS = int(env("ACCESS_TOKEN_TTL_SECONDS", "2592000") or "2592000")
-
-# ✅ DEV helper: if "1"/"true"/"yes", web_auth may return OTP in response (for local dev only)
-WEB_DEV_RETURN_OTP = env("WEB_DEV_RETURN_OTP", "0").lower() in ("1", "true", "yes", "y", "on")
-
-
 # ------------------------------------------------------------
 # Routing
+# ""  -> routes at /
+# "/api" -> routes at /api
 # ------------------------------------------------------------
-# ""      -> routes at /
-# "/api"  -> routes at /api
 API_PREFIX = env("API_PREFIX", "")  # e.g. "/api"
 if API_PREFIX and not API_PREFIX.startswith("/"):
     API_PREFIX = "/" + API_PREFIX
 API_PREFIX = API_PREFIX.rstrip("/")  # normalize
-
 
 # ------------------------------------------------------------
 # CORS
 # ------------------------------------------------------------
 CORS_ORIGINS = env("CORS_ORIGINS", "*")  # comma-separated or "*"
 
-
 # ------------------------------------------------------------
 # Supabase
 # ------------------------------------------------------------
 SUPABASE_URL = env("SUPABASE_URL")
+SUPABASE_ANON_KEY = env("SUPABASE_ANON_KEY")
 SUPABASE_SERVICE_ROLE_KEY = env("SUPABASE_SERVICE_ROLE_KEY")
-SUPABASE_ANON_KEY = env("SUPABASE_ANON_KEY", "")
-
 
 # ------------------------------------------------------------
-# OpenAI (if used)
+# Admin / internal auth
 # ------------------------------------------------------------
-OPENAI_API_KEY = env("OPENAI_API_KEY", "")
-OPENAI_MODEL = env("OPENAI_MODEL", "gpt-4o-mini")
-
+ADMIN_KEY = env("ADMIN_KEY", env("INTERNAL_ADMIN_KEY", ""))
 
 # ------------------------------------------------------------
-# Web token hashing (used in app/core/auth.py)
+# Web auth/session (FIX for your ImportError)
+# These are imported by: app/core/auth.py
 # ------------------------------------------------------------
-WEB_TOKEN_PEPPER = env("WEB_TOKEN_PEPPER", "")
+WEB_AUTH_ENABLED = env_bool("WEB_AUTH_ENABLED", "1")
 
-WEB_TOKEN_TABLE = env("WEB_TOKEN_TABLE", "web_sessions")
-WEB_TOKEN_COL_TOKEN = env("WEB_TOKEN_COL_TOKEN", "token_hash")
-WEB_TOKEN_COL_ACCOUNT_ID = env("WEB_TOKEN_COL_ACCOUNT_ID", "account_id")
-WEB_TOKEN_COL_EXPIRES_AT = env("WEB_TOKEN_COL_EXPIRES_AT", "expires_at")
-WEB_TOKEN_COL_REVOKED_AT = env("WEB_TOKEN_COL_REVOKED_AT", "revoked_at")
+# Pepper used when hashing/storing web tokens (keep secret in prod)
+WEB_TOKEN_PEPPER = env("WEB_TOKEN_PEPPER", "dev_web_token_pepper_change_me")
+
+# Table where web tokens/sessions are stored (if your auth layer uses DB tokens)
+WEB_TOKEN_TABLE = env("WEB_TOKEN_TABLE", "web_tokens")
+
+# Optional: session/OTP knobs some modules may reference
+WEB_SESSION_TTL_DAYS = env_int("WEB_SESSION_TTL_DAYS", "30")
+WEB_OTP_TTL_MINUTES = env_int("WEB_OTP_TTL_MINUTES", "10")
 
 # ------------------------------------------------------------
-# Optional table names (web portal)
+# OpenAI (if used elsewhere)
 # ------------------------------------------------------------
-WEB_OTPS_TABLE = env("WEB_OTPS_TABLE", "web_otps")
-WEB_SESSIONS_TABLE = env("WEB_SESSIONS_TABLE", "web_sessions")
-WEB_CHAT_SESSIONS_TABLE = env("WEB_CHAT_SESSIONS_TABLE", "web_chat_sessions")
-WEB_CHAT_MESSAGES_TABLE = env("WEB_CHAT_MESSAGES_TABLE", "web_chat_messages")
+OPENAI_API_KEY = env("OPENAI_API_KEY", env("OPENAI_KEY", ""))
+
+# ------------------------------------------------------------
+# Paystack (if used elsewhere)
+# ------------------------------------------------------------
+PAYSTACK_SECRET_KEY = env("PAYSTACK_SECRET_KEY")
+PAYSTACK_PUBLIC_KEY = env("PAYSTACK_PUBLIC_KEY")
+PAYSTACK_WEBHOOK_SECRET = env("PAYSTACK_WEBHOOK_SECRET")
+
+# ------------------------------------------------------------
+# Misc
+# ------------------------------------------------------------
+LOG_LEVEL = env("LOG_LEVEL", "INFO")
