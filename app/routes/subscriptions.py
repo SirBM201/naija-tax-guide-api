@@ -37,10 +37,11 @@ def subscription_status():
       - account_id
       - provider
       - provider_user_id
-    Returns (frontend-safe):
+
+    Returns:
       {
         active: bool,
-        state: "none"|"active"|"expired",
+        state: "none"|"active"|"grace"|"expired",
         account_id: str|None,
         plan_code: str|None,
         expires_at: str|None,
@@ -62,10 +63,14 @@ def subscription_status():
 
 
 @bp.post("/subscription/activate")
+@require_admin_key
 def subscription_activate():
     """
     Admin-only manual activation.
-    Header: X-Admin-Key
+    Header:
+      - X-Admin-Key: <ADMIN_API_KEY>
+        OR Authorization: Bearer <ADMIN_API_KEY>
+
     Body:
       {
         "account_id": "<uuid>",
@@ -73,10 +78,6 @@ def subscription_activate():
         "expires_at": "2026-03-01T00:00:00Z"   (optional)
       }
     """
-    guard = require_admin_key()
-    if guard is not None:
-        return guard
-
     body = request.get_json(silent=True) or {}
     account_id = (body.get("account_id") or "").strip()
     plan_code = (body.get("plan_code") or "").strip() or "manual"
@@ -91,23 +92,20 @@ def subscription_activate():
             plan_code=plan_code,
             expires_at=expires_at,
         )
-        return jsonify({"ok": True, "subscription": sub, "plan_expiry": sub.get("expires_at")}), 200
+        return jsonify(
+            {"ok": True, "subscription": sub, "plan_expiry": (sub or {}).get("expires_at")}
+        ), 200
     except Exception:
-        # avoid leaking internals
         return jsonify({"ok": False, "error": "activation_failed"}), 400
 
 
 @bp.post("/subscription/trial")
+@require_admin_key
 def subscription_trial():
     """
     Admin-only trial start (for now).
-    Header: X-Admin-Key
     Body: { "account_id": "<uuid>" }
     """
-    guard = require_admin_key()
-    if guard is not None:
-        return guard
-
     body = request.get_json(silent=True) or {}
     account_id = (body.get("account_id") or "").strip()
     if not account_id:
@@ -121,10 +119,10 @@ def subscription_trial():
 
 
 @bp.post("/subscription/change")
+@require_admin_key
 def subscription_change():
     """
     Admin-only change.
-    Header: X-Admin-Key
     Body:
       {
         "account_id": "<uuid>",
@@ -132,10 +130,6 @@ def subscription_change():
         "when": "now" | "at_expiry"
       }
     """
-    guard = require_admin_key()
-    if guard is not None:
-        return guard
-
     body = request.get_json(silent=True) or {}
     account_id = (body.get("account_id") or "").strip()
     new_plan_code = (body.get("new_plan_code") or "").strip().lower()
@@ -147,10 +141,13 @@ def subscription_change():
     try:
         if when == "at_expiry":
             sub = schedule_plan_change_at_expiry(account_id=account_id, next_plan_code=new_plan_code)
-            return jsonify({"ok": True, "mode": "scheduled", "subscription": sub, "plan_expiry": sub.get("expires_at")}), 200
+            return jsonify(
+                {"ok": True, "mode": "scheduled", "subscription": sub, "plan_expiry": (sub or {}).get("expires_at")}
+            ), 200
 
         sub = activate_subscription_now(account_id=account_id, plan_code=new_plan_code, status="active")
-        return jsonify({"ok": True, "mode": "activated", "subscription": sub, "plan_expiry": sub.get("expires_at")}), 200
+        return jsonify(
+            {"ok": True, "mode": "activated", "subscription": sub, "plan_expiry": (sub or {}).get("expires_at")}
+        ), 200
     except Exception:
-        # avoid leaking internals
         return jsonify({"ok": False, "error": "change_failed"}), 400
