@@ -17,7 +17,6 @@ def expire_subscriptions():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-
 @bp.post("/internal/cron/expire-credits")
 def expire_credits():
     guard = require_admin_key()
@@ -25,7 +24,7 @@ def expire_credits():
         return guard
     try:
         res = supabase().rpc("expire_ai_credits", {}).execute()
-        data = res.data
+        data = getattr(res, "data", None)
         if isinstance(data, list):
             data = data[0] if data else {}
         return jsonify({"ok": True, "result": data}), 200
