@@ -3,8 +3,8 @@ from __future__ import annotations
 
 from flask import Blueprint, jsonify, request
 
-from ..core.security import require_admin_key
-from ..services.subscriptions_service import (
+from app.core.security import require_admin_key
+from app.services.subscriptions_service import (
     get_subscription_status,
     manual_activate_subscription,
     start_trial_if_eligible,
@@ -38,7 +38,7 @@ def subscription_status():
       - provider
       - provider_user_id
 
-    Returns:
+    Returns (frontend-safe):
       {
         active: bool,
         state: "none"|"active"|"grace"|"expired",
@@ -46,6 +46,7 @@ def subscription_status():
         plan_code: str|None,
         expires_at: str|None,
         plan_expiry: str|None,
+        grace_until: str|None,
         reason: str
       }
     """
@@ -67,9 +68,7 @@ def subscription_status():
 def subscription_activate():
     """
     Admin-only manual activation.
-    Header:
-      - X-Admin-Key: <ADMIN_API_KEY>
-        OR Authorization: Bearer <ADMIN_API_KEY>
+    Header: X-Admin-Key or Authorization: Bearer <ADMIN_API_KEY>
 
     Body:
       {
@@ -92,9 +91,7 @@ def subscription_activate():
             plan_code=plan_code,
             expires_at=expires_at,
         )
-        return jsonify(
-            {"ok": True, "subscription": sub, "plan_expiry": (sub or {}).get("expires_at")}
-        ), 200
+        return jsonify({"ok": True, "subscription": sub, "plan_expiry": sub.get("expires_at")}), 200
     except Exception:
         return jsonify({"ok": False, "error": "activation_failed"}), 400
 
@@ -103,7 +100,9 @@ def subscription_activate():
 @require_admin_key
 def subscription_trial():
     """
-    Admin-only trial start (for now).
+    Admin-only trial start.
+    Header: X-Admin-Key or Authorization: Bearer <ADMIN_API_KEY>
+
     Body: { "account_id": "<uuid>" }
     """
     body = request.get_json(silent=True) or {}
@@ -122,7 +121,9 @@ def subscription_trial():
 @require_admin_key
 def subscription_change():
     """
-    Admin-only change.
+    Admin-only change plan.
+    Header: X-Admin-Key or Authorization: Bearer <ADMIN_API_KEY>
+
     Body:
       {
         "account_id": "<uuid>",
@@ -141,13 +142,29 @@ def subscription_change():
     try:
         if when == "at_expiry":
             sub = schedule_plan_change_at_expiry(account_id=account_id, next_plan_code=new_plan_code)
-            return jsonify(
-                {"ok": True, "mode": "scheduled", "subscription": sub, "plan_expiry": (sub or {}).get("expires_at")}
-            ), 200
+            return (
+                jsonify(
+                    {
+                        "ok": True,
+                        "mode": "scheduled",
+                        "subscription": sub,
+                        "plan_expiry": sub.get("expires_at"),
+                    }
+                ),
+                200,
+            )
 
         sub = activate_subscription_now(account_id=account_id, plan_code=new_plan_code, status="active")
-        return jsonify(
-            {"ok": True, "mode": "activated", "subscription": sub, "plan_expiry": (sub or {}).get("expires_at")}
-        ), 200
+        return (
+            jsonify(
+                {
+                    "ok": True,
+                    "mode": "activated",
+                    "subscription": sub,
+                    "plan_expiry": sub.get("expires_at"),
+                }
+            ),
+            200,
+        )
     except Exception:
         return jsonify({"ok": False, "error": "change_failed"}), 400
