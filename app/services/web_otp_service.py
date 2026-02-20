@@ -1,4 +1,3 @@
-# app/services/web_otp_service.py
 from __future__ import annotations
 
 import os
@@ -7,22 +6,20 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 from ..core.supabase_client import supabase
+from .mail_service import send_otp_email   # ← NEW
 
 
 # ------------------------------------------------------------
 # Config
 # ------------------------------------------------------------
 
-# If disabled, OTP works in stub mode to keep web login moving.
 WEB_OTP_ENABLED = (os.getenv("WEB_OTP_ENABLED", "0").strip() == "1")
 
 WEB_OTP_TTL_MINUTES = int((os.getenv("WEB_OTP_TTL_MINUTES", "10") or "10").strip())
 WEB_OTP_LEN = int((os.getenv("WEB_OTP_LEN", "6") or "6").strip())
 
-# For stub/dev testing (when WEB_OTP_ENABLED=0)
 WEB_OTP_STUB_CODE = (os.getenv("WEB_OTP_STUB_CODE", "123456") or "123456").strip()
 
-# Session token TTL (how long web session stays valid after login)
 WEB_SESSION_TTL_DAYS = int((os.getenv("WEB_SESSION_TTL_DAYS", "30") or "30").strip())
 
 
@@ -57,6 +54,9 @@ def _table(name: str):
 def _clean(s: Any) -> str:
     return (s or "").strip()
 
+def _is_email(contact: str) -> bool:
+    return "@" in contact and "." in contact
+
 def _gen_otp() -> str:
     low = 10 ** (WEB_OTP_LEN - 1)
     high = (10 ** WEB_OTP_LEN) - 1
@@ -64,49 +64,53 @@ def _gen_otp() -> str:
 
 
 # ------------------------------------------------------------
-# Public API (MUST match app/routes/web_auth.py)
+# PUBLIC API
 # ------------------------------------------------------------
 
 def request_web_login_otp(contact: str, purpose: str = "web_login") -> Dict[str, Any]:
-    """
-    Generates + stores OTP for a web login flow.
 
-    Expected by routes:
-      request_web_login_otp(contact=..., purpose=...)
-
-    Returns (DEV friendly):
-      { ok: True, dev_otp?: "123456" }
-
-    In prod, route never returns dev_otp anyway (your web_auth.py enforces that).
-    """
     contact = _clean(contact)
     purpose = _clean(purpose) or "web_login"
+
     if not contact:
         return {"ok": False, "error": "missing_contact"}
 
-    # Stub mode (no OTP infrastructure required)
+    # ---------------- STUB MODE ----------------
     if not WEB_OTP_ENABLED:
-        _best_effort_store_otp(contact=contact, purpose=purpose, otp=WEB_OTP_STUB_CODE)
-        return {"ok": True, "mode": "stub", "dev_otp": WEB_OTP_STUB_CODE, "ttl_minutes": WEB_OTP_TTL_MINUTES}
+        _best_effort_store_otp(contact, purpose, WEB_OTP_STUB_CODE)
+        return {
+            "ok": True,
+            "mode": "stub",
+            "dev_otp": WEB_OTP_STUB_CODE,
+            "ttl_minutes": WEB_OTP_TTL_MINUTES,
+        }
 
+    # ---------------- REAL MODE ----------------
     otp = _gen_otp()
-    _best_effort_store_otp(contact=contact, purpose=purpose, otp=otp)
 
-    # In a real deployment, you'd send OTP via SMS/WhatsApp here.
-    # This service intentionally only generates/stores to keep it modular.
-    return {"ok": True, "mode": "real", "ttl_minutes": WEB_OTP_TTL_MINUTES}
+    _best_effort_store_otp(contact, purpose, otp)
+
+    # ---------- SEND EMAIL ----------
+    if _is_email(contact):
+        sent = send_otp_email(contact, otp)
+
+        if sent:
+            print(f"[otp] Email OTP sent → {contact}")
+        else:
+            print(f"[otp] Email OTP FAILED → {contact}")
+
+    else:
+        print(f"[otp] Non-email contact → SMS/WA not yet wired")
+
+    return {
+        "ok": True,
+        "mode": "real",
+        "ttl_minutes": WEB_OTP_TTL_MINUTES,
+    }
 
 
 def verify_web_login_otp(contact: str, otp: str, purpose: str = "web_login") -> Dict[str, Any]:
-    """
-    Verifies OTP and returns a web session token.
 
-    Expected by routes:
-      verify_web_login_otp(contact=..., otp=..., purpose=...)
-
-    Returns:
-      { ok: True, token: "...", account_id?: "...", mode: "stub"|"real" }
-    """
     contact = _clean(contact)
     otp = _clean(otp)
     purpose = _clean(purpose) or "web_login"
@@ -114,14 +118,17 @@ def verify_web_login_otp(contact: str, otp: str, purpose: str = "web_login") -> 
     if not contact or not otp:
         return {"ok": False, "error": "missing_contact_or_otp"}
 
-    # Stub mode (accept fixed OTP)
+    # ---------------- STUB MODE ----------------
     if not WEB_OTP_ENABLED:
         if otp != WEB_OTP_STUB_CODE:
             return {"ok": False, "error": "invalid_otp"}
-        token = _issue_web_session_token(contact=contact)
+
+        token = _issue_web_session_token(contact)
         return {"ok": True, "mode": "stub", "token": token}
 
-    rec = _best_effort_get_latest_otp(contact=contact, purpose=purpose)
+    # ---------------- REAL MODE ----------------
+    rec = _best_effort_get_latest_otp(contact, purpose)
+
     if not rec:
         return {"ok": False, "error": "otp_not_found"}
 
@@ -139,20 +146,19 @@ def verify_web_login_otp(contact: str, otp: str, purpose: str = "web_login") -> 
 
     _best_effort_mark_otp_used(rec)
 
-    token = _issue_web_session_token(contact=contact)
+    token = _issue_web_session_token(contact)
+
     return {"ok": True, "mode": "real", "token": token}
 
 
 # ------------------------------------------------------------
-# Storage (best effort - never crash boot)
-# Recommended tables:
-#   web_otps(contact, purpose, otp, expires_at, used_at, created_at)
-#   web_sessions(token, contact, account_id, expires_at, created_at, last_seen_at, revoked_at)
+# STORAGE
 # ------------------------------------------------------------
 
 def _best_effort_store_otp(contact: str, purpose: str, otp: str) -> None:
+
     now = _now_utc()
-    expires = now + timedelta(minutes=max(1, int(WEB_OTP_TTL_MINUTES)))
+    expires = now + timedelta(minutes=WEB_OTP_TTL_MINUTES)
 
     payload = {
         "contact": contact,
@@ -164,11 +170,12 @@ def _best_effort_store_otp(contact: str, purpose: str, otp: str) -> None:
 
     try:
         _table("web_otps").insert(payload).execute()
-    except Exception:
-        return
+    except Exception as e:
+        print(f"[otp] store error → {e}")
 
 
-def _best_effort_get_latest_otp(contact: str, purpose: str) -> Optional[Dict[str, Any]]:
+def _best_effort_get_latest_otp(contact: str, purpose: str):
+
     try:
         res = (
             _table("web_otps")
@@ -180,29 +187,36 @@ def _best_effort_get_latest_otp(contact: str, purpose: str) -> Optional[Dict[str
             .limit(1)
             .execute()
         )
+
         rows = getattr(res, "data", None) or []
         return rows[0] if rows else None
-    except Exception:
+
+    except Exception as e:
+        print(f"[otp] fetch error → {e}")
         return None
 
 
-def _best_effort_mark_otp_used(rec: Dict[str, Any]) -> None:
+def _best_effort_mark_otp_used(rec):
+
     try:
         rec_id = rec.get("id")
         if not rec_id:
             return
-        _table("web_otps").update({"used_at": _iso(_now_utc())}).eq("id", rec_id).execute()
-    except Exception:
-        return
+
+        _table("web_otps").update(
+            {"used_at": _iso(_now_utc())}
+        ).eq("id", rec_id).execute()
+
+    except Exception as e:
+        print(f"[otp] mark used error → {e}")
 
 
 def _issue_web_session_token(contact: str) -> str:
-    """
-    Creates a web session token and stores in web_sessions best-effort.
-    """
+
     token = os.urandom(24).hex()
+
     now = _now_utc()
-    expires = now + timedelta(days=max(1, int(WEB_SESSION_TTL_DAYS)))
+    expires = now + timedelta(days=WEB_SESSION_TTL_DAYS)
 
     payload = {
         "token": token,
@@ -214,8 +228,7 @@ def _issue_web_session_token(contact: str) -> str:
 
     try:
         _table("web_sessions").insert(payload).execute()
-    except Exception:
-        # Still return token; validation service can be strict later
-        pass
+    except Exception as e:
+        print(f"[session] store error → {e}")
 
     return token
