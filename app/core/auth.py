@@ -43,9 +43,14 @@ def _get_bearer_token() -> Optional[str]:
 def require_auth_plus(fn: Callable[..., Any]) -> Callable[..., Any]:
     """
     Validates web session tokens stored in WEB_TOKEN_TABLE.
+
+    Expects:
+      Authorization: Bearer <raw_token>
+
     Sets:
-      g.account_id = <uuid string from web_tokens.account_id>
-      g.web_token_hash = <hashed token>
+      g.account_id      = <uuid string from web_tokens.account_id>
+      g.web_token_hash  = <hashed token>
+      g.web_token_id    = <row id from web_tokens (if available)>
     """
     @wraps(fn)
     def wrapper(*args, **kwargs):
@@ -56,43 +61,48 @@ def require_auth_plus(fn: Callable[..., Any]) -> Callable[..., Any]:
         th = _token_hash(raw)
 
         try:
+            # Important: explicitly filter revoked=false so we don't accept revoked tokens
             res = (
                 _sb()
                 .table(WEB_TOKEN_TABLE)
-                .select("account_id, expires_at, revoked")
+                .select("id, account_id, expires_at, revoked")
                 .eq("token_hash", th)
+                .eq("revoked", False)
                 .limit(1)
                 .execute()
             )
+
             rows = res.data or []
             if not rows:
                 return jsonify({"ok": False, "error": "invalid_token"}), 401
 
             row = rows[0]
-            if row.get("revoked") is True:
-                return jsonify({"ok": False, "error": "token_revoked"}), 401
 
+            # Expiry check
             expires_at = row.get("expires_at")
             if expires_at:
-                # Supabase may return ISO string with Z / offset
                 v = str(expires_at).replace("Z", "+00:00")
                 exp_dt = datetime.fromisoformat(v)
                 if _now_utc() > exp_dt.astimezone(timezone.utc):
                     return jsonify({"ok": False, "error": "token_expired"}), 401
 
-            # touch last_seen_at best-effort (won't break auth if column missing)
+            # Touch last_seen_at best-effort (won't break auth if column missing)
             try:
                 _sb().table(WEB_TOKEN_TABLE).update(
                     {"last_seen_at": _now_utc().isoformat()}
-                ).eq("token_hash", th).execute()
+                ).eq("id", row.get("id")).execute()
             except Exception:
                 pass
 
             g.account_id = row.get("account_id")
             g.web_token_hash = th
+            g.web_token_id = row.get("id")
+
             return fn(*args, **kwargs)
 
-        except Exception:
-            return jsonify({"ok": False, "error": "auth_failed"}), 401
+        except Exception as e:
+            # Keep 500 so you can see real server errors during debugging
+            print("[require_auth_plus] error:", str(e))
+            return jsonify({"ok": False, "error": "auth_failed"}), 500
 
     return wrapper
