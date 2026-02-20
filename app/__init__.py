@@ -6,24 +6,6 @@ from flask_cors import CORS
 
 from app.core.config import API_PREFIX, CORS_ORIGINS
 
-from app.routes.health import bp as health_bp
-from app.routes.accounts import bp as accounts_bp
-from app.routes.subscriptions import bp as subs_bp
-from app.routes.ask import bp as ask_bp
-from app.routes.webhooks import bp as webhooks_bp
-from app.routes.plans import bp as plans_bp
-from app.routes.link_tokens import bp as link_tokens_bp
-from app.routes.whatsapp import bp as whatsapp_bp
-from app.routes.admin_link_tokens import bp as admin_link_tokens_bp
-from app.routes.debug_routes import bp as debug_routes_bp
-from app.routes.accounts_admin import bp as accounts_admin_bp
-from app.routes.meta import bp as meta_bp
-from app.routes.email_link import bp as email_link_bp
-from app.routes.cron import bp as cron_bp
-
-from app.routes.paystack import paystack_bp
-from app.routes.paystack_webhook import bp as paystack_webhook_bp
-
 
 def _normalize_api_prefix(v: str) -> str:
     v = (v or "").strip()
@@ -45,10 +27,16 @@ def _parse_origins(origins_raw: str):
 
 
 def _safe_import_bp(dotted: str, attr: str = "bp"):
+    """
+    Import a blueprint safely.
+    If missing or import fails, return None so the server still boots.
+    """
     try:
         mod = __import__(dotted, fromlist=[attr])
         return getattr(mod, attr)
-    except Exception:
+    except Exception as e:
+        # Optional: print for easier debugging on Koyeb logs
+        print(f"[boot] optional import failed: {dotted}:{attr} -> {e}")
         return None
 
 
@@ -67,54 +55,52 @@ def create_app() -> Flask:
         max_age=86400,
     )
 
-    # Always-on routes
-    app.register_blueprint(health_bp, url_prefix=api_prefix)
-    app.register_blueprint(accounts_bp, url_prefix=api_prefix)
-    app.register_blueprint(subs_bp, url_prefix=api_prefix)
-    app.register_blueprint(ask_bp, url_prefix=api_prefix)
+    # -----------------------------
+    # REQUIRED / CORE BLUEPRINTS
+    # -----------------------------
+    for dotted in [
+        "app.routes.health",
+        "app.routes.accounts",
+        "app.routes.subscriptions",
+        "app.routes.ask",
+        "app.routes.webhooks",
+        "app.routes.plans",
+        "app.routes.link_tokens",
+        "app.routes.whatsapp",
+        "app.routes.admin_link_tokens",
+        "app.routes.debug_routes",
+        "app.routes.accounts_admin",
+        "app.routes.meta",
+        "app.routes.email_link",
+        "app.routes.web_auth",
+        "app.routes.web_session",
+        "app.routes.paystack_webhook",
+    ]:
+        bp = _safe_import_bp(dotted, "bp")
+        if bp:
+            app.register_blueprint(bp, url_prefix=api_prefix)
 
-    app.register_blueprint(webhooks_bp, url_prefix=api_prefix)
-    app.register_blueprint(plans_bp, url_prefix=api_prefix)
-    app.register_blueprint(link_tokens_bp, url_prefix=api_prefix)
-    app.register_blueprint(whatsapp_bp, url_prefix=api_prefix)
+    # paystack_bp is named differently in your project
+    paystack_bp = _safe_import_bp("app.routes.paystack", "paystack_bp")
+    if paystack_bp:
+        app.register_blueprint(paystack_bp, url_prefix=api_prefix)
 
-    app.register_blueprint(admin_link_tokens_bp, url_prefix=api_prefix)
-    app.register_blueprint(debug_routes_bp, url_prefix=api_prefix)
-    app.register_blueprint(accounts_admin_bp, url_prefix=api_prefix)
-    app.register_blueprint(meta_bp, url_prefix=api_prefix)
-    app.register_blueprint(email_link_bp, url_prefix=api_prefix)
+    # Cron (no /api prefix usually)
+    cron_bp = _safe_import_bp("app.routes.cron", "bp")
+    if cron_bp:
+        app.register_blueprint(cron_bp)
 
-    # Cron (no /api prefix)
-    app.register_blueprint(cron_bp)
-
-    # Paystack
-    app.register_blueprint(paystack_bp, url_prefix=api_prefix)
-    app.register_blueprint(paystack_webhook_bp, url_prefix=api_prefix)
-
-    # OPTIONAL web auth/session (won't crash boot if broken)
-    web_auth_bp = _safe_import_bp("app.routes.web_auth")
-    if web_auth_bp:
-        app.register_blueprint(web_auth_bp, url_prefix=api_prefix)
-
-    web_session_bp = _safe_import_bp("app.routes.web_session")
-    if web_session_bp:
-        app.register_blueprint(web_session_bp, url_prefix=api_prefix)
-
-    # Other OPTIONAL routes
-    telegram_bp = _safe_import_bp("app.routes.telegram")
-    if telegram_bp:
-        app.register_blueprint(telegram_bp, url_prefix=api_prefix)
-
-    web_ask_bp = _safe_import_bp("app.routes.web_ask")
-    if web_ask_bp:
-        app.register_blueprint(web_ask_bp, url_prefix=api_prefix)
-
-    web_chat_bp = _safe_import_bp("app.routes.web_chat")
-    if web_chat_bp:
-        app.register_blueprint(web_chat_bp, url_prefix=api_prefix)
-
-    billing_bp = _safe_import_bp("app.routes.billing")
-    if billing_bp:
-        app.register_blueprint(billing_bp, url_prefix=api_prefix)
+    # -----------------------------
+    # OPTIONAL BLUEPRINTS
+    # -----------------------------
+    for dotted in [
+        "app.routes.telegram",
+        "app.routes.web_ask",
+        "app.routes.web_chat",
+        "app.routes.billing",
+    ]:
+        bp = _safe_import_bp(dotted, "bp")
+        if bp:
+            app.register_blueprint(bp, url_prefix=api_prefix)
 
     return app
