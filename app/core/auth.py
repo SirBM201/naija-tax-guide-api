@@ -12,6 +12,10 @@ from app.core.config import WEB_AUTH_ENABLED, WEB_TOKEN_PEPPER, WEB_TOKEN_TABLE
 from app.core.supabase_client import supabase
 
 
+# -----------------------------
+# Time / helpers
+# -----------------------------
+
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -48,16 +52,17 @@ def _token_hash(raw_token: str) -> str:
 
 
 def _sb():
-    # supports supabase being either a client instance OR a factory
+    # supabase can be either a client instance OR a callable factory
     return supabase() if callable(supabase) else supabase
 
 
+# -----------------------------
+# Session validation
+# -----------------------------
+
 def validate_web_session(raw_token: str) -> Tuple[bool, Optional[str], str]:
     """
-    Validates a web session token.
-
-    Returns:
-      (ok, account_id, reason)
+    Return: (ok, account_id, reason)
     """
     if not WEB_AUTH_ENABLED:
         return False, None, "web_auth_disabled"
@@ -89,7 +94,7 @@ def validate_web_session(raw_token: str) -> Tuple[bool, Optional[str], str]:
 
     exp = _parse_iso(row.get("expires_at") or "")
     if not exp or _now_utc() > exp:
-        # best-effort revoke expired token
+        # revoke expired session best-effort
         try:
             _sb().table(WEB_TOKEN_TABLE).update({"revoked": True}).eq("id", row.get("id")).execute()
         except Exception:
@@ -100,32 +105,34 @@ def validate_web_session(raw_token: str) -> Tuple[bool, Optional[str], str]:
 
 
 def touch_session_best_effort(raw_token: str) -> None:
-    """Best-effort last_seen_at update."""
+    """Best-effort: update last_seen_at without breaking requests."""
     if not raw_token:
         return
     try:
         token_hash = _token_hash(raw_token)
-        _sb().table(WEB_TOKEN_TABLE).update({"last_seen_at": _now_utc().isoformat()}).eq(
-            "token_hash", token_hash
-        ).execute()
+        _sb().table(WEB_TOKEN_TABLE).update(
+            {"last_seen_at": _now_utc().isoformat().replace("+00:00", "Z")}
+        ).eq("token_hash", token_hash).execute()
     except Exception:
         return
 
 
-# Backwards compatible alias (some routes may call touch_session)
+# Backward-friendly alias (some files may call touch_session())
 def touch_session(raw_token: str) -> None:
     touch_session_best_effort(raw_token)
 
 
+# -----------------------------
+# Decorators
+# -----------------------------
+
 def require_auth_plus(fn: Callable) -> Callable:
     """
-    Flask decorator:
-    - Reads Authorization: Bearer <token>
-    - Validates token against WEB_TOKEN_TABLE
-    - Sets:
-        g.web_token
-        g.account_id
+    Flask decorator: validates bearer token and sets:
+      g.account_id
+      g.web_token
     """
+
     @wraps(fn)
     def wrapper(*args, **kwargs):
         auth = request.headers.get("Authorization", "")
@@ -139,6 +146,33 @@ def require_auth_plus(fn: Callable) -> Callable:
         g.account_id = account_id
 
         touch_session_best_effort(raw_token)
+
         return fn(*args, **kwargs)
+
+    return wrapper
+
+
+def require_web_auth(fn: Callable) -> Callable:
+    """
+    Compatibility decorator for modules that previously expected require_web_auth(ctx).
+    This version acts as normal Flask decorator and passes ctx as first arg.
+    """
+
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        auth = request.headers.get("Authorization", "")
+        raw_token = _normalize_bearer(auth)
+
+        ok, account_id, reason = validate_web_session(raw_token)
+        if not ok or not account_id:
+            return jsonify({"ok": False, "error": reason}), 401
+
+        ctx = {"account_id": account_id, "token": raw_token}
+        g.web_token = raw_token
+        g.account_id = account_id
+
+        touch_session_best_effort(raw_token)
+
+        return fn(ctx, *args, **kwargs)
 
     return wrapper
