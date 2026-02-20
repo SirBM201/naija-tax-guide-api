@@ -10,23 +10,18 @@ from typing import Any, Dict, Optional
 from flask import Blueprint, jsonify, request, g
 
 from app.core.supabase_client import supabase
-from app.core.auth import require_auth_plus  # validates sessions in web_tokens
+from app.core.auth import require_auth_plus  # validates sessions in WEB_TOKEN_TABLE
 from app.core.config import (
-    ENV,
     WEB_AUTH_ENABLED,
-    WEB_AUTH_DEBUG,
-    WEB_DEV_RETURN_OTP,
-    WEB_OTP_PEPPER,
-    WEB_OTP_TABLE,
-    WEB_OTP_TTL_MINUTES,
-    WEB_SESSION_TTL_DAYS,
-    WEB_TOKEN_PEPPER,
     WEB_TOKEN_TABLE,
+    WEB_TOKEN_PEPPER,
 )
 
 bp = Blueprint("web_auth", __name__)
 
-
+# -----------------------------
+# Helpers
+# -----------------------------
 def _sb():
     return supabase() if callable(supabase) else supabase
 
@@ -43,11 +38,19 @@ def _truthy(v: str) -> bool:
     return (v or "").strip().lower() in ("1", "true", "yes", "y", "on")
 
 
-# -----------------------------
-# Column mapping (OTP table)
-# Your web_otps columns:
-# id, contact, purpose, code_hash, code_plain, phone_e164, otp_code, used, expires_at, used_at, created_at
-# -----------------------------
+ENV = _env("ENV", "prod").lower()
+WEB_AUTH_DEBUG = _truthy(_env("WEB_AUTH_DEBUG", "0"))
+
+WEB_OTP_TABLE = _env("WEB_OTP_TABLE", "web_otps")
+WEB_OTP_PEPPER = _env("WEB_OTP_PEPPER", WEB_TOKEN_PEPPER)
+WEB_SESSION_TTL_DAYS = int(_env("WEB_SESSION_TTL_DAYS", "30") or "30")
+WEB_OTP_TTL_MINUTES = int(_env("WEB_OTP_TTL_MINUTES", "10") or "10")
+
+# Optional: whether to return OTP in response (dev/testing)
+WEB_DEV_RETURN_OTP = _truthy(_env("WEB_DEV_RETURN_OTP", "0")) or (ENV == "dev")
+
+# --- Column mapping (match your Supabase schema) ---
+# Your table shows: code_hash, code_plain, phone_e164, otp_code, used, expires_at, created_at, used_at
 OTP_COL_CONTACT = _env("WEB_OTP_COL_CONTACT", "contact")
 OTP_COL_PURPOSE = _env("WEB_OTP_COL_PURPOSE", "purpose")
 OTP_COL_CODE_HASH = _env("WEB_OTP_COL_CODE_HASH", "code_hash")
@@ -57,19 +60,6 @@ OTP_COL_OTP_CODE = _env("WEB_OTP_COL_OTP_CODE", "otp_code")
 OTP_COL_EXPIRES_AT = _env("WEB_OTP_COL_EXPIRES_AT", "expires_at")
 OTP_COL_USED = _env("WEB_OTP_COL_USED", "used")
 OTP_COL_USED_AT = _env("WEB_OTP_COL_USED_AT", "used_at")
-OTP_COL_CREATED_AT = _env("WEB_OTP_COL_CREATED_AT", "created_at")
-
-# -----------------------------
-# Column mapping (Accounts table)
-# IMPORTANT: your table uses id (uuid), not account_id
-# -----------------------------
-ACC_TABLE = _env("WEB_ACCOUNTS_TABLE", "accounts")
-ACC_COL_ID = _env("WEB_ACCOUNTS_COL_ID", "id")  # uuid PK
-ACC_COL_PROVIDER = _env("WEB_ACCOUNTS_COL_PROVIDER", "provider")
-ACC_COL_PROVIDER_USER_ID = _env("WEB_ACCOUNTS_COL_PROVIDER_USER_ID", "provider_user_id")
-ACC_COL_DISPLAY_NAME = _env("WEB_ACCOUNTS_COL_DISPLAY_NAME", "display_name")
-ACC_COL_PHONE = _env("WEB_ACCOUNTS_COL_PHONE", "phone")
-ACC_COL_CREATED_AT = _env("WEB_ACCOUNTS_COL_CREATED_AT", "created_at")
 
 
 def _sha256_hex(s: str) -> str:
@@ -77,10 +67,12 @@ def _sha256_hex(s: str) -> str:
 
 
 def _otp_hash(contact: str, purpose: str, otp: str) -> str:
+    # peppered hash; ties OTP to contact+purpose
     return _sha256_hex(f"{WEB_OTP_PEPPER}:{contact}:{purpose}:{otp}")
 
 
 def _token_hash(raw_token: str) -> str:
+    # MUST match app/core/auth.py
     return _sha256_hex(f"{WEB_TOKEN_PEPPER}:{raw_token}")
 
 
@@ -121,58 +113,66 @@ def _extract_supabase_error(e: Exception) -> Dict[str, Any]:
 
 def _upsert_account_for_contact(contact: str) -> Optional[str]:
     """
-    Ensure an account exists for this contact and return the accounts.id (UUID as string).
-    Uses (provider='web', provider_user_id=<contact>) to find/create.
+    Ensure an account exists for this contact and return account_id.
+    IMPORTANT: account_id must be UUID if your DB expects UUID.
     """
     try:
         res = (
             _sb()
-            .table(ACC_TABLE)
-            .select(ACC_COL_ID)
-            .eq(ACC_COL_PROVIDER, "web")
-            .eq(ACC_COL_PROVIDER_USER_ID, contact)
+            .table("accounts")
+            .select("account_id")
+            .eq("provider", "web")
+            .eq("provider_user_id", contact)
             .limit(1)
             .execute()
         )
         rows = (res.data or []) if hasattr(res, "data") else []
-        if rows:
-            return rows[0].get(ACC_COL_ID)
+        if rows and rows[0].get("account_id"):
+            return rows[0]["account_id"]
 
-        ins = (
-            _sb()
-            .table(ACC_TABLE)
-            .insert(
-                {
-                    ACC_COL_PROVIDER: "web",
-                    ACC_COL_PROVIDER_USER_ID: contact,
-                    ACC_COL_DISPLAY_NAME: contact,
-                    ACC_COL_PHONE: contact,
-                }
-            )
-            .execute()
-        )
-        new_rows = (ins.data or []) if hasattr(ins, "data") else []
-        if new_rows and new_rows[0].get(ACC_COL_ID):
-            return new_rows[0].get(ACC_COL_ID)
+        # Generate UUID in Postgres-friendly format
+        # We avoid token_hex here because many schemas set account_id UUID.
+        account_id = str(secrets.token_hex(16))
+        # If your accounts.account_id is UUID, this MUST be a UUID value.
+        # Best practice: let DB generate UUID default. If you have default, omit account_id.
+        payload = {
+            "provider": "web",
+            "provider_user_id": contact,
+            "display_name": contact,
+            "phone": contact,
+        }
 
-        # If insert returns empty, do a lookup again (some configs don't return rows)
+        # If your accounts table auto-generates UUID, DO NOT send account_id.
+        # If it does NOT auto-generate, you must provide a real UUID.
+        # We'll try insert WITHOUT account_id first (works with default uuid_generate_v4()).
+        try:
+            ins = _sb().table("accounts").insert(payload).execute()
+            ins_rows = (ins.data or []) if hasattr(ins, "data") else []
+            if ins_rows and ins_rows[0].get("account_id"):
+                return ins_rows[0]["account_id"]
+        except Exception:
+            pass
+
+        # Fallback: attempt to fetch again (in case it inserted but response didn't include columns)
         res2 = (
             _sb()
-            .table(ACC_TABLE)
-            .select(ACC_COL_ID)
-            .eq(ACC_COL_PROVIDER, "web")
-            .eq(ACC_COL_PROVIDER_USER_ID, contact)
+            .table("accounts")
+            .select("account_id")
+            .eq("provider", "web")
+            .eq("provider_user_id", contact)
             .limit(1)
             .execute()
         )
         rows2 = (res2.data or []) if hasattr(res2, "data") else []
-        return rows2[0].get(ACC_COL_ID) if rows2 else None
+        return rows2[0].get("account_id") if rows2 else None
 
-    except Exception as e:
-        print(f"[web_auth] _upsert_account_for_contact failed: {_extract_supabase_error(e)}")
+    except Exception:
         return None
 
 
+# -----------------------------
+# Routes
+# -----------------------------
 @bp.post("/request-otp")
 @bp.post("/web/auth/request-otp")
 def request_otp():
@@ -186,21 +186,19 @@ def request_otp():
     if not contact:
         return jsonify({"ok": False, "error": "missing_contact"}), 400
 
-    otp = "123456" if ENV.lower() == "dev" else f"{secrets.randbelow(1000000):06d}"
-    expires_at = _now_utc() + timedelta(minutes=int(WEB_OTP_TTL_MINUTES))
-
+    otp = "123456" if ENV == "dev" else f"{secrets.randbelow(1000000):06d}"
+    expires_at = _now_utc() + timedelta(minutes=WEB_OTP_TTL_MINUTES)
     code_hash = _otp_hash(contact, purpose, otp)
 
     payload = {
         OTP_COL_CONTACT: contact,
         OTP_COL_PURPOSE: purpose,
         OTP_COL_CODE_HASH: code_hash,
-        OTP_COL_EXPIRES_AT: expires_at.isoformat().replace("+00:00", "Z"),
-        OTP_COL_USED: False,
-        # Optional debug/dev columns (only stored if enabled)
         OTP_COL_CODE_PLAIN: otp if WEB_DEV_RETURN_OTP else None,
         OTP_COL_PHONE_E164: contact,
         OTP_COL_OTP_CODE: otp if WEB_DEV_RETURN_OTP else None,
+        OTP_COL_EXPIRES_AT: expires_at.isoformat().replace("+00:00", "Z"),
+        OTP_COL_USED: False,
     }
     payload = {k: v for k, v in payload.items() if v is not None}
 
@@ -209,7 +207,7 @@ def request_otp():
     except Exception as e:
         err = _extract_supabase_error(e)
         print(f"[web_auth] request_otp insert failed: {err}")
-        if ENV.lower() == "dev" or WEB_AUTH_DEBUG:
+        if ENV == "dev" or WEB_AUTH_DEBUG:
             return jsonify({"ok": False, "error": "otp_store_failed", "supabase": err}), 500
         return jsonify({"ok": False, "error": "otp_store_failed"}), 500
 
@@ -237,7 +235,6 @@ def verify_otp():
 
     code_hash = _otp_hash(contact, purpose, otp)
 
-    # Validate OTP: not used, not expired, latest first
     try:
         q = (
             _sb()
@@ -247,7 +244,7 @@ def verify_otp():
             .eq(OTP_COL_PURPOSE, purpose)
             .eq(OTP_COL_CODE_HASH, code_hash)
             .eq(OTP_COL_USED, False)
-            .order(OTP_COL_CREATED_AT, desc=True)
+            .order("created_at", desc=True)
             .limit(1)
             .execute()
         )
@@ -255,7 +252,7 @@ def verify_otp():
     except Exception as e:
         err = _extract_supabase_error(e)
         print(f"[web_auth] verify_otp lookup failed: {err}")
-        if ENV.lower() == "dev" or WEB_AUTH_DEBUG:
+        if ENV == "dev" or WEB_AUTH_DEBUG:
             return jsonify({"ok": False, "error": "otp_lookup_failed", "supabase": err}), 500
         return jsonify({"ok": False, "error": "otp_lookup_failed"}), 500
 
@@ -278,7 +275,6 @@ def verify_otp():
             pass
         return jsonify({"ok": False, "error": "otp_expired"}), 401
 
-    # mark OTP used
     try:
         _sb().table(WEB_OTP_TABLE).update(
             {OTP_COL_USED: True, OTP_COL_USED_AT: _now_utc().isoformat().replace("+00:00", "Z")}
@@ -286,22 +282,18 @@ def verify_otp():
     except Exception:
         pass
 
-    # Ensure account exists (returns accounts.id UUID string)
     account_id = _upsert_account_for_contact(contact)
     if not account_id:
-        return jsonify(
-            {"ok": False, "error": "account_create_failed", "hint": "accounts insert/upsert failed"},
-        ), 500
+        return jsonify({"ok": False, "error": "account_create_failed"}), 500
 
-    # Create session token + store session row in web_tokens
     raw_token = secrets.token_hex(32)
-    expires_at = _now_utc() + timedelta(days=int(WEB_SESSION_TTL_DAYS))
+    expires_at = _now_utc() + timedelta(days=WEB_SESSION_TTL_DAYS)
 
     try:
         _sb().table(WEB_TOKEN_TABLE).insert(
             {
                 "token_hash": _token_hash(raw_token),
-                "account_id": str(account_id),
+                "account_id": account_id,
                 "expires_at": expires_at.isoformat().replace("+00:00", "Z"),
                 "revoked": False,
                 "last_seen_at": _now_utc().isoformat().replace("+00:00", "Z"),
@@ -310,7 +302,7 @@ def verify_otp():
     except Exception as e:
         err = _extract_supabase_error(e)
         print(f"[web_auth] session insert failed: {err}")
-        if ENV.lower() == "dev" or WEB_AUTH_DEBUG:
+        if ENV == "dev" or WEB_AUTH_DEBUG:
             return jsonify({"ok": False, "error": "session_store_failed", "supabase": err}), 500
         return jsonify({"ok": False, "error": "session_store_failed"}), 500
 
@@ -319,7 +311,7 @@ def verify_otp():
             "ok": True,
             "mode": "real",
             "token": raw_token,
-            "account_id": str(account_id),
+            "account_id": account_id,
             "expires_at": expires_at.isoformat().replace("+00:00", "Z"),
         }
     )
@@ -336,36 +328,19 @@ def me():
     try:
         res = (
             _sb()
-            .table(ACC_TABLE)
-            .select(
-                f"{ACC_COL_ID},{ACC_COL_PROVIDER},{ACC_COL_PROVIDER_USER_ID},{ACC_COL_DISPLAY_NAME},{ACC_COL_PHONE},{ACC_COL_CREATED_AT}"
-            )
-            .eq(ACC_COL_ID, account_id)
+            .table("accounts")
+            .select("account_id, provider, provider_user_id, display_name, phone, created_at")
+            .eq("account_id", account_id)
             .limit(1)
             .execute()
         )
         rows = (res.data or []) if hasattr(res, "data") else []
         if not rows:
             return jsonify({"ok": False, "error": "account_not_found"}), 404
-
-        # Return stable shape
-        acc = rows[0]
-        return jsonify(
-            {
-                "ok": True,
-                "account": {
-                    "id": acc.get(ACC_COL_ID),
-                    "provider": acc.get(ACC_COL_PROVIDER),
-                    "provider_user_id": acc.get(ACC_COL_PROVIDER_USER_ID),
-                    "display_name": acc.get(ACC_COL_DISPLAY_NAME),
-                    "phone": acc.get(ACC_COL_PHONE),
-                    "created_at": acc.get(ACC_COL_CREATED_AT),
-                },
-            }
-        )
+        return jsonify({"ok": True, "account": rows[0]})
     except Exception as e:
         err = _extract_supabase_error(e)
         print(f"[web_auth] /me account lookup failed: {err}")
-        if ENV.lower() == "dev" or WEB_AUTH_DEBUG:
+        if ENV == "dev" or WEB_AUTH_DEBUG:
             return jsonify({"ok": False, "error": "account_lookup_failed", "supabase": err}), 500
         return jsonify({"ok": False, "error": "account_lookup_failed"}), 500
