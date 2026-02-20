@@ -50,7 +50,7 @@ WEB_OTP_TTL_MINUTES = int(_env("WEB_OTP_TTL_MINUTES", "10") or "10")
 WEB_DEV_RETURN_OTP = _truthy(_env("WEB_DEV_RETURN_OTP", "0")) or (ENV == "dev")
 
 # --- Column mapping (match your Supabase schema) ---
-# Your table shows: code_hash, code_plain, phone_e164, otp_code, used, expires_at, created_at, used_at
+# Your table shows: contact, purpose, code_hash, code_plain, phone_e164, otp_code, used, expires_at, created_at, used_at
 OTP_COL_CONTACT = _env("WEB_OTP_COL_CONTACT", "contact")
 OTP_COL_PURPOSE = _env("WEB_OTP_COL_PURPOSE", "purpose")
 OTP_COL_CODE_HASH = _env("WEB_OTP_COL_CODE_HASH", "code_hash")
@@ -60,6 +60,7 @@ OTP_COL_OTP_CODE = _env("WEB_OTP_COL_OTP_CODE", "otp_code")
 OTP_COL_EXPIRES_AT = _env("WEB_OTP_COL_EXPIRES_AT", "expires_at")
 OTP_COL_USED = _env("WEB_OTP_COL_USED", "used")
 OTP_COL_USED_AT = _env("WEB_OTP_COL_USED_AT", "used_at")
+
 
 def _sha256_hex(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
@@ -91,7 +92,7 @@ def _normalize_contact(v: str) -> str:
 def _extract_supabase_error(e: Exception) -> Dict[str, Any]:
     """
     Try to extract useful info from supabase-py / postgrest errors.
-    We keep this robust because error shapes can vary.
+    Error shapes can vary by version.
     """
     info: Dict[str, Any] = {
         "type": e.__class__.__name__,
@@ -106,7 +107,7 @@ def _extract_supabase_error(e: Exception) -> Dict[str, Any]:
             except Exception:
                 pass
 
-    # sometimes error payload is stored in .args[0] or .json()
+    # sometimes error payload is stored in .args[0]
     try:
         if getattr(e, "args", None):
             info["args"] = [str(a) for a in e.args[:3]]
@@ -121,7 +122,51 @@ def _extract_supabase_error(e: Exception) -> Dict[str, Any]:
     except Exception:
         pass
 
+    # some libs expose .json() or .to_dict()
+    for meth in ("json", "to_dict", "dict"):
+        if hasattr(e, meth):
+            try:
+                fn = getattr(e, meth)
+                val = fn() if callable(fn) else fn
+                if isinstance(val, dict):
+                    info[meth] = val
+            except Exception:
+                pass
+
     return info
+
+
+def _extract_response_error(res: Any) -> Optional[Dict[str, Any]]:
+    """
+    Some supabase/postgrest versions do NOT raise exceptions on 4xx/5xx,
+    but instead return an object with `.error`.
+    """
+    try:
+        err_obj = getattr(res, "error", None)
+        if not err_obj:
+            return None
+
+        detail: Dict[str, Any] = {
+            "type": err_obj.__class__.__name__,
+            "message": getattr(err_obj, "message", None) or str(err_obj),
+        }
+        for k in ("code", "details", "hint", "status", "status_code"):
+            if hasattr(err_obj, k):
+                try:
+                    detail[k] = getattr(err_obj, k)
+                except Exception:
+                    pass
+
+        # Try to pull any dict-like payload
+        try:
+            if getattr(err_obj, "args", None):
+                detail["args"] = [str(a) for a in err_obj.args[:3]]
+        except Exception:
+            pass
+
+        return detail
+    except Exception:
+        return {"type": "UnknownError", "message": "Failed to extract response error"}
 
 
 def _upsert_account_for_contact(contact: str) -> Optional[str]:
@@ -180,13 +225,13 @@ def request_otp():
     code_hash = _otp_hash(contact, purpose, otp)
 
     # Store OTP in DB (MATCH YOUR TABLE SCHEMA)
-    payload = {
+    payload: Dict[str, Any] = {
         OTP_COL_CONTACT: contact,
         OTP_COL_PURPOSE: purpose,
         OTP_COL_CODE_HASH: code_hash,
-        OTP_COL_CODE_PLAIN: otp if WEB_DEV_RETURN_OTP else None,   # keep optional
-        OTP_COL_PHONE_E164: contact,                               # your schema has phone_e164
-        OTP_COL_OTP_CODE: otp if WEB_DEV_RETURN_OTP else None,     # your schema has otp_code
+        OTP_COL_CODE_PLAIN: otp if WEB_DEV_RETURN_OTP else None,  # optional
+        OTP_COL_PHONE_E164: contact,  # your schema has phone_e164
+        OTP_COL_OTP_CODE: otp if WEB_DEV_RETURN_OTP else None,  # your schema has otp_code
         OTP_COL_EXPIRES_AT: expires_at.isoformat().replace("+00:00", "Z"),
         OTP_COL_USED: False,
     }
@@ -194,15 +239,43 @@ def request_otp():
     # Remove None fields so Supabase doesn't reject type constraints
     payload = {k: v for k, v in payload.items() if v is not None}
 
+    # Insert + capture supabase error details (both raise + return styles)
     try:
-        _sb().table(WEB_OTP_TABLE).insert(payload).execute()
+        res = _sb().table(WEB_OTP_TABLE).insert(payload).execute()
+
+        # Some versions return an error object instead of raising
+        resp_err = _extract_response_error(res)
+        if resp_err:
+            print(f"[web_auth] request_otp insert returned error: {resp_err}")
+            if ENV == "dev" or WEB_AUTH_DEBUG:
+                return (
+                    jsonify(
+                        {
+                            "ok": False,
+                            "error": "otp_store_failed",
+                            "supabase": resp_err,
+                            "payload_keys": list(payload.keys()),
+                        }
+                    ),
+                    500,
+                )
+            return jsonify({"ok": False, "error": "otp_store_failed"}), 500
+
     except Exception as e:
         err = _extract_supabase_error(e)
-        # Always log server-side
         print(f"[web_auth] request_otp insert failed: {err}")
-        # Return detail only in dev/debug mode
         if ENV == "dev" or WEB_AUTH_DEBUG:
-            return jsonify({"ok": False, "error": "otp_store_failed", "supabase": err}), 500
+            return (
+                jsonify(
+                    {
+                        "ok": False,
+                        "error": "otp_store_failed",
+                        "supabase": err,
+                        "payload_keys": list(payload.keys()),
+                    }
+                ),
+                500,
+            )
         return jsonify({"ok": False, "error": "otp_store_failed"}), 500
 
     resp = {"ok": True, "contact": contact, "purpose": purpose}
@@ -243,6 +316,15 @@ def verify_otp():
             .limit(1)
             .execute()
         )
+
+        # handle return-style errors
+        resp_err = _extract_response_error(q)
+        if resp_err:
+            print(f"[web_auth] verify_otp lookup returned error: {resp_err}")
+            if ENV == "dev" or WEB_AUTH_DEBUG:
+                return jsonify({"ok": False, "error": "otp_lookup_failed", "supabase": resp_err}), 500
+            return jsonify({"ok": False, "error": "otp_lookup_failed"}), 500
+
         rows = (q.data or []) if hasattr(q, "data") else []
     except Exception as e:
         err = _extract_supabase_error(e)
@@ -289,7 +371,7 @@ def verify_otp():
     expires_at = _now_utc() + timedelta(days=WEB_SESSION_TTL_DAYS)
 
     try:
-        _sb().table(WEB_TOKEN_TABLE).insert(
+        ins = _sb().table(WEB_TOKEN_TABLE).insert(
             {
                 "token_hash": _token_hash(raw_token),
                 "account_id": account_id,
@@ -298,6 +380,14 @@ def verify_otp():
                 "last_seen_at": _now_utc().isoformat().replace("+00:00", "Z"),
             }
         ).execute()
+
+        resp_err = _extract_response_error(ins)
+        if resp_err:
+            print(f"[web_auth] session insert returned error: {resp_err}")
+            if ENV == "dev" or WEB_AUTH_DEBUG:
+                return jsonify({"ok": False, "error": "session_store_failed", "supabase": resp_err}), 500
+            return jsonify({"ok": False, "error": "session_store_failed"}), 500
+
     except Exception as e:
         err = _extract_supabase_error(e)
         print(f"[web_auth] session insert failed: {err}")
@@ -333,10 +423,19 @@ def me():
             .limit(1)
             .execute()
         )
+
+        resp_err = _extract_response_error(res)
+        if resp_err:
+            print(f"[web_auth] /me account lookup returned error: {resp_err}")
+            if ENV == "dev" or WEB_AUTH_DEBUG:
+                return jsonify({"ok": False, "error": "account_lookup_failed", "supabase": resp_err}), 500
+            return jsonify({"ok": False, "error": "account_lookup_failed"}), 500
+
         rows = (res.data or []) if hasattr(res, "data") else []
         if not rows:
             return jsonify({"ok": False, "error": "account_not_found"}), 404
         return jsonify({"ok": True, "account": rows[0]})
+
     except Exception as e:
         err = _extract_supabase_error(e)
         print(f"[web_auth] /me account lookup failed: {err}")
