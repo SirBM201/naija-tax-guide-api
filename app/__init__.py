@@ -25,31 +25,30 @@ def _truthy(v: str | None) -> bool:
 
 def _cookie_mode_enabled() -> bool:
     """
-    Cookie auth MUST be explicitly enabled. Otherwise you'll accidentally force
-    credentialed CORS and break '*' origins.
-
-    Enable by setting:
-      COOKIE_AUTH_ENABLED=1
+    Cookie auth should be explicitly enabled.
+    Otherwise you'll accidentally force credentialed CORS and break '*' origins.
     """
-    return _truthy(os.getenv("COOKIE_AUTH_ENABLED", ""))
+    # Preferred explicit flag
+    if _truthy(os.getenv("COOKIE_AUTH_ENABLED", "")):
+        return True
+
+    # Backwards compat: allow enabling via WEB_AUTH_ENABLED + explicit cookie samesite/secure
+    if _truthy(os.getenv("WEB_AUTH_ENABLED", "")) and os.getenv("WEB_AUTH_COOKIE_SAMESITE"):
+        return True
+
+    return False
 
 
-def _parse_origins(
-    origins_raw: str,
-    *,
-    cookie_mode: bool
-) -> Tuple[Union[str, List[str]], bool, Optional[str]]:
+def _parse_origins(origins_raw: str, *, cookie_mode: bool) -> Tuple[Union[str, List[str]], bool, Optional[str]]:
     """
     Returns (origins, supports_credentials, error_message_if_any)
 
-    Rules:
-      - If cookie_mode=True, origins MUST be explicit list (NOT '*')
-      - supports_credentials must be True for cookie mode
-      - If cookie_mode=False, '*' is allowed and supports_credentials=False
+    IMPORTANT:
+      - If cookie_mode=True, origins MUST be an explicit list, not '*'
+      - supports_credentials must be True for cookies
     """
     raw = (origins_raw or "").strip()
 
-    # default: allow all (only safe for non-cookie use)
     if not raw:
         if cookie_mode:
             return [], True, "CORS_ORIGINS is empty but cookie auth requires explicit origins."
@@ -73,9 +72,6 @@ def _parse_origins(
 
 
 def _import_attr(dotted: str, attr: str) -> Tuple[Optional[Any], Optional[str]]:
-    """
-    Import module.attr safely. Returns (obj, error_string).
-    """
     try:
         mod = __import__(dotted, fromlist=[attr])
         obj = getattr(mod, attr)
@@ -92,39 +88,23 @@ def create_app() -> Flask:
     cookie_mode = _cookie_mode_enabled()
     origins, supports_credentials, cors_err = _parse_origins(CORS_ORIGINS, cookie_mode=cookie_mode)
 
-    # If cookie mode is enabled but origins are invalid, fail fast
     if cors_err:
         raise RuntimeError(f"[CORS] {cors_err}")
 
-    # Use regex resource pattern so ALL api paths match reliably
-    api_resource_regex = rf"^{api_prefix}/.*"
-
     CORS(
         app,
-        resources={api_resource_regex: {"origins": origins}},
+        resources={rf"{api_prefix}/*": {"origins": origins}},
         supports_credentials=supports_credentials,
-        allow_headers=[
-            "Content-Type",
-            "Authorization",
-            "X-Auth-Token",
-            "X-Requested-With",
-        ],
+        allow_headers=["Content-Type", "Authorization", "X-Auth-Token", "X-Requested-With"],
         expose_headers=["Set-Cookie"],
         methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         max_age=86400,
     )
 
-    # ---------------------------------------
-    # BOOT REPORT (so you can see import fails)
-    # ---------------------------------------
     boot: Dict[str, Any] = {
         "api_prefix": api_prefix,
         "cookie_mode": cookie_mode,
-        "cors": {
-            "origins": origins,
-            "supports_credentials": supports_credentials,
-            "resource_regex": api_resource_regex,
-        },
+        "cors": {"origins": origins, "supports_credentials": supports_credentials},
         "required": [],
         "optional": [],
         "errors": [],
@@ -132,12 +112,7 @@ def create_app() -> Flask:
 
     strict = (os.getenv("STRICT_BLUEPRINTS", "1").strip() != "0")
 
-    def _register_bp(
-        dotted: str,
-        attr: str = "bp",
-        required: bool = True,
-        url_prefix: Optional[str] = api_prefix
-    ):
+    def _register_bp(dotted: str, attr: str = "bp", required: bool = True, url_prefix: Optional[str] = api_prefix):
         obj, err = _import_attr(dotted, attr)
         entry = {"module": dotted, "attr": attr, "registered": False, "url_prefix": url_prefix, "error": err}
 
@@ -189,7 +164,6 @@ def create_app() -> Flask:
         "app.routes.paystack_webhook",
         "app.routes.debug_routes",
     ]
-
     for dotted in required_modules:
         _register_bp(dotted, "bp", required=True, url_prefix=api_prefix)
 
