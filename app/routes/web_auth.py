@@ -31,7 +31,21 @@ def _env(name: str, default: str = "") -> str:
 
 def _truthy(v: str | None) -> bool:
     return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+def _cookie_name() -> str:
+    return (os.getenv("WEB_AUTH_COOKIE_NAME", "ntg_session") or "ntg_session").strip()
 
+def _cookie_secure() -> bool:
+    # Koyeb is https => secure cookies OK
+    return (os.getenv("WEB_AUTH_COOKIE_SECURE", "1").strip() == "1")
+
+def _cookie_samesite() -> str:
+    # For cross-site frontend (Vercel) => SameSite=None is required
+    # If frontend and backend share same site/subdomain, you can use "Lax".
+    return (os.getenv("WEB_AUTH_COOKIE_SAMESITE", "None") or "None").strip()
+
+def _cookie_domain() -> Optional[str]:
+    v = (os.getenv("WEB_AUTH_COOKIE_DOMAIN", "") or "").strip()
+    return v or None
 
 ENV = _env("ENV", "prod").lower()
 
