@@ -5,7 +5,7 @@ import os
 import traceback
 from datetime import datetime, timezone
 from functools import wraps
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict
 
 from flask import g, jsonify, request
 
@@ -46,14 +46,14 @@ def auth_debug_snapshot() -> Dict[str, Any]:
 def require_auth_plus(fn: Callable[..., Any]) -> Callable[..., Any]:
     """
     Cookie-first auth, Bearer fallback.
+
     Sets:
       g.account_id
       g.token_row
       g.auth_token (raw token)
       g.raw_token_source = "cookie" | "bearer"
-      g.web_token_hash (hash prefix tracking)
+      g.web_token_hash (hash)
     """
-
     @wraps(fn)
     def wrapper(*args, **kwargs):
         try:
@@ -65,7 +65,6 @@ def require_auth_plus(fn: Callable[..., Any]) -> Callable[..., Any]:
 
             table = (os.getenv("WEB_TOKEN_TABLE", WEB_TOKEN_TABLE) or WEB_TOKEN_TABLE).strip() or WEB_TOKEN_TABLE
 
-            # Validate token via shared service
             ok, payload, err = validate_token(raw, table=table, touch=True)
             if not ok:
                 _dbg(f"[auth] deny src={source} err={err} path={request.path} method={request.method}")
@@ -74,7 +73,6 @@ def require_auth_plus(fn: Callable[..., Any]) -> Callable[..., Any]:
             account_id = (payload.get("account_id") or "").strip()
             token_row = payload.get("token_row") or {}
 
-            # Populate g for downstream routes
             g.account_id = account_id
             g.token_row = token_row
             g.auth_token = raw
