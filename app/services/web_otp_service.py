@@ -7,29 +7,46 @@ import random
 import smtplib
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from ..core.supabase_client import supabase
 
 # ------------------------------------------------------------
-# Config
+# ENV / Config
 # ------------------------------------------------------------
+
+WEB_AUTH_ENABLED = (os.getenv("WEB_AUTH_ENABLED", "1").strip() == "1")
 
 WEB_OTP_ENABLED = (os.getenv("WEB_OTP_ENABLED", "1").strip() == "1")
 WEB_OTP_TTL_MINUTES = int((os.getenv("WEB_OTP_TTL_MINUTES", "10") or "10").strip())
 WEB_OTP_LEN = int((os.getenv("WEB_OTP_LEN", "6") or "6").strip())
 
-# If you still want a fallback stub in dev only:
-WEB_OTP_STUB_CODE = (os.getenv("WEB_OTP_STUB_CODE", "123456") or "123456").strip()
+WEB_OTP_TABLE = (os.getenv("WEB_OTP_TABLE", "web_otps") or "web_otps").strip()
+WEB_TOKEN_TABLE = (os.getenv("WEB_TOKEN_TABLE", "web_tokens") or "web_tokens").strip()
+
+WEB_OTP_PEPPER = (os.getenv("WEB_OTP_PEPPER", "") or "").strip()
+WEB_TOKEN_PEPPER = (os.getenv("WEB_TOKEN_PEPPER", "") or "").strip()
 
 WEB_SESSION_TTL_DAYS = int((os.getenv("WEB_SESSION_TTL_DAYS", "30") or "30").strip())
 
-# OTP hashing (recommended)
-WEB_OTP_PEPPER = (os.getenv("WEB_OTP_PEPPER", "") or "").strip()
+# Security controls
+WEB_OTP_MAX_ATTEMPTS = int((os.getenv("WEB_OTP_MAX_ATTEMPTS", "5") or "5").strip())
+
+# Rate limits
+WEB_OTP_REQ_LIMIT_COUNT = int((os.getenv("WEB_OTP_REQ_LIMIT_COUNT", "3") or "3").strip())
+WEB_OTP_REQ_LIMIT_WINDOW_MIN = int((os.getenv("WEB_OTP_REQ_LIMIT_WINDOW_MIN", "15") or "15").strip())
+
+WEB_OTP_IP_LIMIT_COUNT = int((os.getenv("WEB_OTP_IP_LIMIT_COUNT", "20") or "20").strip())
+WEB_OTP_IP_LIMIT_WINDOW_MIN = int((os.getenv("WEB_OTP_IP_LIMIT_WINDOW_MIN", "60") or "60").strip())
+
+WEB_OTP_LOCK_MINUTES = int((os.getenv("WEB_OTP_LOCK_MINUTES", "30") or "30").strip())
+
+# Optional dev return
+WEB_DEV_RETURN_OTP = (os.getenv("WEB_DEV_RETURN_OTP", "0").strip() == "1")
 
 # ------------------------------------------------------------
-# Mail (Mailtrap SMTP)
-# Supports both MAIL_* and SMTP_* env names to avoid mismatch.
+# Mail (SMTP)
+# Supports both MAIL_* and SMTP_* env names.
 # ------------------------------------------------------------
 
 def _env_first(*names: str, default: str = "") -> str:
@@ -46,14 +63,20 @@ MAIL_USER = _env_first("MAIL_USER", "SMTP_USER")
 MAIL_PASS = _env_first("MAIL_PASS", "SMTP_PASS")
 MAIL_FROM_EMAIL = _env_first("MAIL_FROM_EMAIL", default="no-reply@thecre8hub.com")
 MAIL_FROM_NAME = _env_first("MAIL_FROM_NAME", default="NaijaTax Guide")
-
-# If not explicitly set, assume STARTTLS on typical Mailtrap ports
 MAIL_USE_TLS = _env_first("MAIL_USE_TLS", default="1") == "1"
-
 
 # ------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------
+
+def _sb():
+    try:
+        return supabase()
+    except TypeError:
+        return supabase
+
+def _table(name: str):
+    return _sb().table(name)
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
@@ -66,65 +89,67 @@ def _parse_iso(value: Optional[str]) -> Optional[datetime]:
         return None
     try:
         v = str(value).replace("Z", "+00:00")
-        return datetime.fromisoformat(v)
+        return datetime.fromisoformat(v).astimezone(timezone.utc)
     except Exception:
         return None
 
-def _sb():
-    try:
-        return supabase()
-    except TypeError:
-        return supabase
+def _clean(v: Any) -> str:
+    return (v or "").strip()
 
-def _table(name: str):
-    return _sb().table(name)
+def _normalize_contact(v: str) -> str:
+    v = _clean(v)
+    if not v:
+        return ""
+    if "@" in v:
+        return v.lower()
+    if v.startswith("0"):
+        return "+234" + v[1:]
+    if v.startswith("234"):
+        return "+" + v
+    return v
 
-def _clean(s: Any) -> str:
-    return (s or "").strip()
-
-def _gen_otp() -> str:
-    # numeric OTP with fixed length
-    low = 10 ** (WEB_OTP_LEN - 1)
-    high = (10 ** WEB_OTP_LEN) - 1
-    return str(random.randint(low, high))
+def _is_email(v: str) -> bool:
+    v = _clean(v)
+    return ("@" in v) and ("." in v)
 
 def _sha256_hex(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 def _otp_hash(contact: str, purpose: str, otp: str) -> str:
-    """
-    Hash ties OTP to (contact,purpose) plus pepper.
-    This prevents OTP reuse across contacts/purposes.
-    """
-    base = f"{WEB_OTP_PEPPER}:{contact}:{purpose}:{otp}"
-    return _sha256_hex(base)
+    # ties OTP to contact+purpose + pepper
+    return _sha256_hex(f"{WEB_OTP_PEPPER}:{contact}:{purpose}:{otp}")
 
-def _smtp_configured() -> bool:
+def _token_hash(raw_token: str) -> str:
+    # MUST match app/core/auth.py: sha256(f"{pepper}:{raw_token}")
+    return _sha256_hex(f"{WEB_TOKEN_PEPPER}:{raw_token}")
+
+def _gen_otp() -> str:
+    low = 10 ** (WEB_OTP_LEN - 1)
+    high = (10 ** WEB_OTP_LEN) - 1
+    return str(random.randint(low, high))
+
+def smtp_is_configured() -> bool:
     if not MAIL_ENABLED:
         return False
     if not MAIL_HOST or not MAIL_PORT or not MAIL_USER or not MAIL_PASS:
         return False
     return True
 
-def _send_email_otp(to_email: str, otp: str, ttl_minutes: int) -> Dict[str, Any]:
-    """
-    Sends OTP to user's email using SMTP (Mailtrap).
-    Returns {sent: bool, error?: str}
-    """
-    if not _smtp_configured():
-        return {"sent": False, "error": "smtp_not_configured"}
+def _send_email_otp(to_email: str, otp: str, ttl_minutes: int) -> Tuple[bool, Optional[str]]:
+    if not smtp_is_configured():
+        return False, "smtp_not_configured"
 
     msg = EmailMessage()
     msg["From"] = f"{MAIL_FROM_NAME} <{MAIL_FROM_EMAIL}>"
     msg["To"] = to_email
     msg["Subject"] = f"Your NaijaTax Guide login code: {otp}"
 
-    text = (
-        f"Your NaijaTax Guide one-time login code is: {otp}\n\n"
+    msg.set_content(
+        "Your NaijaTax Guide one-time login code is:\n\n"
+        f"{otp}\n\n"
         f"This code expires in {ttl_minutes} minutes.\n\n"
-        f"If you did not request this code, ignore this email."
+        "If you did not request this code, ignore this email."
     )
-    msg.set_content(text)
 
     try:
         with smtplib.SMTP(MAIL_HOST, MAIL_PORT, timeout=15) as server:
@@ -132,147 +157,202 @@ def _send_email_otp(to_email: str, otp: str, ttl_minutes: int) -> Dict[str, Any]
                 server.starttls()
             server.login(MAIL_USER, MAIL_PASS)
             server.send_message(msg)
-        return {"sent": True}
+        return True, None
     except Exception as e:
-        return {"sent": False, "error": f"smtp_send_failed:{type(e).__name__}"}
-
+        return False, f"smtp_send_failed:{type(e).__name__}"
 
 # ------------------------------------------------------------
-# Public API (MUST match app/routes/web_auth.py)
+# Rate limiting + lock checks
 # ------------------------------------------------------------
 
-def request_web_login_otp(contact: str, purpose: str = "web_login") -> Dict[str, Any]:
+def _latest_otp_row(contact: str, purpose: str) -> Optional[Dict[str, Any]]:
+    try:
+        res = (
+            _table(WEB_OTP_TABLE)
+            .select("id, created_at, expires_at, used, attempts, locked_until")
+            .eq("contact", contact)
+            .eq("purpose", purpose)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = getattr(res, "data", None) or []
+        return rows[0] if rows else None
+    except Exception:
+        return None
+
+def _is_locked(contact: str, purpose: str) -> Tuple[bool, Optional[str]]:
+    row = _latest_otp_row(contact, purpose)
+    if not row:
+        return False, None
+    locked_until = _parse_iso(row.get("locked_until"))
+    if locked_until and _now_utc() < locked_until:
+        # still locked
+        return True, f"locked_until:{_iso(locked_until)}"
+    return False, None
+
+def _count_recent_requests_by_contact(contact: str, purpose: str, window_min: int) -> int:
+    since = _now_utc() - timedelta(minutes=max(1, int(window_min)))
+    try:
+        res = (
+            _table(WEB_OTP_TABLE)
+            .select("id, created_at")
+            .eq("contact", contact)
+            .eq("purpose", purpose)
+            .gte("created_at", _iso(since))
+            .limit(500)
+            .execute()
+        )
+        rows = getattr(res, "data", None) or []
+        return len(rows)
+    except Exception:
+        return 0
+
+def _count_recent_requests_by_ip(ip: str, window_min: int) -> int:
+    if not ip:
+        return 0
+    since = _now_utc() - timedelta(minutes=max(1, int(window_min)))
+    try:
+        res = (
+            _table(WEB_OTP_TABLE)
+            .select("id, created_at")
+            .eq("request_ip", ip)
+            .gte("created_at", _iso(since))
+            .limit(1000)
+            .execute()
+        )
+        rows = getattr(res, "data", None) or []
+        return len(rows)
+    except Exception:
+        return 0
+
+def _lock_contact(contact: str, purpose: str, minutes: int) -> None:
+    # Best effort: mark the latest row with locked_until (so both request/verify can block)
+    row = _latest_otp_row(contact, purpose)
+    if not row or not row.get("id"):
+        return
+    locked_until = _now_utc() + timedelta(minutes=max(1, int(minutes)))
+    try:
+        _table(WEB_OTP_TABLE).update({"locked_until": _iso(locked_until)}).eq("id", row["id"]).execute()
+    except Exception:
+        return
+
+# ------------------------------------------------------------
+# Accounts + tokens
+# ------------------------------------------------------------
+
+def _upsert_account_for_contact(contact: str) -> Optional[str]:
     """
-    Generates + stores OTP for a web login flow.
-
-    Returns:
-      { ok: True, ttl_minutes, email_sent, email_to, email_error? }
-      plus dev_otp ONLY when WEB_DEV_RETURN_OTP=1
+    provider='web', provider_user_id=contact
     """
-    contact = _clean(contact)
-    purpose = _clean(purpose) or "web_login"
-    if not contact:
-        return {"ok": False, "error": "missing_contact"}
+    try:
+        res = (
+            _sb()
+            .table("accounts")
+            .select("account_id")
+            .eq("provider", "web")
+            .eq("provider_user_id", contact)
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        if rows:
+            return rows[0].get("account_id")
 
-    # Generate OTP
-    if not WEB_OTP_ENABLED:
-        otp = WEB_OTP_STUB_CODE
-        mode = "stub"
-    else:
-        otp = _gen_otp()
-        mode = "real"
+        ins = (
+            _sb()
+            .table("accounts")
+            .insert({
+                "provider": "web",
+                "provider_user_id": contact,
+                "display_name": contact,
+                "phone": contact,
+            })
+            .execute()
+        )
+        inserted = ins.data or []
+        return inserted[0].get("account_id") if inserted else None
+    except Exception:
+        return None
 
-    # Store hashed OTP (code_hash) + used boolean
-    stored = _best_effort_store_otp(contact=contact, purpose=purpose, otp=otp)
+def _issue_web_session_token(account_id: str, contact: str) -> Dict[str, Any]:
+    raw_token = os.urandom(24).hex()
+    now = _now_utc()
+    expires = now + timedelta(days=max(1, int(WEB_SESSION_TTL_DAYS)))
 
-    # Send email if contact looks like an email address
-    email_sent = False
-    email_error = None
-    if "@" in contact:
-        r = _send_email_otp(to_email=contact, otp=otp, ttl_minutes=WEB_OTP_TTL_MINUTES)
-        email_sent = bool(r.get("sent"))
-        email_error = r.get("error")
-
-    out: Dict[str, Any] = {
-        "ok": True,
-        "mode": mode,
-        "ttl_minutes": WEB_OTP_TTL_MINUTES,
-        "email_to": contact if "@" in contact else None,
-        "email_sent": email_sent,
-        "email_error": email_error,
-        "stored": stored,
+    payload = {
+        "token_hash": _token_hash(raw_token),
+        "account_id": account_id,
+        "expires_at": _iso(expires),
+        "revoked": False,
+        "last_seen_at": _iso(now),
+        "created_at": _iso(now),
     }
 
-    # Optional dev return (ONLY if you still want it)
-    if (os.getenv("WEB_DEV_RETURN_OTP", "0").strip() == "1"):
-        out["dev_otp"] = otp
+    # optional contact column
+    if _has_column(WEB_TOKEN_TABLE, "contact"):
+        payload["contact"] = contact
 
-    return out
+    _table(WEB_TOKEN_TABLE).insert(payload).execute()
+    return {"token": raw_token, "account_id": account_id, "expires_at": _iso(expires)}
 
-
-def verify_web_login_otp(contact: str, otp: str, purpose: str = "web_login") -> Dict[str, Any]:
-    """
-    Verifies OTP and returns a web session token.
-
-    Expected by routes:
-      verify_web_login_otp(contact=..., otp=..., purpose=...)
-
-    Returns:
-      { ok: True, token: "...", account_id?: "...", expires_at?: "..." }
-    """
-    contact = _clean(contact)
-    otp = _clean(otp)
-    purpose = _clean(purpose) or "web_login"
-
-    if not contact or not otp:
-        return {"ok": False, "error": "missing_contact_or_otp"}
-
-    # Match record by code_hash, used=False, not expired
-    code_hash = _otp_hash(contact=contact, purpose=purpose, otp=otp)
-    rec = _best_effort_find_valid_otp(contact=contact, purpose=purpose, code_hash=code_hash)
-    if not rec:
-        return {"ok": False, "error": "invalid_otp"}
-
-    # Mark used
-    _best_effort_mark_otp_used(rec)
-
-    # Issue web token (your project uses web_tokens with token_hash)
-    token_info = _issue_web_session_token(contact=contact)
-    return {"ok": True, **token_info}
-
+def _has_column(table: str, col: str) -> bool:
+    try:
+        _table(table).select(col).limit(1).execute()
+        return True
+    except Exception:
+        return False
 
 # ------------------------------------------------------------
-# Storage (best effort)
-# Table expected: web_otps
-# Recommended columns:
-#   id uuid pk
-#   contact text
-#   purpose text
-#   code_hash text
-#   expires_at timestamptz
-#   used bool default false
-#   used_at timestamptz nullable (optional)
-#   created_at timestamptz
-#
-# Session token expected: web_tokens (NOT web_sessions)
-# Recommended columns:
-#   id uuid pk
-#   token_hash text unique
-#   account_id text/uuid
-#   expires_at timestamptz
-#   revoked bool default false
-#   last_seen_at timestamptz
-#   created_at timestamptz
+# OTP Storage
 # ------------------------------------------------------------
 
-def _best_effort_store_otp(contact: str, purpose: str, otp: str) -> bool:
+def _create_otp_row(
+    contact: str,
+    purpose: str,
+    otp: str,
+    request_ip: str,
+    dest_email: Optional[str],
+    email_sent: bool,
+    email_error: Optional[str],
+) -> None:
     now = _now_utc()
     expires = now + timedelta(minutes=max(1, int(WEB_OTP_TTL_MINUTES)))
 
-    payload = {
+    payload: Dict[str, Any] = {
         "contact": contact,
         "purpose": purpose,
         "code_hash": _otp_hash(contact, purpose, otp),
         "expires_at": _iso(expires),
         "used": False,
+        "attempts": 0,
+        "locked_until": None,
+        "request_ip": request_ip or None,
         "created_at": _iso(now),
     }
 
-    try:
-        _table("web_otps").insert(payload).execute()
-        return True
-    except Exception:
-        return False
+    # optional metadata columns
+    if _has_column(WEB_OTP_TABLE, "sent_to"):
+        payload["sent_to"] = dest_email
+    if _has_column(WEB_OTP_TABLE, "channel"):
+        payload["channel"] = "email" if dest_email else "none"
+    if _has_column(WEB_OTP_TABLE, "email_sent"):
+        payload["email_sent"] = bool(email_sent)
+    if _has_column(WEB_OTP_TABLE, "email_error"):
+        payload["email_error"] = email_error
 
+    _table(WEB_OTP_TABLE).insert(payload).execute()
 
-def _best_effort_find_valid_otp(contact: str, purpose: str, code_hash: str) -> Optional[Dict[str, Any]]:
+def _find_latest_active_otp(contact: str, purpose: str) -> Optional[Dict[str, Any]]:
+    """
+    Latest unused, unexpired OTP row for contact+purpose.
+    """
     try:
         res = (
-            _table("web_otps")
-            .select("id, expires_at, used")
+            _table(WEB_OTP_TABLE)
+            .select("id, code_hash, expires_at, used, attempts, locked_until, created_at")
             .eq("contact", contact)
             .eq("purpose", purpose)
-            .eq("code_hash", code_hash)
             .eq("used", False)
             .order("created_at", desc=True)
             .limit(1)
@@ -284,70 +364,207 @@ def _best_effort_find_valid_otp(contact: str, purpose: str, code_hash: str) -> O
 
         row = rows[0]
         exp = _parse_iso(row.get("expires_at"))
-        if not exp:
+        if not exp or _now_utc() > exp:
             return None
-        if _now_utc() > exp:
-            return None
+
+        locked_until = _parse_iso(row.get("locked_until"))
+        if locked_until and _now_utc() < locked_until:
+            return row  # still active but locked
 
         return row
     except Exception:
         return None
 
+def _increment_attempts_and_maybe_lock(row_id: str, attempts: int) -> None:
+    """
+    attempts passed in is current attempts; we increment to next.
+    If next > WEB_OTP_MAX_ATTEMPTS => mark used + lock contact.
+    """
+    next_attempts = int(attempts or 0) + 1
+    updates: Dict[str, Any] = {
+        "attempts": next_attempts,
+        "last_attempt_at": _iso(_now_utc()),
+    } if _has_column(WEB_OTP_TABLE, "last_attempt_at") else {"attempts": next_attempts}
 
-def _best_effort_mark_otp_used(rec: Dict[str, Any]) -> None:
+    # If exceeded, invalidate and lock
+    if next_attempts >= WEB_OTP_MAX_ATTEMPTS:
+        updates["used"] = True
+        if _has_column(WEB_OTP_TABLE, "used_at"):
+            updates["used_at"] = _iso(_now_utc())
+        locked_until = _now_utc() + timedelta(minutes=max(1, int(WEB_OTP_LOCK_MINUTES)))
+        updates["locked_until"] = _iso(locked_until)
+
     try:
-        rec_id = rec.get("id")
-        if not rec_id:
-            return
-        _table("web_otps").update({"used": True, "used_at": _iso(_now_utc())}).eq("id", rec_id).execute()
+        _table(WEB_OTP_TABLE).update(updates).eq("id", row_id).execute()
     except Exception:
         return
 
+def _mark_used(row_id: str) -> None:
+    updates: Dict[str, Any] = {"used": True}
+    if _has_column(WEB_OTP_TABLE, "used_at"):
+        updates["used_at"] = _iso(_now_utc())
+    try:
+        _table(WEB_OTP_TABLE).update(updates).eq("id", row_id).execute()
+    except Exception:
+        return
 
-def _issue_web_session_token(contact: str) -> Dict[str, Any]:
+# ------------------------------------------------------------
+# Public API used by web_auth routes
+# ------------------------------------------------------------
+
+def request_web_login_otp(
+    contact: str,
+    purpose: str = "web_login",
+    request_ip: str = "",
+    email_to: str = "",
+) -> Dict[str, Any]:
     """
-    Your system validates tokens via app/core/auth.py against web_tokens.token_hash,
-    so we must insert hashed token into web_tokens.
+    Generates + stores OTP. Sends email when possible.
 
-    We also map contact -> account_id elsewhere (routes/service). For now we store contact
-    only if your table has it; otherwise we store account_id only at issuance time in the route.
+    Security:
+    - Blocks when locked
+    - Contact-based request rate limit
+    - IP-based request rate limit
     """
-    token = os.urandom(24).hex()
-    now = _now_utc()
-    expires = now + timedelta(days=max(1, int(WEB_SESSION_TTL_DAYS)))
+    if not WEB_AUTH_ENABLED:
+        return {"ok": False, "error": "web_auth_disabled"}
 
-    # IMPORTANT: token_hash must match app/core/auth.py _token_hash() logic (pepper + raw token).
-    # If your auth.py hashes as sha256(f"{pepper}:{raw_token}"), do same here.
-    pepper = (os.getenv("WEB_TOKEN_PEPPER", "") or "").strip()
-    token_hash = _sha256_hex(f"{pepper}:{token}")
+    contact = _normalize_contact(contact)
+    purpose = _clean(purpose) or "web_login"
+    request_ip = _clean(request_ip)
 
-    payload = {
-        "token_hash": token_hash,
-        "expires_at": _iso(expires),
-        "revoked": False,
-        "last_seen_at": _iso(now),
-        "created_at": _iso(now),
+    if not contact:
+        return {"ok": False, "error": "missing_contact"}
+
+    # Lock check
+    locked, lock_reason = _is_locked(contact, purpose)
+    if locked:
+        return {"ok": False, "error": "locked", "detail": lock_reason}
+
+    # Rate limit (contact)
+    c = _count_recent_requests_by_contact(contact, purpose, WEB_OTP_REQ_LIMIT_WINDOW_MIN)
+    if c >= WEB_OTP_REQ_LIMIT_COUNT:
+        _lock_contact(contact, purpose, WEB_OTP_LOCK_MINUTES)
+        return {"ok": False, "error": "rate_limited", "scope": "contact"}
+
+    # Rate limit (IP)
+    if request_ip:
+        ip_c = _count_recent_requests_by_ip(request_ip, WEB_OTP_IP_LIMIT_WINDOW_MIN)
+        if ip_c >= WEB_OTP_IP_LIMIT_COUNT:
+            return {"ok": False, "error": "rate_limited", "scope": "ip"}
+
+    # Generate OTP
+    otp = _gen_otp() if WEB_OTP_ENABLED else (os.getenv("WEB_OTP_STUB_CODE", "123456").strip() or "123456")
+    ttl = WEB_OTP_TTL_MINUTES
+
+    # Determine email destination
+    email_to = _clean(email_to).lower()
+    dest_email = ""
+    if _is_email(contact):
+        dest_email = contact
+    elif _is_email(email_to):
+        dest_email = email_to
+
+    email_sent = False
+    email_error: Optional[str] = None
+    if dest_email:
+        email_sent, email_error = _send_email_otp(dest_email, otp, ttl)
+
+    # Store OTP row
+    try:
+        _create_otp_row(
+            contact=contact,
+            purpose=purpose,
+            otp=otp,
+            request_ip=request_ip,
+            dest_email=dest_email or None,
+            email_sent=email_sent,
+            email_error=email_error,
+        )
+    except Exception:
+        # Do not leak internals; caller can retry
+        return {"ok": False, "error": "otp_store_failed"}
+
+    resp: Dict[str, Any] = {
+        "ok": True,
+        "ttl_minutes": ttl,
+        "email_sent": bool(email_sent),
+        "email_to": dest_email or None,
     }
+    if dest_email and email_error:
+        resp["email_error"] = email_error
 
-    # If your web_tokens table includes contact, store it (optional)
-    if _has_column("web_tokens", "contact"):
-        payload["contact"] = contact
+    if WEB_DEV_RETURN_OTP:
+        resp["dev_otp"] = otp
+        resp["smtp_configured"] = smtp_is_configured()
 
-    try:
-        _table("web_tokens").insert(payload).execute()
-    except Exception:
-        # Still return token so you can see failures on auth step if insertion failed
-        pass
-
-    return {"token": token, "expires_at": _iso(expires)}
+    return resp
 
 
-def _has_column(table: str, col: str) -> bool:
+def verify_web_login_otp(
+    contact: str,
+    otp: str,
+    purpose: str = "web_login",
+    request_ip: str = "",
+) -> Dict[str, Any]:
     """
-    Best-effort: attempt a select with the column; if it errors, assume missing.
+    Verifies OTP and returns a web session token.
+
+    Security:
+    - Locks respected
+    - Uses latest active OTP row for contact+purpose
+    - Wrong OTP increments attempts
+    - attempts >= WEB_OTP_MAX_ATTEMPTS => invalidates + locks
     """
+    if not WEB_AUTH_ENABLED:
+        return {"ok": False, "error": "web_auth_disabled"}
+
+    contact = _normalize_contact(contact)
+    otp = _clean(otp)
+    purpose = _clean(purpose) or "web_login"
+    request_ip = _clean(request_ip)
+
+    if not contact or not otp:
+        return {"ok": False, "error": "missing_contact_or_otp"}
+
+    # Lock check
+    locked, lock_reason = _is_locked(contact, purpose)
+    if locked:
+        return {"ok": False, "error": "locked", "detail": lock_reason}
+
+    row = _find_latest_active_otp(contact, purpose)
+    if not row:
+        # nothing active to validate against
+        return {"ok": False, "error": "invalid_otp"}
+
+    # if row shows lock
+    locked_until = _parse_iso(row.get("locked_until"))
+    if locked_until and _now_utc() < locked_until:
+        return {"ok": False, "error": "locked", "detail": f"locked_until:{_iso(locked_until)}"}
+
+    row_id = row.get("id")
+    if not row_id:
+        return {"ok": False, "error": "invalid_otp"}
+
+    expected = (row.get("code_hash") or "").strip()
+    got = _otp_hash(contact, purpose, otp)
+
+    if not expected or got != expected:
+        # wrong otp -> increment attempts on the active row
+        _increment_attempts_and_maybe_lock(row_id, int(row.get("attempts") or 0))
+        return {"ok": False, "error": "invalid_otp"}
+
+    # Correct OTP -> mark used
+    _mark_used(row_id)
+
+    # Ensure account
+    account_id = _upsert_account_for_contact(contact)
+    if not account_id:
+        return {"ok": False, "error": "account_create_failed"}
+
+    # Issue session token
     try:
-        _table(table).select(col).limit(1).execute()
-        return True
+        token_info = _issue_web_session_token(account_id=account_id, contact=contact)
+        return {"ok": True, **token_info}
     except Exception:
-        return False
+        return {"ok": False, "error": "token_issue_failed"}
