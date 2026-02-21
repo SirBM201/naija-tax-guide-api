@@ -242,7 +242,20 @@ def request_otp():
     if WEB_AUTH_DEBUG:
         resp["debug"] = _safe_debug_info()
 
-    return jsonify(resp)
+     resp = jsonify(out)
+
+    # Cookie auth (Option A)
+    resp.set_cookie(
+        _cookie_name(),
+        raw_token,
+        httponly=True,
+        secure=_cookie_secure(),
+        samesite=_cookie_samesite(),  # "None" for Vercel frontend
+        domain=_cookie_domain(),       # usually leave empty unless you know you need it
+        path="/",
+        max_age=int(WEB_SESSION_TTL_DAYS) * 24 * 60 * 60,
+    )
+    return resp
 
 
 # -------------------------------------------------
