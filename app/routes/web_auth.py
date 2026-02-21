@@ -47,17 +47,17 @@ def _cookie_name() -> str:
 
 
 def _cookie_secure() -> bool:
-    # Koyeb is https => secure cookies OK
+    # For SameSite=None you MUST be Secure (true) on HTTPS
     return _env("WEB_AUTH_COOKIE_SECURE", _env("COOKIE_SECURE", "1")) == "1"
 
 
 def _cookie_samesite() -> str:
-    # Cross-site (Vercel frontend -> Koyeb backend) requires SameSite=None + Secure
-    # If same-site, you can set Lax.
+    # Cross-site (Vercel -> Koyeb) requires SameSite=None + Secure
     return (_env("WEB_AUTH_COOKIE_SAMESITE", _env("COOKIE_SAMESITE", "None")) or "None").strip()
 
 
 def _cookie_domain() -> Optional[str]:
+    # Usually leave empty for cross-site (Vercel <-> Koyeb), unless you know you need it.
     v = _env("WEB_AUTH_COOKIE_DOMAIN", _env("COOKIE_DOMAIN", "")).strip()
     return v or None
 
@@ -128,7 +128,6 @@ def _safe_debug_info() -> Dict[str, Any]:
 
 
 def _account_pk_column() -> str:
-    # prefer account_id if your schema has it
     if _has_column("accounts", "account_id"):
         return "account_id"
     if _has_column("accounts", "id"):
@@ -140,18 +139,21 @@ def _upsert_account_for_contact(contact: str) -> Optional[str]:
     pk = _account_pk_column()
 
     # 1) exists?
-    res = (
-        _sb()
-        .table("accounts")
-        .select(pk)
-        .eq("provider", "web")
-        .eq("provider_user_id", contact)
-        .limit(1)
-        .execute()
-    )
-    rows = (res.data or []) if hasattr(res, "data") else []
-    if rows and rows[0].get(pk):
-        return str(rows[0][pk])
+    try:
+        res = (
+            _sb()
+            .table("accounts")
+            .select(pk)
+            .eq("provider", "web")
+            .eq("provider_user_id", contact)
+            .limit(1)
+            .execute()
+        )
+        rows = (res.data or []) if hasattr(res, "data") else []
+        if rows and rows[0].get(pk):
+            return str(rows[0][pk])
+    except Exception:
+        pass
 
     # 2) insert minimal safe fields
     payload: Dict[str, Any] = {
@@ -172,18 +174,21 @@ def _upsert_account_for_contact(contact: str) -> Optional[str]:
         pass
 
     # fallback re-query
-    res2 = (
-        _sb()
-        .table("accounts")
-        .select(pk)
-        .eq("provider", "web")
-        .eq("provider_user_id", contact)
-        .limit(1)
-        .execute()
-    )
-    rows2 = (res2.data or []) if hasattr(res2, "data") else []
-    if rows2 and rows2[0].get(pk):
-        return str(rows2[0][pk])
+    try:
+        res2 = (
+            _sb()
+            .table("accounts")
+            .select(pk)
+            .eq("provider", "web")
+            .eq("provider_user_id", contact)
+            .limit(1)
+            .execute()
+        )
+        rows2 = (res2.data or []) if hasattr(res2, "data") else []
+        if rows2 and rows2[0].get(pk):
+            return str(rows2[0][pk])
+    except Exception:
+        pass
 
     return None
 
@@ -224,6 +229,7 @@ def request_otp():
             resp["debug"] = _safe_debug_info()
         return jsonify(resp), 500
 
+    # Determine email destination
     dest_email = ""
     if _is_email(contact):
         dest_email = contact
@@ -305,8 +311,10 @@ def verify_otp():
         return jsonify(resp), 401
 
     row = rows[0]
+
+    # expiry check
     try:
-        exp = datetime.fromisoformat(str(row["expires_at"]).replace("Z", "+00:00"))
+        exp = datetime.fromisoformat(str(row.get("expires_at")).replace("Z", "+00:00"))
         if _now_utc() > exp.astimezone(timezone.utc):
             return jsonify({"ok": False, "error": "otp_expired"}), 401
     except Exception:
@@ -397,9 +405,8 @@ def logout():
             raw = auth[7:].strip()
 
     if raw:
-        # best effort; ignore errors
         try:
-            revoke_token(raw)
+            revoke_token(raw, table=WEB_TOKEN_TABLE)
         except Exception:
             pass
 
