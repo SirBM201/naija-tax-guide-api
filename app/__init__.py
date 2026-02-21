@@ -25,13 +25,12 @@ def _truthy(v: str | None) -> bool:
 
 def _cookie_mode_enabled() -> bool:
     """
-    If you enable cookie auth, we MUST do credentialed CORS with explicit origins.
-    We trigger cookie-mode if:
-      - WEB_COOKIE_NAME is set (default is ntg_session)
-      - OR COOKIE_AUTH_ENABLED=1
+    Cookie auth should be explicitly enabled.
+    Otherwise you'll accidentally force credentialed CORS and break '*' origins.
     """
     if _truthy(os.getenv("COOKIE_AUTH_ENABLED", "")):
         return True
+    return False
     cookie_name = (os.getenv("WEB_COOKIE_NAME", "ntg_session") or "ntg_session").strip()
     return bool(cookie_name)  # default enables cookie name, but cookie-mode still depends on frontend using cookies
 
