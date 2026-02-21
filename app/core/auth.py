@@ -6,7 +6,7 @@ import os
 import traceback
 from datetime import datetime, timezone
 from functools import wraps
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Dict
 
 from flask import g, jsonify, request
 
@@ -55,69 +55,116 @@ def _dbg(msg: str) -> None:
         print(msg, flush=True)
 
 
+def _validate_web_token() -> Dict[str, Any]:
+    """
+    Shared validator for web session tokens stored in WEB_TOKEN_TABLE.
+    Returns:
+      {"ok": True, "account_id": "...", "token_hash": "..."} on success
+      {"ok": False, "status": 401, "error": "..."} on failure
+    """
+    raw = _get_bearer_token()
+    if not raw:
+        _dbg("[auth] missing_token: no Authorization: Bearer <token> header")
+        return {"ok": False, "status": 401, "error": "missing_token"}
+
+    th = _token_hash(raw)
+    th_prefix = th[:12]  # safe prefix for correlation
+
+    try:
+        _dbg(f"[auth] start token_hash_prefix={th_prefix} path={request.path} method={request.method}")
+
+        res = (
+            _sb()
+            .table(WEB_TOKEN_TABLE)
+            .select("account_id, expires_at, revoked")
+            .eq("token_hash", th)
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        if not rows:
+            _dbg(f"[auth] invalid_token: token_hash_prefix={th_prefix} not found in {WEB_TOKEN_TABLE}")
+            return {"ok": False, "status": 401, "error": "invalid_token"}
+
+        row = rows[0]
+        if row.get("revoked") is True:
+            _dbg(f"[auth] token_revoked: token_hash_prefix={th_prefix}")
+            return {"ok": False, "status": 401, "error": "token_revoked"}
+
+        expires_at = row.get("expires_at")
+        if expires_at:
+            v = str(expires_at).replace("Z", "+00:00")
+            exp_dt = datetime.fromisoformat(v).astimezone(timezone.utc)
+            if _now_utc() > exp_dt:
+                _dbg(f"[auth] token_expired: token_hash_prefix={th_prefix} exp={exp_dt.isoformat()}")
+                return {"ok": False, "status": 401, "error": "token_expired"}
+
+        # touch last_seen_at best-effort (won't break auth if column missing)
+        try:
+            _sb().table(WEB_TOKEN_TABLE).update(
+                {"last_seen_at": _now_utc().isoformat()}
+            ).eq("token_hash", th).execute()
+        except Exception as e:
+            _dbg(f"[auth] last_seen_at update skipped: {type(e).__name__}: {str(e)[:140]}")
+
+        account_id = row.get("account_id")
+        if not account_id:
+            _dbg(f"[auth] auth_failed: missing account_id in token row token_hash_prefix={th_prefix}")
+            return {"ok": False, "status": 401, "error": "auth_failed"}
+
+        _dbg(f"[auth] ok account_id={account_id} token_hash_prefix={th_prefix}")
+        return {"ok": True, "account_id": account_id, "token_hash": th}
+
+    except Exception as e:
+        _dbg(f"[auth] auth_failed: {type(e).__name__}: {str(e)[:200]}")
+        _dbg("[auth] traceback:\n" + traceback.format_exc())
+        return {"ok": False, "status": 401, "error": "auth_failed"}
+
+
 def require_auth_plus(fn: Callable[..., Any]) -> Callable[..., Any]:
     """
-    Validates web session tokens stored in WEB_TOKEN_TABLE.
+    Decorator used by routes that read auth state from flask.g
     Sets:
       g.account_id = <uuid string from web_tokens.account_id>
       g.web_token_hash = <hashed token>
+    Does NOT pass ctx into the handler.
     """
     @wraps(fn)
     def wrapper(*args, **kwargs):
-        raw = _get_bearer_token()
-        if not raw:
-            _dbg("[auth] missing_token: no Authorization: Bearer <token> header")
-            return jsonify({"ok": False, "error": "missing_token"}), 401
+        verdict = _validate_web_token()
+        if not verdict.get("ok"):
+            return jsonify({"ok": False, "error": verdict.get("error")}), int(verdict.get("status") or 401)
 
-        th = _token_hash(raw)
-        th_prefix = th[:12]  # safe prefix for correlation
+        g.account_id = verdict["account_id"]
+        g.web_token_hash = verdict["token_hash"]
+        return fn(*args, **kwargs)
 
-        try:
-            _dbg(f"[auth] start token_hash_prefix={th_prefix} path={request.path} method={request.method}")
+    return wrapper
 
-            res = (
-                _sb()
-                .table(WEB_TOKEN_TABLE)
-                .select("account_id, expires_at, revoked")
-                .eq("token_hash", th)
-                .limit(1)
-                .execute()
-            )
-            rows = res.data or []
-            if not rows:
-                _dbg(f"[auth] invalid_token: token_hash_prefix={th_prefix} not found in {WEB_TOKEN_TABLE}")
-                return jsonify({"ok": False, "error": "invalid_token"}), 401
 
-            row = rows[0]
-            if row.get("revoked") is True:
-                _dbg(f"[auth] token_revoked: token_hash_prefix={th_prefix}")
-                return jsonify({"ok": False, "error": "token_revoked"}), 401
+def require_web_auth(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """
+    Backward-compatible decorator expected by web_chat routes.
 
-            expires_at = row.get("expires_at")
-            if expires_at:
-                v = str(expires_at).replace("Z", "+00:00")
-                exp_dt = datetime.fromisoformat(v).astimezone(timezone.utc)
-                if _now_utc() > exp_dt:
-                    _dbg(f"[auth] token_expired: token_hash_prefix={th_prefix} exp={exp_dt.isoformat()}")
-                    return jsonify({"ok": False, "error": "token_expired"}), 401
+    It validates the same web token, sets flask.g, AND passes a ctx dict
+    as the first positional argument to the view function:
 
-            # touch last_seen_at best-effort (won't break auth if column missing)
-            try:
-                _sb().table(WEB_TOKEN_TABLE).update(
-                    {"last_seen_at": _now_utc().isoformat()}
-                ).eq("token_hash", th).execute()
-            except Exception as e:
-                _dbg(f"[auth] last_seen_at update skipped: {type(e).__name__}: {str(e)[:140]}")
+      def handler(ctx, ...):
+          account_id = ctx["account_id"]
+    """
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        verdict = _validate_web_token()
+        if not verdict.get("ok"):
+            return jsonify({"ok": False, "error": verdict.get("error")}), int(verdict.get("status") or 401)
 
-            g.account_id = row.get("account_id")
-            g.web_token_hash = th
+        g.account_id = verdict["account_id"]
+        g.web_token_hash = verdict["token_hash"]
 
-            _dbg(f"[auth] ok account_id={g.account_id} token_hash_prefix={th_prefix}")
-            return fn(*args, **kwargs)
-
-        except Exception as e:
-            _dbg(f"[auth] auth_failed: {type(e).__name__}: {str(e)[:200]}")
-            _dbg("[auth] traceback:\n" + traceback.format_exc())
-            return jsonify({"ok": False, "error": "auth_failed"}), 401
+        ctx = {
+            "account_id": verdict["account_id"],
+            "web_token_hash": verdict["token_hash"],
+        }
+        return fn(ctx, *args, **kwargs)
 
     return wrapper
