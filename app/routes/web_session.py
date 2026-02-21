@@ -6,25 +6,33 @@ from flask import Blueprint, jsonify, g
 
 from app.core.auth import require_auth_plus
 from app.core.supabase_client import supabase
-from app.services.web_tokens_service import revoke_token
 
 bp = Blueprint("web_session", __name__)
 
 
+def _sb():
+    return supabase() if callable(supabase) else supabase
+
+
 def _get_account(account_id: str) -> Optional[Dict[str, Any]]:
-    try:
-        res = (
-            supabase()
-            .table("accounts")
-            .select("account_id, provider, provider_user_id, display_name, phone, created_at")
-            .eq("account_id", account_id)
-            .limit(1)
-            .execute()
-        )
-        rows = (res.data or []) if hasattr(res, "data") else []
-        return rows[0] if rows else None
-    except Exception:
-        return None
+    # Support schemas where PK may be account_id or id
+    for pk in ("account_id", "id"):
+        try:
+            # Only query columns that exist (best effort)
+            res = (
+                _sb()
+                .table("accounts")
+                .select("*")
+                .eq(pk, account_id)
+                .limit(1)
+                .execute()
+            )
+            rows = (res.data or []) if hasattr(res, "data") else []
+            if rows:
+                return rows[0]
+        except Exception:
+            continue
+    return None
 
 
 # Support BOTH endpoints (in case you registered blueprints differently)
@@ -33,53 +41,54 @@ def _get_account(account_id: str) -> Optional[Dict[str, Any]]:
 @require_auth_plus
 def me():
     account_id = getattr(g, "account_id", None)
-    token_row = getattr(g, "token_row", {}) or {}
-
     if not account_id:
         return jsonify({"ok": False, "error": "Unauthorized"}), 401
 
-    acct = _get_account(account_id)
+    acct = _get_account(str(account_id))
     if not acct:
         return jsonify({"ok": False, "error": "Unauthorized"}), 401
 
     phone = (acct.get("phone") or acct.get("provider_user_id") or "").strip()
 
-    return jsonify(
-        {
-            "ok": True,
-            "account": {
-                "account_id": acct.get("account_id"),
-                "display_name": acct.get("display_name"),
-                "phone_e164": phone,
-                "provider": acct.get("provider"),
-                "provider_user_id": acct.get("provider_user_id"),
-                "created_at": acct.get("created_at"),
-            },
-            "auth": {"token_expires_at": token_row.get("expires_at")},
-            # keep these keys stable even if not yet wired
-            "subscription": getattr(g, "subscription", {}) or {},
-            "credits": getattr(g, "credits", {}) or {},
-        }
-    ), 200
+    # require_auth_plus (latest) sets:
+    # g.raw_token_source and g.web_token_hash
+    # Some earlier versions used different names, so we keep best-effort.
+    source = getattr(g, "raw_token_source", None) or getattr(g, "auth_source", None)
+
+    return (
+        jsonify(
+            {
+                "ok": True,
+                "account": {
+                    "account_id": acct.get("account_id") or acct.get("id"),
+                    "display_name": acct.get("display_name"),
+                    "phone_e164": phone,
+                    "provider": acct.get("provider"),
+                    "provider_user_id": acct.get("provider_user_id"),
+                    "created_at": acct.get("created_at"),
+                },
+                "auth": {
+                    "source": source,
+                },
+                # keep these keys stable even if not yet wired
+                "subscription": getattr(g, "subscription", {}) or {},
+                "credits": getattr(g, "credits", {}) or {},
+            }
+        ),
+        200,
+    )
 
 
 @bp.get("/billing/me")
 @require_auth_plus
 def billing_me():
-    return jsonify(
-        {
-            "ok": True,
-            "subscription": getattr(g, "subscription", {}) or {},
-            "credits": getattr(g, "credits", {}) or {},
-        }
-    ), 200
-
-
-@bp.post("/web/auth/logout")
-@require_auth_plus
-def logout():
-    token = getattr(g, "auth_token", "") or ""
-    ok, err = revoke_token(token)
-    if not ok:
-        return jsonify({"ok": False, "error": err or "Failed to logout"}), 500
-    return jsonify({"ok": True}), 200
+    return (
+        jsonify(
+            {
+                "ok": True,
+                "subscription": getattr(g, "subscription", {}) or {},
+                "credits": getattr(g, "credits", {}) or {},
+            }
+        ),
+        200,
+    )
