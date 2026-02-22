@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import secrets
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from flask import Blueprint, jsonify, request, make_response
 
@@ -37,11 +38,7 @@ def _truthy(v: str | None) -> bool:
 # Cookie config
 # -------------------------
 def _cookie_name() -> str:
-    return (
-        _env("WEB_AUTH_COOKIE_NAME")
-        or _env("WEB_COOKIE_NAME")
-        or "ntg_session"
-    ).strip()
+    return (_env("WEB_AUTH_COOKIE_NAME") or _env("WEB_COOKIE_NAME") or "ntg_session").strip()
 
 
 def _cookie_secure() -> bool:
@@ -49,7 +46,6 @@ def _cookie_secure() -> bool:
 
 
 def _cookie_samesite() -> str:
-    # cross-site (Vercel -> Koyeb) requires None + Secure
     return (_env("WEB_AUTH_COOKIE_SAMESITE", _env("COOKIE_SAMESITE", "None")) or "None").strip()
 
 
@@ -59,9 +55,8 @@ def _cookie_domain() -> Optional[str]:
 
 
 ENV = _env("ENV", "prod").lower()
-
-WEB_AUTH_ENABLED = (_env("WEB_AUTH_ENABLED", "1") == "1") or (_env("WEB_AUTH_ENABLED", "true").lower() == "true")
-WEB_AUTH_DEBUG = (_env("WEB_AUTH_DEBUG", "0") == "1")
+WEB_AUTH_ENABLED = _env("WEB_AUTH_ENABLED", "1").strip().lower() in {"1", "true", "yes", "y", "on"}
+WEB_AUTH_DEBUG = _env("WEB_AUTH_DEBUG", "0").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 WEB_OTP_TABLE = _env("WEB_OTP_TABLE", "web_otps")
 WEB_TOKEN_TABLE = _env("WEB_TOKEN_TABLE", "web_tokens")
@@ -70,7 +65,6 @@ WEB_OTP_TTL_MINUTES = int(_env("WEB_OTP_TTL_MINUTES", "10") or "10")
 WEB_SESSION_TTL_DAYS = int(_env("WEB_SESSION_TTL_DAYS", "30") or "30")
 
 WEB_OTP_PEPPER = _env("WEB_OTP_PEPPER", _env("WEB_TOKEN_PEPPER", ""))
-
 WEB_DEV_RETURN_OTP = (_env("WEB_DEV_RETURN_OTP", "0") == "1") or (ENV == "dev")
 
 
@@ -122,6 +116,53 @@ def _safe_debug_info() -> Dict[str, Any]:
     }
 
 
+# -------------------------
+# Rootcause exposer helpers
+# -------------------------
+def _clip(s: str, n: int = 220) -> str:
+    s = (s or "")
+    return s if len(s) <= n else s[:n] + "…"
+
+
+def _read_json_body() -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """
+    Returns (data, meta)
+    meta contains SAFE request diagnostics (no secrets).
+    """
+    meta: Dict[str, Any] = {
+        "content_type": (request.headers.get("Content-Type") or "").strip(),
+        "content_length": request.content_length,
+        "json_parsed": False,
+        "fallback_json_parsed": False,
+        "raw_body_preview": "",
+        "raw_body_len": 0,
+        "keys": [],
+    }
+
+    # 1) Flask JSON parse
+    data = request.get_json(silent=True)
+    if isinstance(data, dict):
+        meta["json_parsed"] = True
+        meta["keys"] = sorted(list(data.keys()))
+        return data, meta
+
+    # 2) Fallback: raw body
+    raw = request.get_data(cache=False, as_text=True) or ""
+    meta["raw_body_len"] = len(raw)
+    meta["raw_body_preview"] = _clip(raw, 200)
+
+    try:
+        parsed = json.loads(raw) if raw else {}
+        if isinstance(parsed, dict):
+            meta["fallback_json_parsed"] = True
+            meta["keys"] = sorted(list(parsed.keys()))
+            return parsed, meta
+    except Exception as e:
+        meta["fallback_error"] = f"{type(e).__name__}:{_clip(str(e), 120)}"
+
+    return {}, meta
+
+
 def _account_pk_column() -> str:
     if _has_column("accounts", "account_id"):
         return "account_id"
@@ -160,6 +201,7 @@ def _upsert_account_for_contact(contact: str) -> Optional[str]:
     except Exception:
         pass
 
+    # fallback re-query
     res2 = (
         _sb()
         .table("accounts")
@@ -185,13 +227,16 @@ def request_otp():
     if not WEB_AUTH_ENABLED:
         return jsonify({"ok": False, "error": "web_auth_disabled"}), 403
 
-    data: Dict[str, Any] = request.get_json(silent=True) or {}
+    data, meta = _read_json_body()
     contact = _normalize_contact(str(data.get("contact") or ""))
     purpose = (str(data.get("purpose") or "web_login")).strip()
     email_to = (str(data.get("email") or "") or "").strip().lower()
 
     if not contact:
-        return jsonify({"ok": False, "error": "missing_contact"}), 400
+        out = {"ok": False, "error": "missing_contact"}
+        if WEB_AUTH_DEBUG:
+            out["debug"] = {"why": "contact_missing_or_empty", "req": meta, **_safe_debug_info()}
+        return jsonify(out), 400
 
     otp = f"{secrets.randbelow(1000000):06d}"
     expires_at = _now_utc() + timedelta(minutes=WEB_OTP_TTL_MINUTES)
@@ -209,7 +254,7 @@ def request_otp():
     except Exception:
         out = {"ok": False, "error": "otp_store_failed"}
         if WEB_AUTH_DEBUG:
-            out["debug"] = _safe_debug_info()
+            out["debug"] = {"why": "db_insert_failed", "req": meta, **_safe_debug_info()}
         return jsonify(out), 500
 
     dest_email = ""
@@ -221,12 +266,7 @@ def request_otp():
     sent_email = False
     email_err: Optional[str] = None
     if dest_email:
-        email_err = send_email_otp(
-            to_email=dest_email,
-            otp=otp,
-            purpose=purpose,
-            ttl_minutes=WEB_OTP_TTL_MINUTES,
-        )
+        email_err = send_email_otp(dest_email, otp, purpose, WEB_OTP_TTL_MINUTES)
         sent_email = (email_err is None)
 
     out: Dict[str, Any] = {
@@ -235,7 +275,6 @@ def request_otp():
         "email_sent": bool(sent_email),
         "email_to": dest_email or None,
     }
-
     if dest_email and email_err:
         out["email_error"] = email_err
 
@@ -244,9 +283,8 @@ def request_otp():
         out["smtp_configured"] = smtp_is_configured()
 
     if WEB_AUTH_DEBUG:
-        out["debug"] = _safe_debug_info()
+        out["debug"] = {"req": meta, **_safe_debug_info()}
 
-    # IMPORTANT: request_otp does NOT set cookies.
     return jsonify(out), 200
 
 
@@ -259,7 +297,8 @@ def verify_otp():
     if not WEB_AUTH_ENABLED:
         return jsonify({"ok": False, "error": "web_auth_disabled"}), 403
 
-    data: Dict[str, Any] = request.get_json(silent=True) or {}
+    data, meta = _read_json_body()
+
     contact = _normalize_contact(str(data.get("contact") or ""))
     purpose = (str(data.get("purpose") or "web_login")).strip()
     otp = str(data.get("otp") or "").strip()
@@ -267,7 +306,17 @@ def verify_otp():
     if not contact or not otp:
         out = {"ok": False, "error": "invalid_request"}
         if WEB_AUTH_DEBUG:
-            out["debug"] = _safe_debug_info()
+            missing = []
+            if not contact:
+                missing.append("contact")
+            if not otp:
+                missing.append("otp")
+            out["debug"] = {
+                "why": "missing_required_fields",
+                "missing": missing,
+                "req": meta,
+                **_safe_debug_info(),
+            }
         return jsonify(out), 400
 
     code_hash = _otp_hash(contact, purpose, otp)
@@ -288,7 +337,7 @@ def verify_otp():
     if not rows:
         out = {"ok": False, "error": "invalid_otp"}
         if WEB_AUTH_DEBUG:
-            out["debug"] = _safe_debug_info()
+            out["debug"] = {"why": "no_matching_otp_row", "req": meta, **_safe_debug_info()}
         return jsonify(out), 401
 
     row = rows[0]
@@ -312,7 +361,7 @@ def verify_otp():
     if not account_id:
         out = {"ok": False, "error": "account_create_failed"}
         if WEB_AUTH_DEBUG:
-            out["debug"] = _safe_debug_info()
+            out["debug"] = {"why": "account_upsert_failed", "req": meta, **_safe_debug_info()}
         return jsonify(out), 500
 
     raw_token = secrets.token_hex(32)
@@ -323,7 +372,6 @@ def verify_otp():
         "account_id": account_id,
         "expires_at": expires_at.isoformat(),
     }
-
     if _has_column(WEB_TOKEN_TABLE, "revoked"):
         insert_payload["revoked"] = False
     if _has_column(WEB_TOKEN_TABLE, "revoked_at"):
@@ -338,7 +386,7 @@ def verify_otp():
     except Exception:
         out = {"ok": False, "error": "token_issue_failed"}
         if WEB_AUTH_DEBUG:
-            out["debug"] = _safe_debug_info()
+            out["debug"] = {"why": "token_insert_failed", "req": meta, **_safe_debug_info()}
         return jsonify(out), 500
 
     out: Dict[str, Any] = {
@@ -349,7 +397,7 @@ def verify_otp():
         "auth_mode": "cookie+bearer",
     }
     if WEB_AUTH_DEBUG:
-        out["debug"] = _safe_debug_info()
+        out["debug"] = {"req": meta, **_safe_debug_info()}
 
     resp = make_response(jsonify(out), 200)
     resp.set_cookie(
