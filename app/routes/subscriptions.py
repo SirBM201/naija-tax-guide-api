@@ -38,6 +38,22 @@ def subscription_status():
 
 @bp.post("/subscription/activate")
 def subscription_activate():
+    """
+    ADMIN ONLY: upsert a subscription row for testing.
+
+    Header:
+      X-Admin-Key: <ADMIN_KEY>
+
+    Body:
+      {
+        "account_id": "<uuid>",
+        "plan_code": "monthly|quarterly|yearly|trial|manual",
+        "status": "active" (optional),
+        "expires_at": "2026-03-01T00:00:00Z" (optional),
+        "grace_until": "..." (optional),
+        "trial_until": "..." (optional)
+      }
+    """
     if not _admin_key_configured():
         return (
             jsonify(
@@ -64,10 +80,12 @@ def subscription_activate():
         )
 
     body: Dict[str, Any] = request.get_json(silent=True) or {}
+
     account_id = (body.get("account_id") or body.get("user_id") or "").strip()
     plan_code = (body.get("plan_code") or body.get("plan") or "manual").strip()
-    expires_at = body.get("expires_at")
     status = (body.get("status") or "active").strip()
+
+    expires_at = body.get("expires_at")
     grace_until = body.get("grace_until")
     trial_until = body.get("trial_until")
 
@@ -75,10 +93,10 @@ def subscription_activate():
         return jsonify({"ok": False, "error": "missing_account_id"}), 400
 
     res = activate_subscription_now(
-        user_id=account_id,
+        account_id=account_id,
         plan_code=plan_code,
-        expires_at_iso=expires_at,
         status=status,
+        expires_at_iso=expires_at,
         grace_until_iso=grace_until,
         trial_until_iso=trial_until,
     )
