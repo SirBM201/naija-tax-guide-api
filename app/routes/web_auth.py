@@ -1,453 +1,224 @@
-# app/routes/web_auth.py
+# app/__init__.py
 from __future__ import annotations
 
-import hashlib
-import json
 import os
-import secrets
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List, Union
 
-from flask import Blueprint, jsonify, request, make_response
+from flask import Flask, jsonify, request
+from flask_cors import CORS
 
-from app.core.supabase_client import supabase
-from app.core.auth import token_hash
-from app.services.web_tokens_service import revoke_token
-from app.services.email_service import send_email_otp, smtp_is_configured
-
-bp = Blueprint("web_auth", __name__)
+from app.core.config import API_PREFIX, CORS_ORIGINS
 
 
-def _sb():
-    return supabase() if callable(supabase) else supabase
-
-
-def _now_utc() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def _env(name: str, default: str = "") -> str:
-    return (os.getenv(name, default) or default).strip()
+def _normalize_api_prefix(v: str) -> str:
+    v = (v or "").strip()
+    if not v:
+        return "/api"
+    if not v.startswith("/"):
+        v = "/" + v
+    return v.rstrip("/")
 
 
 def _truthy(v: str | None) -> bool:
     return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-# -------------------------
-# Cookie config
-# -------------------------
-def _cookie_name() -> str:
-    return (_env("WEB_AUTH_COOKIE_NAME") or _env("WEB_COOKIE_NAME") or "ntg_session").strip()
-
-
-def _cookie_secure() -> bool:
-    return _env("WEB_AUTH_COOKIE_SECURE", _env("COOKIE_SECURE", "1")) == "1"
-
-
-def _cookie_samesite() -> str:
-    return (_env("WEB_AUTH_COOKIE_SAMESITE", _env("COOKIE_SAMESITE", "None")) or "None").strip()
-
-
-def _cookie_domain() -> Optional[str]:
-    v = _env("WEB_AUTH_COOKIE_DOMAIN", _env("COOKIE_DOMAIN", "")).strip()
-    return v or None
-
-
-ENV = _env("ENV", "prod").lower()
-WEB_AUTH_ENABLED = _truthy(_env("WEB_AUTH_ENABLED", "1"))
-WEB_AUTH_DEBUG = _truthy(_env("WEB_AUTH_DEBUG", "0"))
-
-WEB_OTP_TABLE = _env("WEB_OTP_TABLE", "web_otps")
-WEB_TOKEN_TABLE = _env("WEB_TOKEN_TABLE", "web_tokens")
-
-WEB_OTP_TTL_MINUTES = int(_env("WEB_OTP_TTL_MINUTES", "10") or "10")
-WEB_SESSION_TTL_DAYS = int(_env("WEB_SESSION_TTL_DAYS", "30") or "30")
-
-WEB_OTP_PEPPER = _env("WEB_OTP_PEPPER", _env("WEB_TOKEN_PEPPER", ""))
-WEB_DEV_RETURN_OTP = (_env("WEB_DEV_RETURN_OTP", "0") == "1") or (ENV == "dev")
-
-
-def _sha256_hex(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()
-
-
-def _otp_hash(contact: str, purpose: str, otp: str) -> str:
-    return _sha256_hex(f"{WEB_OTP_PEPPER}:{contact}:{purpose}:{otp}")
-
-
-def _normalize_contact(v: str) -> str:
-    v = (v or "").strip()
-    if not v:
-        return ""
-    if "@" in v:
-        return v.lower()
-    if v.startswith("0"):
-        return "+234" + v[1:]
-    if v.startswith("234"):
-        return "+" + v
-    return v
-
-
-def _is_email(v: str) -> bool:
-    v = (v or "").strip()
-    return ("@" in v) and ("." in v)
-
-
-def _has_column(table: str, col: str) -> bool:
-    try:
-        _sb().table(table).select(col).limit(1).execute()
+def _cookie_mode_enabled() -> bool:
+    """
+    Cookie auth should be explicitly enabled.
+    Otherwise you'll accidentally force credentialed CORS and break '*' origins.
+    """
+    # Preferred explicit flag
+    if _truthy(os.getenv("COOKIE_AUTH_ENABLED", "")):
         return True
-    except Exception:
-        return False
+
+    # Backwards compat: allow enabling via WEB_AUTH_ENABLED + explicit cookie samesite/secure
+    if _truthy(os.getenv("WEB_AUTH_ENABLED", "")) and os.getenv("WEB_AUTH_COOKIE_SAMESITE"):
+        return True
+
+    return False
 
 
-def _safe_debug_info() -> Dict[str, Any]:
-    return {
-        "env": ENV,
-        "tables": {"otp_table": WEB_OTP_TABLE, "token_table": WEB_TOKEN_TABLE},
-        "cookie": {
-            "name": _cookie_name(),
-            "secure": _cookie_secure(),
-            "samesite": _cookie_samesite(),
-            "domain": _cookie_domain() or "",
-        },
-        "smtp_configured": bool(smtp_is_configured()),
-    }
-
-
-# -------------------------
-# Rootcause exposer helpers
-# -------------------------
-def _clip(s: str, n: int = 220) -> str:
-    s = (s or "")
-    return s if len(s) <= n else s[:n] + "…"
-
-
-def _read_json_body() -> Tuple[Dict[str, Any], Dict[str, Any]]:
+def _parse_origins(
+    origins_raw: str, *, cookie_mode: bool
+) -> Tuple[Union[str, List[str]], bool, Optional[str]]:
     """
-    Returns (data, meta)
-    meta contains SAFE request diagnostics (no secrets).
+    Returns (origins, supports_credentials, error_message_if_any)
+
+    IMPORTANT:
+      - If cookie_mode=True, origins MUST be an explicit list, not '*'
+      - supports_credentials must be True for cookies
     """
-    meta: Dict[str, Any] = {
-        "content_type": (request.headers.get("Content-Type") or "").strip(),
-        "content_length": request.content_length,
-        "json_parsed": False,
-        "fallback_json_parsed": False,
-        "raw_body_preview": "",
-        "raw_body_len": 0,
-        "keys": [],
-    }
+    raw = (origins_raw or "").strip()
 
-    data = request.get_json(silent=True)
-    if isinstance(data, dict):
-        meta["json_parsed"] = True
-        meta["keys"] = sorted(list(data.keys()))
-        return data, meta
-
-    raw = request.get_data(cache=False, as_text=True) or ""
-    meta["raw_body_len"] = len(raw)
-    meta["raw_body_preview"] = _clip(raw, 200)
-
-    try:
-        parsed = json.loads(raw) if raw else {}
-        if isinstance(parsed, dict):
-            meta["fallback_json_parsed"] = True
-            meta["keys"] = sorted(list(parsed.keys()))
-            return parsed, meta
-    except Exception as e:
-        meta["fallback_error"] = f"{type(e).__name__}:{_clip(str(e), 120)}"
-
-    return {}, meta
-
-
-def _account_pk_column() -> str:
-    if _has_column("accounts", "account_id"):
-        return "account_id"
-    if _has_column("accounts", "id"):
-        return "id"
-    return "account_id"
-
-
-def _upsert_account_for_contact(contact: str) -> Optional[str]:
-    pk = _account_pk_column()
-
-    res = (
-        _sb()
-        .table("accounts")
-        .select(pk)
-        .eq("provider", "web")
-        .eq("provider_user_id", contact)
-        .limit(1)
-        .execute()
-    )
-    rows = (res.data or []) if hasattr(res, "data") else []
-    if rows and rows[0].get(pk):
-        return str(rows[0][pk])
-
-    payload: Dict[str, Any] = {"provider": "web", "provider_user_id": contact}
-    if _has_column("accounts", "display_name"):
-        payload["display_name"] = contact
-    # keep legacy field usage if it exists
-    if _has_column("accounts", "phone_e164"):
-        payload["phone_e164"] = contact
-    elif _has_column("accounts", "phone"):
-        payload["phone"] = contact if not _is_email(contact) else None
-
-    try:
-        ins = _sb().table("accounts").insert(payload).execute()
-        inserted = (ins.data or []) if hasattr(ins, "data") else []
-        if inserted and inserted[0].get(pk):
-            return str(inserted[0][pk])
-    except Exception:
-        pass
-
-    # fallback re-query
-    res2 = (
-        _sb()
-        .table("accounts")
-        .select(pk)
-        .eq("provider", "web")
-        .eq("provider_user_id", contact)
-        .limit(1)
-        .execute()
-    )
-    rows2 = (res2.data or []) if hasattr(res2, "data") else []
-    if rows2 and rows2[0].get(pk):
-        return str(rows2[0][pk])
-
-    return None
-
-
-def _pick_contact_from_payload(data: Dict[str, Any]) -> str:
-    """
-    Accept multiple shapes:
-      - contact
-      - email  (your PowerShell tests use this)
-      - identifier / login / handle / user (common fallback keys)
-    """
-    for k in ("contact", "email", "identifier", "login", "handle", "user"):
-        v = str(data.get(k) or "").strip()
-        if v:
-            return _normalize_contact(v)
-    return ""
-
-
-# -------------------------------------------------
-# REQUEST OTP
-# -------------------------------------------------
-@bp.post("/request-otp")
-@bp.post("/web/auth/request-otp")
-def request_otp():
-    if not WEB_AUTH_ENABLED:
-        return jsonify({"ok": False, "error": "web_auth_disabled"}), 403
-
-    data, meta = _read_json_body()
-
-    contact = _pick_contact_from_payload(data)
-    purpose = (str(data.get("purpose") or "web_login")).strip()
-
-    if not contact:
-        out = {"ok": False, "error": "missing_contact"}
-        if WEB_AUTH_DEBUG:
-            out["debug"] = {"why": "no_contact_like_field_found", "req": meta, **_safe_debug_info()}
-        return jsonify(out), 400
-
-    otp = f"{secrets.randbelow(1000000):06d}"
-    expires_at = _now_utc() + timedelta(minutes=WEB_OTP_TTL_MINUTES)
-
-    try:
-        _sb().table(WEB_OTP_TABLE).insert(
-            {
-                # supports both "contact" and legacy "phone_e164" schemas
-                ("contact" if _has_column(WEB_OTP_TABLE, "contact") else "phone_e164"): contact,
-                "purpose": purpose if _has_column(WEB_OTP_TABLE, "purpose") else "web_login",
-                ("code_hash" if _has_column(WEB_OTP_TABLE, "code_hash") else "otp_hash"): _otp_hash(contact, purpose, otp),
-                "expires_at": expires_at.isoformat(),
-                ("used" if _has_column(WEB_OTP_TABLE, "used") else "revoked"): False,
-            }
-        ).execute()
-    except Exception as e:
-        out = {"ok": False, "error": "otp_store_failed"}
-        if WEB_AUTH_DEBUG:
-            out["debug"] = {
-                "why": "db_insert_failed",
-                "root_cause": _clip(repr(e), 300),
-                "req": meta,
-                **_safe_debug_info(),
-            }
-        return jsonify(out), 500
-
-    # Send email OTP when contact is an email
-    dest_email = contact if _is_email(contact) else ""
-    sent_email = False
-    email_err: Optional[str] = None
-
-    if dest_email:
-        email_err = send_email_otp(dest_email, otp, purpose, WEB_OTP_TTL_MINUTES)
-        sent_email = (email_err is None)
-
-    out: Dict[str, Any] = {
-        "ok": True,
-        "ttl_minutes": WEB_OTP_TTL_MINUTES,
-        "email_sent": bool(sent_email),
-        "email_to": dest_email or None,
-        "smtp_configured": bool(smtp_is_configured()),
-    }
-    if dest_email and email_err:
-        out["email_error"] = email_err
-
-    # Dev-only: return OTP for testing (your screenshot shows dev_otp is returned)
-    if WEB_DEV_RETURN_OTP:
-        out["dev_otp"] = otp
-
-    if WEB_AUTH_DEBUG:
-        out["debug"] = {"req": meta, **_safe_debug_info()}
-
-    return jsonify(out), 200
-
-
-# -------------------------------------------------
-# VERIFY OTP (SETS COOKIE)
-# -------------------------------------------------
-@bp.post("/verify-otp")
-@bp.post("/web/auth/verify-otp")
-def verify_otp():
-    if not WEB_AUTH_ENABLED:
-        return jsonify({"ok": False, "error": "web_auth_disabled"}), 403
-
-    data, meta = _read_json_body()
-
-    contact = _pick_contact_from_payload(data)
-    purpose = (str(data.get("purpose") or "web_login")).strip()
-    otp = str(data.get("otp") or "").strip()
-
-    if not contact or not otp:
-        out = {"ok": False, "error": "invalid_request"}
-        if WEB_AUTH_DEBUG:
-            missing = []
-            if not contact:
-                missing.append("contact/email/identifier/login/handle/user")
-            if not otp:
-                missing.append("otp")
-            out["debug"] = {"why": "missing_required_fields", "missing": missing, "req": meta, **_safe_debug_info()}
-        return jsonify(out), 400
-
-    computed_hash = _otp_hash(contact, purpose, otp)
-    hash_col = "code_hash" if _has_column(WEB_OTP_TABLE, "code_hash") else "otp_hash"
-    contact_col = "contact" if _has_column(WEB_OTP_TABLE, "contact") else "phone_e164"
-    used_col = "used" if _has_column(WEB_OTP_TABLE, "used") else "revoked"
-
-    q = (
-        _sb()
-        .table(WEB_OTP_TABLE)
-        .select("*")
-        .eq(contact_col, contact)
-        .eq(hash_col, computed_hash)
-        .eq(used_col, False)
-        .order("created_at", desc=True)
-        .limit(1)
-        .execute()
-    )
-    rows = (q.data or []) if hasattr(q, "data") else []
-    if not rows:
-        out = {"ok": False, "error": "invalid_otp"}
-        if WEB_AUTH_DEBUG:
-            out["debug"] = {"why": "no_matching_otp_row", "req": meta, **_safe_debug_info()}
-        return jsonify(out), 401
-
-    row = rows[0]
-    try:
-        exp = datetime.fromisoformat(str(row.get("expires_at", "")).replace("Z", "+00:00"))
-        if _now_utc() > exp.astimezone(timezone.utc):
-            return jsonify({"ok": False, "error": "otp_expired"}), 401
-    except Exception:
-        return jsonify({"ok": False, "error": "otp_expired"}), 401
-
-    # mark used/revoked best-effort
-    try:
-        if "id" in row:
-            if used_col == "used":
-                _sb().table(WEB_OTP_TABLE).update({"used": True, "used_at": _now_utc().isoformat()}).eq("id", row["id"]).execute()
-            else:
-                _sb().table(WEB_OTP_TABLE).update({"revoked": True}).eq("id", row["id"]).execute()
-    except Exception:
-        pass
-
-    account_id = _upsert_account_for_contact(contact)
-    if not account_id:
-        out = {"ok": False, "error": "account_create_failed"}
-        if WEB_AUTH_DEBUG:
-            out["debug"] = {"why": "account_upsert_failed", "req": meta, **_safe_debug_info()}
-        return jsonify(out), 500
-
-    raw_token = secrets.token_hex(32)
-    expires_at = _now_utc() + timedelta(days=WEB_SESSION_TTL_DAYS)
-
-    insert_payload: Dict[str, Any] = {
-        "token_hash": token_hash(raw_token),
-        "account_id": account_id,
-        "expires_at": expires_at.isoformat(),
-    }
-    if _has_column(WEB_TOKEN_TABLE, "revoked"):
-        insert_payload["revoked"] = False
-    if _has_column(WEB_TOKEN_TABLE, "revoked_at"):
-        insert_payload["revoked_at"] = None
-    if _has_column(WEB_TOKEN_TABLE, "created_at"):
-        insert_payload["created_at"] = _now_utc().isoformat()
-    if _has_column(WEB_TOKEN_TABLE, "last_seen_at"):
-        insert_payload["last_seen_at"] = _now_utc().isoformat()
-
-    try:
-        _sb().table(WEB_TOKEN_TABLE).insert(insert_payload).execute()
-    except Exception as e:
-        out = {"ok": False, "error": "token_issue_failed"}
-        if WEB_AUTH_DEBUG:
-            out["debug"] = {"why": "token_insert_failed", "root_cause": _clip(repr(e), 300), "req": meta, **_safe_debug_info()}
-        return jsonify(out), 500
-
-    out: Dict[str, Any] = {
-        "ok": True,
-        "token": raw_token,  # bearer also returned (matches your screenshot)
-        "account_id": account_id,
-        "expires_at": expires_at.isoformat(),
-        "auth_mode": "cookie+bearer",
-    }
-    if WEB_AUTH_DEBUG:
-        out["debug"] = {"req": meta, **_safe_debug_info()}
-
-    resp = make_response(jsonify(out), 200)
-    resp.set_cookie(
-        _cookie_name(),
-        raw_token,
-        httponly=True,
-        secure=_cookie_secure(),
-        samesite=_cookie_samesite(),
-        domain=_cookie_domain(),
-        path="/",
-        max_age=WEB_SESSION_TTL_DAYS * 24 * 60 * 60,
-    )
-    return resp
-
-
-# -------------------------------------------------
-# LOGOUT
-# -------------------------------------------------
-@bp.post("/logout")
-@bp.post("/web/auth/logout")
-def logout():
-    raw = (request.cookies.get(_cookie_name()) or "").strip()
     if not raw:
-        auth = (request.headers.get("Authorization") or "").strip()
-        if auth.lower().startswith("bearer "):
-            raw = auth[7:].strip()
+        if cookie_mode:
+            return [], True, "CORS_ORIGINS is empty but cookie auth requires explicit origins."
+        return "*", False, None
 
-    if raw:
-        try:
-            revoke_token(raw)
-        except Exception:
-            pass
+    if raw == "*":
+        if cookie_mode:
+            return [], True, "CORS_ORIGINS='*' is not allowed with cookie auth. Use explicit comma-separated origins."
+        return "*", False, None
 
-    resp = make_response(jsonify({"ok": True}), 200)
-    resp.delete_cookie(_cookie_name(), domain=_cookie_domain(), path="/")
-    return resp
+    origins = [o.strip() for o in raw.split(",") if o.strip()]
+    if not origins:
+        if cookie_mode:
+            return [], True, "CORS_ORIGINS parsed empty but cookie auth requires explicit origins."
+        return "*", False, None
+
+    if cookie_mode:
+        return origins, True, None
+
+    return origins, False, None
+
+
+def _import_attr(dotted: str, attr: str) -> Tuple[Optional[Any], Optional[str]]:
+    try:
+        mod = __import__(dotted, fromlist=[attr])
+        obj = getattr(mod, attr)
+        return obj, None
+    except Exception as e:
+        return None, f"{dotted}:{attr} -> {repr(e)}"
+
+
+def create_app() -> Flask:
+    app = Flask(__name__)
+
+    api_prefix = _normalize_api_prefix(API_PREFIX)
+
+    cookie_mode = _cookie_mode_enabled()
+    origins, supports_credentials, cors_err = _parse_origins(CORS_ORIGINS, cookie_mode=cookie_mode)
+
+    if cors_err:
+        raise RuntimeError(f"[CORS] {cors_err}")
+
+    # CORS
+    CORS(
+        app,
+        resources={rf"{api_prefix}/*": {"origins": origins}},
+        supports_credentials=supports_credentials,
+        allow_headers=[
+            "Content-Type",
+            "Authorization",
+            "X-Auth-Token",
+            "X-Requested-With",
+            "X-Admin-Key",
+            "X-Debug",
+        ],
+        expose_headers=["Set-Cookie"],
+        methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        max_age=86400,
+    )
+
+    boot: Dict[str, Any] = {
+        "api_prefix": api_prefix,
+        "cookie_mode": cookie_mode,
+        "cors": {"origins": origins, "supports_credentials": supports_credentials},
+        "required": [],
+        "optional": [],
+        "errors": [],
+    }
+
+    strict = (os.getenv("STRICT_BLUEPRINTS", "1").strip() != "0")
+
+    def _register_bp(
+        dotted: str,
+        attr: str = "bp",
+        required: bool = True,
+        url_prefix: Optional[str] = api_prefix,
+    ):
+        obj, err = _import_attr(dotted, attr)
+        entry = {"module": dotted, "attr": attr, "registered": False, "url_prefix": url_prefix, "error": err}
+
+        if obj is None:
+            (boot["required"] if required else boot["optional"]).append(entry)
+            if err:
+                boot["errors"].append(entry)
+            if required and strict:
+                raise RuntimeError(f"[boot] REQUIRED blueprint import failed: {err}")
+            return
+
+        bp_name = getattr(obj, "name", None) or f"{dotted}:{attr}"
+
+        if not hasattr(app, "_bp_names"):
+            app._bp_names = set()  # type: ignore[attr-defined]
+
+        if bp_name in app._bp_names:  # type: ignore[attr-defined]
+            msg = f"[boot] Duplicate blueprint name detected: {bp_name} from {dotted}:{attr}"
+            entry["error"] = msg
+            boot["errors"].append(entry)
+            if required and strict:
+                raise RuntimeError(msg)
+            return
+
+        app._bp_names.add(bp_name)  # type: ignore[attr-defined]
+
+        if url_prefix:
+            app.register_blueprint(obj, url_prefix=url_prefix)
+        else:
+            app.register_blueprint(obj)
+
+        entry["registered"] = True
+        (boot["required"] if required else boot["optional"]).append(entry)
+
+    # REQUIRED: core API routes
+    required_modules = [
+        "app.routes.health",
+        "app.routes.accounts",
+        "app.routes.subscriptions",
+        "app.routes.ask",
+        "app.routes.webhooks",
+        "app.routes.plans",
+        "app.routes.link_tokens",
+        "app.routes.admin_link_tokens",
+        "app.routes.accounts_admin",
+        "app.routes.meta",
+        "app.routes.email_link",
+        "app.routes.web_auth",
+        "app.routes.web_session",
+        "app.routes.paystack_webhook",
+        "app.routes.debug_routes",
+        "app.routes._debug",
+    ]
+    for dotted in required_modules:
+        _register_bp(dotted, "bp", required=True, url_prefix=api_prefix)
+
+    # OPTIONAL: paystack helpers and cron (cron typically has NO api prefix)
+    _register_bp("app.routes.paystack", "paystack_bp", required=False, url_prefix=api_prefix)
+    _register_bp("app.routes.cron", "bp", required=False, url_prefix=None)
+
+    # OPTIONAL: multi-channel + web UI helpers
+    optional_modules = [
+        "app.routes.whatsapp",
+        "app.routes.telegram",
+        "app.routes.web_ask",
+        "app.routes.web_chat",
+        "app.routes.billing",
+    ]
+    for dotted in optional_modules:
+        _register_bp(dotted, "bp", required=False, url_prefix=api_prefix)
+
+    # --- Safe diagnostics endpoint for production ---
+    @app.get(f"{api_prefix}/_boot")
+    def boot_report():
+        return jsonify({"ok": True, "boot": boot, "strict": strict})
+
+    # --- Root-cause exposer (SAFE) ---
+    # Only returns a short reason + request id. Full trace is NOT returned.
+    @app.errorhandler(Exception)
+    def _handle_any_error(e: Exception):
+        # Keep prod safe: do NOT leak secrets or stacktraces.
+        # You can still see full trace in Koyeb logs.
+        status = getattr(e, "code", 500)
+        msg = str(e) or type(e).__name__
+
+        # Allow a tiny bit more info if X-Debug: 1 is present (still clipped).
+        debug_on = (request.headers.get("X-Debug") or "").strip() == "1"
+        out: Dict[str, Any] = {"ok": False, "error": type(e).__name__, "message": msg[:220]}
+        if debug_on:
+            out["debug"] = {"path": request.path, "method": request.method}
+
+        return jsonify(out), status
+
+    return app
