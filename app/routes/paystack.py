@@ -1,34 +1,49 @@
 # app/routes/paystack.py
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple
-
+from typing import Any, Dict, Optional
 from flask import Blueprint, jsonify, request
 
 from app.core.supabase_client import supabase
 from app.services.plans_service import get_plan
 from app.services.paystack_service import (
-    PaystackHTTPError,
     create_reference,
     initialize_transaction,
     verify_transaction,
-    verify_webhook_signature,
+    health as paystack_health,
 )
 from app.services.subscriptions_service import activate_subscription_now
 
-# IMPORTANT: must be named "bp" (your app registers dotted:...:bp)
-bp = Blueprint("paystack", __name__)
+paystack_bp = Blueprint("paystack", __name__)
+
+# Optional alias so older imports like app.routes.paystack:bp still work
+bp = paystack_bp
 
 
 def _sb():
     return supabase() if callable(supabase) else supabase
 
 
-def _get_json_body() -> Dict[str, Any]:
-    return request.get_json(silent=True) or {}
+def _json_error(status: int, code: str, *, message: str = "", root_cause: Any = None, extra: Dict[str, Any] | None = None):
+    payload: Dict[str, Any] = {"ok": False, "error": code}
+    if message:
+        payload["message"] = message
+    if root_cause is not None:
+        payload["root_cause"] = root_cause
+    if extra:
+        payload["extra"] = extra
+    return jsonify(payload), status
 
 
-def _account_exists(account_id: str) -> bool:
+def _ensure_account_exists(account_id: str, email: str) -> Optional[Dict[str, Any]]:
+    """
+    Fixes FK failures by ensuring accounts row exists before writing user_subscriptions.
+    We keep it minimal (provider=web, provider_user_id=email) so it won't break existing model.
+    """
+    if not account_id:
+        return None
+
+    # 1) check exists
     try:
         res = (
             _sb()
@@ -39,110 +54,124 @@ def _account_exists(account_id: str) -> bool:
             .execute()
         )
         rows = (res.data or []) if hasattr(res, "data") else []
-        return bool(rows)
+        if rows:
+            return rows[0]
     except Exception:
-        # If Supabase is down, fail safe (don’t take money)
-        return False
+        pass
+
+    # 2) create stub (best-effort)
+    try:
+        ins = (
+            _sb()
+            .table("accounts")
+            .insert(
+                {
+                    "account_id": account_id,
+                    "provider": "web",
+                    "provider_user_id": (email or "").strip() or account_id,
+                    "display_name": (email or "").strip(),
+                }
+            )
+            .execute()
+        )
+        rows = (ins.data or []) if hasattr(ins, "data") else []
+        return rows[0] if rows else {"account_id": account_id}
+    except Exception as e:
+        # If it fails (RLS etc), we return None and let caller expose root cause
+        return None
 
 
-def _extract_init_fields(body: Dict[str, Any]) -> Tuple[str, str, str]:
+@paystack_bp.get("/paystack/health")
+def health():
+    return jsonify(paystack_health()), 200
+
+
+@paystack_bp.post("/paystack/init")
+def paystack_init():
     """
-    Accept BOTH formats:
+    Start a Paystack payment.
 
-    A) Preferred:
-      { "email": "...", "account_id": "...", "plan_code": "monthly" }
+    Supports TWO modes:
 
-    B) Legacy/test:
-      { "email": "...", "metadata": { "account_id":"...", "plan_code":"monthly" } }
+    A) Plan mode (recommended)
+    {
+      "account_id": "<uuid>",
+      "plan_code": "monthly|quarterly|yearly",
+      "email": "user@email.com"
+    }
+
+    B) Amount mode (for raw testing)
+    {
+      "account_id": "<uuid>",
+      "email": "user@email.com",
+      "amount_kobo": 20000,
+      "currency": "NGN",
+      "metadata": {...}
+    }
     """
-    email = (body.get("email") or "").strip()
+    body: Dict[str, Any] = request.get_json(silent=True) or {}
 
     account_id = (body.get("account_id") or "").strip()
     plan_code = (body.get("plan_code") or "").strip().lower()
+    email = (body.get("email") or "").strip()
 
-    if (not account_id or not plan_code) and isinstance(body.get("metadata"), dict):
-        md = body["metadata"] or {}
-        account_id = account_id or (md.get("account_id") or "").strip()
-        plan_code = plan_code or (md.get("plan_code") or "").strip().lower()
+    if not account_id or not email:
+        return _json_error(400, "account_id_email_required")
 
-    return email, account_id, plan_code
+    # Build metadata
+    metadata = body.get("metadata") or {}
+    if not isinstance(metadata, dict):
+        metadata = {}
 
+    # Always ensure required metadata fields exist
+    metadata.setdefault("account_id", account_id)
+    if plan_code:
+        metadata.setdefault("plan_code", plan_code)
+        metadata.setdefault("purpose", "subscription")
 
-@bp.get("/paystack/health")
-def paystack_health():
-    # quick check that route is registered
-    return jsonify({"ok": True, "service": "paystack"}), 200
+    # Amount resolution
+    amount_naira: Optional[int] = None
+    amount_kobo: Optional[int] = None
 
-
-@bp.post("/paystack/init")
-def paystack_init():
-    """
-    Start a Paystack payment for a subscription plan.
-
-    Body (preferred):
-    {
-      "email": "user@email.com",
-      "account_id": "<uuid>",
-      "plan_code": "monthly|quarterly|yearly"
-    }
-    """
-    body = _get_json_body()
-    email, account_id, plan_code = _extract_init_fields(body)
-
-    if not email or not account_id or not plan_code:
-        return jsonify(
-            {
-                "ok": False,
-                "error": "email_account_id_plan_code_required",
-                "received_keys": sorted(list(body.keys())),
-            }
-        ), 400
-
-    # CRITICAL: prevent paying for a non-existent account (this caused your FK crash)
-    if not _account_exists(account_id):
-        return jsonify(
-            {
-                "ok": False,
-                "error": "account_not_found",
-                "hint": "Login first and use the real account_id from /api/web/auth/me, or create the accounts row before payment.",
-                "account_id": account_id,
-            }
-        ), 400
-
-    plan = get_plan(plan_code)
-    if not plan or not plan.get("active", True):
-        return jsonify({"ok": False, "error": "invalid_plan"}), 400
-
-    amount_naira = int(plan.get("price") or 0)
-    if amount_naira <= 0:
-        return jsonify({"ok": False, "error": "invalid_plan_price"}), 400
+    if plan_code:
+        plan = get_plan(plan_code)
+        if not plan or not plan.get("active", True):
+            return _json_error(400, "invalid_plan")
+        amount_naira = int(plan.get("price") or 0)
+        if amount_naira <= 0:
+            return _json_error(400, "invalid_plan_price")
+    else:
+        # raw test mode
+        if body.get("amount_kobo") is not None:
+            amount_kobo = int(body.get("amount_kobo") or 0)
+        elif body.get("amount_naira") is not None:
+            amount_naira = int(body.get("amount_naira") or 0)
+        elif body.get("amount") is not None:
+            # tolerate "amount" meaning kobo (common in earlier tests)
+            amount_kobo = int(body.get("amount") or 0)
+        else:
+            return _json_error(400, "plan_code_or_amount_required")
 
     reference = create_reference("NTG")
-    metadata = {
-        "account_id": account_id,
-        "plan_code": plan_code,
-        "purpose": "subscription",
-        # keep any extra metadata user sent
-        **(body.get("metadata") or {}),
-    }
 
     try:
         init_data = initialize_transaction(
             email=email,
             amount_naira=amount_naira,
+            amount_kobo=amount_kobo,
             reference=reference,
             metadata=metadata,
         )
         d = init_data.get("data") or {}
 
-        # best-effort store
+        # store initiated transaction (best-effort)
         try:
             _sb().table("paystack_transactions").insert(
                 {
                     "reference": reference,
                     "account_id": account_id,
-                    "plan_code": plan_code,
-                    "amount": amount_naira,
+                    "plan_code": plan_code or None,
+                    "amount": amount_naira or (amount_kobo or 0) / 100,
                     "currency": d.get("currency") or "NGN",
                     "status": "initiated",
                     "authorization_url": d.get("authorization_url"),
@@ -162,29 +191,23 @@ def paystack_init():
             }
         ), 200
 
-    except PaystackHTTPError as e:
-        return jsonify(
-            {
-                "ok": False,
-                "error": "paystack_init_failed",
-                "paystack_status_code": e.status_code,
-                "paystack_message": e.message,
-                "root_cause": e.raw,
-            }
-        ), 400
-
     except Exception as e:
-        return jsonify({"ok": False, "error": "init_failed", "root_cause": str(e)}), 400
+        return _json_error(400, "paystack_init_failed", message=str(e))
 
 
-@bp.get("/paystack/verify/<reference>")
+@paystack_bp.get("/paystack/verify/<reference>")
 def paystack_verify(reference: str):
     """
-    Verify a transaction and (if successful) activate subscription.
+    Verify a transaction and (if successful) activate the subscription.
+
+    This endpoint now:
+    - updates paystack_transactions (best-effort)
+    - ensures accounts row exists (to avoid FK failures)
+    - then upserts user_subscriptions
     """
     reference = (reference or "").strip()
     if not reference:
-        return jsonify({"ok": False, "error": "missing_reference"}), 400
+        return _json_error(400, "missing_reference")
 
     try:
         data = verify_transaction(reference)
@@ -195,7 +218,7 @@ def paystack_verify(reference: str):
         account_id = (metadata.get("account_id") or "").strip()
         plan_code = (metadata.get("plan_code") or "").strip().lower()
 
-        # best-effort update transaction row
+        # update transaction row (best-effort)
         try:
             _sb().table("paystack_transactions").update(
                 {
@@ -210,93 +233,38 @@ def paystack_verify(reference: str):
             pass
 
         if status != "success":
-            return jsonify({"ok": False, "error": "payment_not_successful", "paystack_status": status}), 400
+            return _json_error(400, "payment_not_successful", extra={"paystack_status": status})
 
         if not account_id or not plan_code:
-            return jsonify(
-                {
-                    "ok": False,
-                    "error": "missing_metadata",
-                    "hint": "Paystack tx metadata must include account_id and plan_code",
-                    "metadata_keys": sorted(list(metadata.keys())) if isinstance(metadata, dict) else [],
-                }
-            ), 400
+            return _json_error(400, "missing_metadata", extra={"metadata": metadata})
 
-        # Prevent FK crash (your exact issue)
-        if not _account_exists(account_id):
-            return jsonify(
-                {
-                    "ok": False,
-                    "error": "account_not_found",
-                    "hint": "This payment is real, but the account row does not exist in accounts table. Create the accounts row or use the correct logged-in account_id.",
-                    "account_id": account_id,
-                }
-            ), 400
+        # ✅ Critical FK fix: ensure accounts row exists
+        ensured = _ensure_account_exists(account_id=account_id, email=str(tx.get("customer", {}).get("email") or ""))
+        if not ensured:
+            return _json_error(
+                400,
+                "account_missing_and_cannot_create",
+                message="Account row missing and could not be created (RLS or schema mismatch).",
+                extra={"account_id": account_id},
+            )
 
-        sub = activate_subscription_now(account_id=account_id, plan_code=plan_code, status="active")
-
-        return jsonify({"ok": True, "reference": reference, "subscription": sub}), 200
-
-    except PaystackHTTPError as e:
-        return jsonify(
-            {
-                "ok": False,
-                "error": "paystack_verify_failed",
-                "paystack_status_code": e.status_code,
-                "paystack_message": e.message,
-                "root_cause": e.raw,
-            }
-        ), 400
-    except Exception as e:
-        return jsonify({"ok": False, "error": "verify_failed", "root_cause": str(e)}), 400
-
-
-@bp.post("/paystack/webhook")
-def paystack_webhook():
-    """
-    Paystack webhook endpoint.
-    Verifies signature, then (optionally) verifies transaction via Paystack API,
-    then activates subscription.
-    """
-    raw = request.get_data() or b""
-    sig = request.headers.get("x-paystack-signature", "")
-
-    if not verify_webhook_signature(raw, sig):
-        return jsonify({"ok": False, "error": "invalid_signature"}), 401
-
-    evt = request.get_json(silent=True) or {}
-    event_name = (evt.get("event") or "").strip()
-    data = evt.get("data") or {}
-
-    # We only act on successful charges
-    if event_name != "charge.success":
-        return jsonify({"ok": True, "ignored": True, "event": event_name}), 200
-
-    reference = (data.get("reference") or "").strip()
-    if not reference:
-        return jsonify({"ok": False, "error": "missing_reference"}), 400
-
-    # safest: verify reference with Paystack before activation
-    try:
-        verified = verify_transaction(reference)
-        tx = (verified.get("data") or {})
-        status = (tx.get("status") or "").lower()
-        metadata = tx.get("metadata") or {}
-
-        if status != "success":
-            return jsonify({"ok": True, "ignored": True, "paystack_status": status}), 200
-
-        account_id = (metadata.get("account_id") or "").strip()
-        plan_code = (metadata.get("plan_code") or "").strip().lower()
-
-        if not account_id or not plan_code:
-            return jsonify({"ok": False, "error": "missing_metadata"}), 400
-
-        if not _account_exists(account_id):
-            return jsonify({"ok": False, "error": "account_not_found", "account_id": account_id}), 400
-
-        sub = activate_subscription_now(account_id=account_id, plan_code=plan_code, status="active")
-        return jsonify({"ok": True, "reference": reference, "subscription": sub}), 200
+        # Activate subscription
+        try:
+            sub = activate_subscription_now(account_id=account_id, plan_code=plan_code, status="active")
+            return jsonify({"ok": True, "reference": reference, "subscription": sub}), 200
+        except Exception as e:
+            # Root-cause exposer
+            return _json_error(
+                400,
+                "db_upsert_failed",
+                message=str(e),
+                root_cause={
+                    "table": "user_subscriptions",
+                    "where": "activate_subscription_now",
+                    "hint": "Upsert failed. Common causes: FK missing accounts row, RLS denies, or wrong service role key.",
+                    "meta": {"account_id": account_id, "plan_code": plan_code},
+                },
+            )
 
     except Exception as e:
-        return jsonify({"ok": False, "error": "webhook_failed", "root_cause": str(e)}), 400
+        return _json_error(400, "paystack_verify_failed", message=str(e))
