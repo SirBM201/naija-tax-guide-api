@@ -15,18 +15,77 @@ def _sb():
     return supabase() if callable(supabase) else supabase
 
 
-def _get(d: Dict[str, Any], path: str) -> Optional[Any]:
-    cur: Any = d
-    for part in path.split("."):
-        if not isinstance(cur, dict) or part not in cur:
-            return None
-        cur = cur[part]
-    return cur
+def _safe_update_paystack_tx(reference: str, payload: Dict[str, Any], status: str) -> None:
+    """
+    paystack_transactions schema varies across versions.
+    We attempt richer updates first, then fall back to minimal fields.
+    """
+    if not reference:
+        return
+
+    try:
+        _sb().table("paystack_transactions").update(
+            {
+                "paystack_status": status,
+                "raw": payload,
+                "status": "success" if status == "success" else "failed",
+            }
+        ).eq("reference", reference).execute()
+        return
+    except Exception:
+        pass
+
+    # fallback: minimal
+    try:
+        _sb().table("paystack_transactions").update(
+            {
+                "raw": payload,
+                "status": "success" if status == "success" else "failed",
+            }
+        ).eq("reference", reference).execute()
+    except Exception:
+        return
+
+
+def _event_exists(event_id: str) -> bool:
+    if not event_id:
+        return False
+    try:
+        res = (
+            _sb()
+            .table("paystack_events")
+            .select("id")
+            .eq("event_id", event_id)
+            .limit(1)
+            .execute()
+        )
+        rows = getattr(res, "data", None) or []
+        return bool(rows)
+    except Exception:
+        return False
+
+
+def _insert_event(event_id: str, event_type: str, reference: Optional[str], payload: Dict[str, Any]) -> None:
+    """
+    paystack_events columns you have:
+      id (bigint), event_id, event_type, reference, payload(jsonb), created_at(default now)
+    """
+    try:
+        _sb().table("paystack_events").insert(
+            {
+                "event_id": event_id or "",
+                "event_type": event_type or "",
+                "reference": reference or None,
+                "payload": payload,
+            }
+        ).execute()
+    except Exception:
+        return
 
 
 @bp.post("/paystack/webhook")
 def paystack_webhook():
-    raw = request.get_data(cache=False, as_text=False) or b""
+    raw = request.get_data() or b""
     sig = (request.headers.get("x-paystack-signature") or "").strip()
 
     if not verify_webhook_signature(raw, sig):
@@ -34,77 +93,37 @@ def paystack_webhook():
 
     payload: Dict[str, Any] = request.get_json(silent=True) or {}
     event_type = (payload.get("event") or "").strip()
-    event_id = str(payload.get("id") or "").strip()
+    event_id = (payload.get("id") or "").strip()
 
     data = payload.get("data") or {}
-    reference = str(data.get("reference") or "").strip()
-    status = str(data.get("status") or "").strip().lower()
+    reference = (data.get("reference") or "").strip()
+    status = (data.get("status") or "").strip().lower()
     metadata = data.get("metadata") or {}
 
-    # 1) DEDUPE LOCK: insert event_id (unique)
-    if not event_id:
-        return jsonify({"ok": True, "needs_reconcile": True, "reason": "missing_event_id"}), 200
+    # 1) Idempotency: if event already processed, ack OK fast
+    if event_id and _event_exists(event_id):
+        return jsonify({"ok": True, "deduped": True}), 200
 
-    try:
-        _sb().table("paystack_events").insert(
-            {
-                "event_id": event_id,
-                "event_type": event_type or "unknown",
-                "reference": reference or None,
-                "payload": payload,
-                "signature": sig or None,
-            }
-        ).execute()
-    except Exception:
-        # Duplicate event => already processed
-        return jsonify({"ok": True, "deduped": True, "event_id": event_id}), 200
+    # 2) Persist event (best-effort)
+    _insert_event(event_id=event_id, event_type=event_type, reference=reference, payload=payload)
 
-    # 2) UPSERT paystack_transactions by reference (if present)
-    if reference:
-        amount = data.get("amount")
-        currency = data.get("currency")
-        paid_at = data.get("paid_at") or data.get("paidAt")
+    # 3) Update transaction row (best-effort)
+    _safe_update_paystack_tx(reference=reference, payload=payload, status=status)
 
-        account_id = (metadata.get("account_id") or "").strip() or None
-        plan_code = (metadata.get("plan_code") or "").strip().lower() or None
+    # 4) Activate on success events only
+    success_events = {"charge.success", "subscription.create", "invoice.payment_succeeded"}
+    if event_type in success_events and status == "success":
+        account_id = (metadata.get("account_id") or "").strip()
+        plan_code = (metadata.get("plan_code") or "").strip().lower()
 
-        try:
-            _sb().table("paystack_transactions").upsert(
-                {
-                    "reference": reference,
-                    "status": "success" if status == "success" else (status or "unknown"),
-                    "amount": amount,
-                    "currency": currency,
-                    "paid_at": paid_at,
-                    "account_id": account_id,
-                    "plan_code": plan_code,
-                    "raw": payload,
-                },
-                on_conflict="reference",
-            ).execute()
-        except Exception:
-            pass
+        if account_id and plan_code:
+            # This call is now FK-safe (resolves to accounts.id internally)
+            _ = activate_subscription_now(
+                account_id=account_id,
+                plan_code=plan_code,
+                status="active",
+                provider="paystack",
+                provider_ref=reference or None,
+            )
 
-    # 3) Activate only on success
-    if event_type not in ("charge.success", "subscription.create", "invoice.payment_succeeded"):
-        return jsonify({"ok": True, "ignored": True, "event": event_type}), 200
-
-    if status != "success":
-        return jsonify({"ok": True, "ignored": True, "status": status}), 200
-
-    account_id = (metadata.get("account_id") or "").strip()
-    plan_code = (metadata.get("plan_code") or "").strip().lower()
-
-    if not account_id or not plan_code:
-        return jsonify({"ok": True, "needs_reconcile": True, "reason": "missing_metadata"}), 200
-
-    # 4) Idempotent activate
-    result = activate_subscription_now(
-        account_id=account_id,
-        plan_code=plan_code,
-        status="active",
-        provider="paystack",
-        reference=reference or None,
-    )
-
-    return jsonify({"ok": True, "activated": bool(result.get("ok")), "activation": result}), 200
+    return jsonify({"ok": True}), 200
