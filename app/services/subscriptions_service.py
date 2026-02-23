@@ -287,3 +287,41 @@ def handle_payment_failed(*, reference: str, event: Optional[Dict[str, Any]] = N
 
     except Exception as e:
         return _err("handle_payment_failed_failed", "failed to process failed event", root_cause=e, extra={"reference": reference})
+
+def debug_read_subscription(account_id: str) -> Dict[str, Any]:
+    """
+    Debug helper used by routes/subscriptions.py.
+    Returns the raw user_subscriptions row (if any) plus computed status.
+    Safe to keep in prod but you can protect the route with admin auth later.
+    """
+    account_id = (account_id or "").strip()
+    if not account_id:
+        return {"ok": False, "error": "missing_account_id", "message": "account_id is required"}
+
+    try:
+        res = (
+            _sb()
+            .table("user_subscriptions")
+            .select("*")
+            .eq("account_id", account_id)
+            .limit(1)
+            .execute()
+        )
+        rows = (res.data or []) if hasattr(res, "data") else []
+        row = rows[0] if rows else None
+
+        status = get_subscription_status(account_id)
+
+        return {
+            "ok": True,
+            "account_id": account_id,
+            "subscription_row": row,
+            "computed_status": status,
+        }
+    except Exception as e:
+        return _err(
+            "debug_read_subscription_failed",
+            "could not read subscription for debug",
+            root_cause=e,
+            extra={"account_id": account_id},
+        )
