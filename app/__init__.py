@@ -180,6 +180,7 @@ def create_app() -> Flask:
         "app.routes.web_session",
         "app.routes.paystack_webhook",
         "app.routes.debug_routes",
+        "app.routes._debug",
     ]
     for dotted in required_modules:
         _register_bp(dotted, "bp", required=True, url_prefix=api_prefix)
