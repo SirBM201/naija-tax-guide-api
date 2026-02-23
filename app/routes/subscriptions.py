@@ -33,8 +33,8 @@ def subscription_status():
     Returns subscription status for the currently authenticated user.
     Works for cookie OR bearer (require_auth_plus sets g.account_id).
     """
-    account_id = getattr(g, "account_id", None) or ""
-    status = get_subscription_status(str(account_id))
+    account_id = str(getattr(g, "account_id", "") or "").strip()
+    status = get_subscription_status(account_id)
     return jsonify(status), 200
 
 
@@ -93,13 +93,15 @@ def subscription_activate():
     if not account_id:
         return jsonify({"ok": False, "error": "missing_account_id"}), 400
 
+    # ✅ FIX: use account_id keyword (NOT user_id)
     res = activate_subscription_now(
-        user_id=account_id,
+        account_id=account_id,
         plan_code=plan_code,
         status=status,
         expires_at_iso=expires_at,
         grace_until_iso=grace_until,
         trial_until_iso=trial_until,
     )
+
     code = 200 if res.get("ok") else 400
     return jsonify(res), code
