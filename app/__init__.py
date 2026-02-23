@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, Optional, Tuple, List, Union
+from typing import Any, Dict, Optional, Tuple, List, Union, Set
 
 from flask import Flask, jsonify
 from flask_cors import CORS
@@ -31,16 +31,14 @@ def _cookie_mode_enabled() -> bool:
     if _truthy(os.getenv("COOKIE_AUTH_ENABLED", "")):
         return True
 
-    # Backwards compat: allow enabling via WEB_AUTH_ENABLED + explicit cookie samesite/secure
+    # Backwards compat: enable via WEB_AUTH_ENABLED + explicit cookie samesite/secure config
     if _truthy(os.getenv("WEB_AUTH_ENABLED", "")) and os.getenv("WEB_AUTH_COOKIE_SAMESITE"):
         return True
 
     return False
 
 
-def _parse_origins(
-    origins_raw: str, *, cookie_mode: bool
-) -> Tuple[Union[str, List[str]], bool, Optional[str]]:
+def _parse_origins(origins_raw: str, *, cookie_mode: bool) -> Tuple[Union[str, List[str]], bool, Optional[str]]:
     """
     Returns (origins, supports_credentials, error_message_if_any)
 
@@ -81,6 +79,16 @@ def _import_attr(dotted: str, attr: str) -> Tuple[Optional[Any], Optional[str]]:
         return None, f"{dotted}:{attr} -> {repr(e)}"
 
 
+def _snapshot_routes(app: Flask) -> Set[Tuple[str, str]]:
+    out: Set[Tuple[str, str]] = set()
+    for r in app.url_map.iter_rules():
+        for m in (r.methods or set()):
+            if m in {"HEAD", "OPTIONS"}:
+                continue
+            out.add((str(r.rule), m))
+    return out
+
+
 def create_app() -> Flask:
     app = Flask(__name__)
 
@@ -92,9 +100,6 @@ def create_app() -> Flask:
     if cors_err:
         raise RuntimeError(f"[CORS] {cors_err}")
 
-    # NOTE:
-    # - We explicitly allow X-Admin-Key for admin-only endpoints
-    # - supports_credentials must be True when using cookies
     CORS(
         app,
         resources={rf"{api_prefix}/*": {"origins": origins}},
@@ -104,7 +109,7 @@ def create_app() -> Flask:
             "Authorization",
             "X-Auth-Token",
             "X-Requested-With",
-            "X-Admin-Key",  # ✅ needed for admin endpoints
+            "X-Admin-Key",
         ],
         expose_headers=["Set-Cookie"],
         methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
@@ -118,6 +123,7 @@ def create_app() -> Flask:
         "required": [],
         "optional": [],
         "errors": [],
+        "route_collisions": [],
     }
 
     strict = (os.getenv("STRICT_BLUEPRINTS", "1").strip() != "0")
@@ -128,6 +134,8 @@ def create_app() -> Flask:
         required: bool = True,
         url_prefix: Optional[str] = api_prefix,
     ):
+        before = _snapshot_routes(app)
+
         obj, err = _import_attr(dotted, attr)
         entry = {"module": dotted, "attr": attr, "registered": False, "url_prefix": url_prefix, "error": err}
 
@@ -139,9 +147,8 @@ def create_app() -> Flask:
                 raise RuntimeError(f"[boot] REQUIRED blueprint import failed: {err}")
             return
 
-        # Detect duplicate blueprint *names* (Flask uses bp.name)
+        # Detect duplicate blueprint names (Flask uses bp.name)
         bp_name = getattr(obj, "name", None) or f"{dotted}:{attr}"
-
         if not hasattr(app, "_bp_names"):
             app._bp_names = set()  # type: ignore[attr-defined]
 
@@ -164,9 +171,20 @@ def create_app() -> Flask:
         entry["registered"] = True
         (boot["required"] if required else boot["optional"]).append(entry)
 
-    # ============================================================
-    # REQUIRED: core API routes (keep stable)
-    # ============================================================
+        # Route-collision detection (best-effort)
+        after = _snapshot_routes(app)
+        new_routes = after - before
+        collided = [list(x) for x in (new_routes & before)]
+        if collided:
+            boot["route_collisions"].append(
+                {"module": dotted, "attr": attr, "url_prefix": url_prefix, "collisions": collided[:50]}
+            )
+            if required and strict:
+                raise RuntimeError(
+                    f"[boot] Route collision detected after registering {dotted}:{attr}: {collided[:5]}"
+                )
+
+    # REQUIRED: core API routes
     required_modules = [
         "app.routes.health",
         "app.routes.accounts",
@@ -182,29 +200,18 @@ def create_app() -> Flask:
         "app.routes.web_auth",
         "app.routes.web_session",
         "app.routes.paystack_webhook",
-        "app.routes.debug_routes",
-        "app.routes._debug",
+        "app.routes.debug_routes",   # /api/_routes, /api/_debug/config, etc (if you have it)
+        "app.routes.debug_mail",     # /api/debug/mail
+        "app.routes._debug",         # /api/_debug/otp/latest (fixed)
     ]
     for dotted in required_modules:
         _register_bp(dotted, "bp", required=True, url_prefix=api_prefix)
 
-    # ============================================================
-    # OPTIONAL: debug helpers (registered when present)
-    # - debug_mail gives /api/debug/mail
-    # - debug_otp gives /api/_debug/otp/latest (once you add the file)
-    # ============================================================
-    _register_bp("app.routes.debug_mail", "bp", required=False, url_prefix=api_prefix)
-    _register_bp("app.routes.debug_otp", "bp", required=False, url_prefix=api_prefix)
-
-    # ============================================================
-    # OPTIONAL: paystack helpers and cron (cron has NO api prefix)
-    # ============================================================
+    # OPTIONAL: paystack helpers and cron (cron typically has NO api prefix)
     _register_bp("app.routes.paystack", "paystack_bp", required=False, url_prefix=api_prefix)
     _register_bp("app.routes.cron", "bp", required=False, url_prefix=None)
 
-    # ============================================================
     # OPTIONAL: multi-channel + web UI helpers
-    # ============================================================
     optional_modules = [
         "app.routes.whatsapp",
         "app.routes.telegram",
@@ -217,7 +224,6 @@ def create_app() -> Flask:
 
     @app.get(f"{api_prefix}/_boot")
     def boot_report():
-        # A safe boot report endpoint for production diagnostics
         return jsonify({"ok": True, "boot": boot, "strict": strict})
 
     return app
