@@ -31,23 +31,20 @@ def initialize_transaction(
     *,
     email: str,
     amount_kobo: int,
-    reference: str,
+    reference: Optional[str] = None,
     currency: Optional[str] = None,
     metadata: Optional[Dict[str, Any]] = None,
-    callback_url: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Initializes a Paystack transaction.
 
     IMPORTANT:
-    - Paystack expects amount in KOBO (integer).
-    - Use requests.post(..., json=payload) to ensure proper JSON body.
+    - Paystack expects amount in KOBO (NGN), so caller must pass kobo.
+    - reference is optional; if missing, we'll generate one.
     """
+    email = (email or "").strip()
     if not email:
         raise ValueError("missing_email")
-
-    if amount_kobo is None:
-        raise ValueError("missing_amount_kobo")
 
     try:
         amount_kobo_int = int(amount_kobo)
@@ -57,17 +54,19 @@ def initialize_transaction(
     if amount_kobo_int <= 0:
         raise ValueError("invalid_amount_kobo")
 
+    ref = (reference or "").strip() or create_reference("NTG")
+    cur = (currency or PAYSTACK_CURRENCY or "NGN").strip() or "NGN"
+
     payload: Dict[str, Any] = {
         "email": email,
-        "amount": amount_kobo_int,
-        "currency": (currency or PAYSTACK_CURRENCY or "NGN").strip(),
-        "reference": reference,
+        "amount": amount_kobo_int,  # KOBO
+        "currency": cur,
+        "reference": ref,
         "metadata": metadata or {},
     }
 
-    cb = (callback_url or PAYSTACK_CALLBACK_URL or "").strip()
-    if cb:
-        payload["callback_url"] = cb
+    if PAYSTACK_CALLBACK_URL:
+        payload["callback_url"] = PAYSTACK_CALLBACK_URL
 
     r = requests.post(
         f"{PAYSTACK_BASE}/transaction/initialize",
@@ -76,10 +75,21 @@ def initialize_transaction(
         timeout=25,
     )
 
-    data = r.json() if r.content else {}
-    if not r.ok or not data.get("status"):
-        # Paystack returns: {status: false, message: "...", data: ...}
-        raise RuntimeError(data.get("message") or "paystack_init_failed")
+    # Paystack almost always returns JSON; still guard safely.
+    data: Dict[str, Any] = {}
+    try:
+        data = r.json() if r.content else {}
+    except Exception:
+        data = {}
+
+    # Paystack success shape: { "status": true, "message": "...", "data": {...} }
+    if (not r.ok) or (not data.get("status")):
+        msg = data.get("message") or f"paystack_init_failed_http_{r.status_code}"
+        raise RuntimeError(msg)
+
+    # Ensure our reference is returned even if Paystack doesn't echo (it should)
+    if isinstance(data.get("data"), dict) and not data["data"].get("reference"):
+        data["data"]["reference"] = ref
 
     return data
 
@@ -94,28 +104,36 @@ def verify_transaction(reference: str) -> Dict[str, Any]:
         headers=_headers(),
         timeout=25,
     )
-    data = r.json() if r.content else {}
-    if not r.ok or not data.get("status"):
-        raise RuntimeError(data.get("message") or "paystack_verify_failed")
+
+    data: Dict[str, Any] = {}
+    try:
+        data = r.json() if r.content else {}
+    except Exception:
+        data = {}
+
+    if (not r.ok) or (not data.get("status")):
+        msg = data.get("message") or f"paystack_verify_failed_http_{r.status_code}"
+        raise RuntimeError(msg)
 
     return data
 
 
 def verify_webhook_signature(raw_body: bytes, signature_header: str) -> bool:
     """
-    Paystack webhook signature:
-    HMAC SHA512 of the RAW request body, using secret key.
-    Hex digest should match x-paystack-signature header.
+    Paystack webhook signature uses HMAC SHA512(secret_key, raw_body)
+    Header: x-paystack-signature: <hex digest>
     """
     if not PAYSTACK_SECRET_KEY:
         return False
-    if not signature_header:
+
+    sig = (signature_header or "").strip()
+    if not sig:
         return False
 
     mac = hmac.new(
         PAYSTACK_SECRET_KEY.encode("utf-8"),
-        msg=raw_body or b"",
+        msg=raw_body,
         digestmod=hashlib.sha512,
     ).hexdigest()
 
-    return hmac.compare_digest(mac, signature_header.strip().lower())
+    return hmac.compare_digest(mac, sig)
