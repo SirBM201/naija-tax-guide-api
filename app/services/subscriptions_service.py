@@ -2,54 +2,50 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple, List
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Optional
 
 from ..core.supabase_client import supabase
-from ..services.subscription_status_service import get_subscription_status
+from .subscription_status_service import get_subscription_status as _get_status
+
+
+SUBSCRIPTIONS_TABLE = (os.getenv("SUBSCRIPTIONS_TABLE", "") or "").strip() or "subscriptions"
 
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _sanitize_err(e: Exception) -> str:
-    s = str(e) or e.__class__.__name__
-    s = s.replace("\n", " ").strip()
-    return s[:280]
+def _iso(dt: Optional[datetime]) -> Optional[str]:
+    if not dt:
+        return None
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _insert_try(
-    *,
-    table_name: str,
-    id_col: str,
-    plan_col: str,
-    account_id: str,
-    plan_code: str,
-    status: str,
-    expires_at_iso: Optional[str],
-    grace_until_iso: Optional[str],
-    trial_until_iso: Optional[str],
-) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    try:
-        db = supabase()
-        payload: Dict[str, Any] = {
-            id_col: account_id,
-            plan_col: plan_code,
-            "status": status,
-        }
-        if expires_at_iso:
-            payload["expires_at"] = expires_at_iso
-        if grace_until_iso:
-            payload["grace_until"] = grace_until_iso
-        if trial_until_iso:
-            payload["trial_until"] = trial_until_iso
+def _default_expiry_for_plan(plan_code: str) -> Optional[datetime]:
+    """
+    Conservative defaults for admin test activation.
+    You can override by sending expires_at in the request body.
+    """
+    p = (plan_code or "").strip().lower()
+    now = _now_utc()
 
-        res = db.table(table_name).insert(payload).execute()
-        rows = getattr(res, "data", None) or []
-        return (rows[0] if rows else payload), None
-    except Exception as e:
-        return None, _sanitize_err(e)
+    if p == "monthly":
+        return now + timedelta(days=30)
+    if p == "quarterly":
+        return now + timedelta(days=90)
+    if p == "yearly":
+        return now + timedelta(days=365)
+    if p == "trial":
+        return now + timedelta(days=7)
+
+    # manual/unknown -> no expiry unless caller provides
+    return None
+
+
+def get_subscription_status(account_id: str) -> Dict[str, Any]:
+    # Single source for subscription state computation
+    return _get_status(account_id)
 
 
 def activate_subscription_now(
@@ -58,71 +54,51 @@ def activate_subscription_now(
     plan_code: str = "manual",
     expires_at_iso: Optional[str] = None,
     status: str = "active",
-    grace_until_iso: Optional[str] = None,
-    trial_until_iso: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    ADMIN helper:
-    Inserts a subscription row in a schema-compatible way.
+    Admin-only helper: create/update a subscription row for the given user/account.
 
-    Tries:
-      tables: SUBSCRIPTIONS_TABLE env (or 'subscriptions')
-      id_col: account_id then user_id
-      plan_col: plan_code then plan
+    Writes to SUBSCRIPTIONS_TABLE (default: 'subscriptions') using:
+      account_id, plan_code, status, expires_at, grace_until, trial_until
     """
     account_id = (user_id or "").strip()
     if not account_id:
         return {"ok": False, "error": "missing_account_id"}
 
-    table = (os.getenv("SUBSCRIPTIONS_TABLE", "") or "").strip() or "subscriptions"
+    plan_code_norm = (plan_code or "manual").strip().lower()
+    status_norm = (status or "active").strip().lower()
 
-    id_cols: List[str] = ["account_id", "user_id"]
-    plan_cols: List[str] = ["plan_code", "plan"]
+    # expiry
+    if expires_at_iso:
+        expires_at = expires_at_iso
+    else:
+        exp_dt = _default_expiry_for_plan(plan_code_norm)
+        expires_at = _iso(exp_dt)
 
-    last_error: Optional[str] = None
-    used_id_col: Optional[str] = None
-    used_plan_col: Optional[str] = None
-    inserted: Optional[Dict[str, Any]] = None
+    # for trial, also set trial_until
+    trial_until = None
+    if plan_code_norm == "trial":
+        trial_until = expires_at or _iso(_now_utc() + timedelta(days=7))
 
-    for id_col in id_cols:
-        for plan_col in plan_cols:
-            row, err = _insert_try(
-                table_name=table,
-                id_col=id_col,
-                plan_col=plan_col,
-                account_id=account_id,
-                plan_code=plan_code,
-                status=status,
-                expires_at_iso=expires_at_iso,
-                grace_until_iso=grace_until_iso,
-                trial_until_iso=trial_until_iso,
-            )
-            if err:
-                last_error = err
-                continue
-            inserted = row
-            used_id_col = id_col
-            used_plan_col = plan_col
-            break
-        if inserted:
-            break
-
-    if not inserted:
-        return {
-            "ok": False,
-            "error": "db_insert_failed",
-            "message": last_error or "insert failed",
-            "debug_source": {"table": table, "id_col": None, "plan_col": None},
-        }
-
-    # Return computed status after insert (uses your compatibility reader)
-    computed = get_subscription_status(account_id)
-
-    return {
-        "ok": True,
+    payload: Dict[str, Any] = {
         "account_id": account_id,
-        "inserted": inserted,
-        "computed_status": computed,
-        "debug_source": {"table": table, "id_col": used_id_col, "plan_col": used_plan_col},
-        "ts": _now_utc().isoformat(),
+        "plan_code": plan_code_norm,
+        "status": status_norm,
+        "expires_at": expires_at,
+        "trial_until": trial_until,
+        # grace_until optional: you can add later if you want
     }
+
+    try:
+        db = supabase()  # ✅ FIX: supabase() returns the client
+        # Requires UNIQUE constraint on account_id (we added it in SQL)
+        res = (
+            db.table(SUBSCRIPTIONS_TABLE)
+            .upsert(payload, on_conflict="account_id")
+            .execute()
+        )
+        data = getattr(res, "data", None) or []
+        row = data[0] if data else None
+        return {"ok": True, "row": row, "table": SUBSCRIPTIONS_TABLE}
+    except Exception as e:
+        return {"ok": False, "error": "db_insert_failed", "message": f"{e.__class__.__name__}: {str(e)[:240]}"}
