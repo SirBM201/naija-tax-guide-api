@@ -1,3 +1,4 @@
+# app/routes/web_auth.py
 from __future__ import annotations
 
 import hashlib
@@ -17,9 +18,6 @@ from app.services.email_service import send_email_otp, smtp_is_configured
 bp = Blueprint("web_auth", __name__)
 
 
-# -------------------------
-# Supabase wrapper (handles supabase being either a client or a factory function)
-# -------------------------
 def _sb():
     return supabase() if callable(supabase) else supabase
 
@@ -119,7 +117,7 @@ def _safe_debug_info() -> Dict[str, Any]:
 
 
 # -------------------------
-# Safe root-cause exposer helpers
+# Rootcause exposer helpers
 # -------------------------
 def _clip(s: str, n: int = 220) -> str:
     s = (s or "")
@@ -163,28 +161,6 @@ def _read_json_body() -> Tuple[Dict[str, Any], Dict[str, Any]]:
     return {}, meta
 
 
-def _extract_contact(data: Dict[str, Any]) -> str:
-    """
-    Accept multiple payload shapes:
-      - contact (preferred)
-      - email / identifier / phone / login / handle
-    """
-    raw_contact = (
-        data.get("contact")
-        or data.get("email")
-        or data.get("identifier")
-        or data.get("phone")
-        or data.get("login")
-        or data.get("handle")
-        or ""
-    )
-    return _normalize_contact(str(raw_contact))
-
-
-def _extract_otp(data: Dict[str, Any]) -> str:
-    return str(data.get("otp") or data.get("code") or data.get("passcode") or "").strip()
-
-
 def _account_pk_column() -> str:
     if _has_column("accounts", "account_id"):
         return "account_id"
@@ -196,26 +172,26 @@ def _account_pk_column() -> str:
 def _upsert_account_for_contact(contact: str) -> Optional[str]:
     pk = _account_pk_column()
 
-    try:
-        res = (
-            _sb()
-            .table("accounts")
-            .select(pk)
-            .eq("provider", "web")
-            .eq("provider_user_id", contact)
-            .limit(1)
-            .execute()
-        )
-        rows = (res.data or []) if hasattr(res, "data") else []
-        if rows and rows[0].get(pk):
-            return str(rows[0][pk])
-    except Exception:
-        pass
+    res = (
+        _sb()
+        .table("accounts")
+        .select(pk)
+        .eq("provider", "web")
+        .eq("provider_user_id", contact)
+        .limit(1)
+        .execute()
+    )
+    rows = (res.data or []) if hasattr(res, "data") else []
+    if rows and rows[0].get(pk):
+        return str(rows[0][pk])
 
     payload: Dict[str, Any] = {"provider": "web", "provider_user_id": contact}
     if _has_column("accounts", "display_name"):
         payload["display_name"] = contact
-    if _has_column("accounts", "phone"):
+    # keep legacy field usage if it exists
+    if _has_column("accounts", "phone_e164"):
+        payload["phone_e164"] = contact
+    elif _has_column("accounts", "phone"):
         payload["phone"] = contact if not _is_email(contact) else None
 
     try:
@@ -227,23 +203,34 @@ def _upsert_account_for_contact(contact: str) -> Optional[str]:
         pass
 
     # fallback re-query
-    try:
-        res2 = (
-            _sb()
-            .table("accounts")
-            .select(pk)
-            .eq("provider", "web")
-            .eq("provider_user_id", contact)
-            .limit(1)
-            .execute()
-        )
-        rows2 = (res2.data or []) if hasattr(res2, "data") else []
-        if rows2 and rows2[0].get(pk):
-            return str(rows2[0][pk])
-    except Exception:
-        pass
+    res2 = (
+        _sb()
+        .table("accounts")
+        .select(pk)
+        .eq("provider", "web")
+        .eq("provider_user_id", contact)
+        .limit(1)
+        .execute()
+    )
+    rows2 = (res2.data or []) if hasattr(res2, "data") else []
+    if rows2 and rows2[0].get(pk):
+        return str(rows2[0][pk])
 
     return None
+
+
+def _pick_contact_from_payload(data: Dict[str, Any]) -> str:
+    """
+    Accept multiple shapes:
+      - contact
+      - email  (your PowerShell tests use this)
+      - identifier / login / handle / user (common fallback keys)
+    """
+    for k in ("contact", "email", "identifier", "login", "handle", "user"):
+        v = str(data.get(k) or "").strip()
+        if v:
+            return _normalize_contact(v)
+    return ""
 
 
 # -------------------------------------------------
@@ -257,16 +244,13 @@ def request_otp():
 
     data, meta = _read_json_body()
 
-    contact = _extract_contact(data)
+    contact = _pick_contact_from_payload(data)
     purpose = (str(data.get("purpose") or "web_login")).strip()
 
-    # Optional explicit email destination if contact is phone
-    email_to = (str(data.get("email_to") or data.get("email") or "") or "").strip().lower()
-
     if not contact:
-        out: Dict[str, Any] = {"ok": False, "error": "missing_contact"}
+        out = {"ok": False, "error": "missing_contact"}
         if WEB_AUTH_DEBUG:
-            out["debug"] = {"why": "contact_missing_or_empty", "req": meta, **_safe_debug_info()}
+            out["debug"] = {"why": "no_contact_like_field_found", "req": meta, **_safe_debug_info()}
         return jsonify(out), 400
 
     otp = f"{secrets.randbelow(1000000):06d}"
@@ -275,11 +259,12 @@ def request_otp():
     try:
         _sb().table(WEB_OTP_TABLE).insert(
             {
-                "contact": contact,
-                "purpose": purpose,
-                "code_hash": _otp_hash(contact, purpose, otp),
+                # supports both "contact" and legacy "phone_e164" schemas
+                ("contact" if _has_column(WEB_OTP_TABLE, "contact") else "phone_e164"): contact,
+                "purpose": purpose if _has_column(WEB_OTP_TABLE, "purpose") else "web_login",
+                ("code_hash" if _has_column(WEB_OTP_TABLE, "code_hash") else "otp_hash"): _otp_hash(contact, purpose, otp),
                 "expires_at": expires_at.isoformat(),
-                "used": False,
+                ("used" if _has_column(WEB_OTP_TABLE, "used") else "revoked"): False,
             }
         ).execute()
     except Exception as e:
@@ -287,21 +272,17 @@ def request_otp():
         if WEB_AUTH_DEBUG:
             out["debug"] = {
                 "why": "db_insert_failed",
-                "root_cause": f"{type(e).__name__}:{_clip(str(e), 220)}",
+                "root_cause": _clip(repr(e), 300),
                 "req": meta,
                 **_safe_debug_info(),
             }
         return jsonify(out), 500
 
-    # Email destination
-    dest_email = ""
-    if _is_email(contact):
-        dest_email = contact
-    elif _is_email(email_to):
-        dest_email = email_to
-
+    # Send email OTP when contact is an email
+    dest_email = contact if _is_email(contact) else ""
     sent_email = False
     email_err: Optional[str] = None
+
     if dest_email:
         email_err = send_email_otp(dest_email, otp, purpose, WEB_OTP_TTL_MINUTES)
         sent_email = (email_err is None)
@@ -311,13 +292,14 @@ def request_otp():
         "ttl_minutes": WEB_OTP_TTL_MINUTES,
         "email_sent": bool(sent_email),
         "email_to": dest_email or None,
+        "smtp_configured": bool(smtp_is_configured()),
     }
     if dest_email and email_err:
         out["email_error"] = email_err
 
+    # Dev-only: return OTP for testing (your screenshot shows dev_otp is returned)
     if WEB_DEV_RETURN_OTP:
         out["dev_otp"] = otp
-        out["smtp_configured"] = smtp_is_configured()
 
     if WEB_AUTH_DEBUG:
         out["debug"] = {"req": meta, **_safe_debug_info()}
@@ -336,55 +318,40 @@ def verify_otp():
 
     data, meta = _read_json_body()
 
-    contact = _extract_contact(data)
+    contact = _pick_contact_from_payload(data)
     purpose = (str(data.get("purpose") or "web_login")).strip()
-    otp = _extract_otp(data)
+    otp = str(data.get("otp") or "").strip()
 
     if not contact or not otp:
-        out: Dict[str, Any] = {"ok": False, "error": "invalid_request"}
+        out = {"ok": False, "error": "invalid_request"}
         if WEB_AUTH_DEBUG:
             missing = []
             if not contact:
-                missing.append("contact")
+                missing.append("contact/email/identifier/login/handle/user")
             if not otp:
                 missing.append("otp")
-            out["debug"] = {
-                "why": "missing_required_fields",
-                "missing": missing,
-                "req": meta,
-                **_safe_debug_info(),
-            }
+            out["debug"] = {"why": "missing_required_fields", "missing": missing, "req": meta, **_safe_debug_info()}
         return jsonify(out), 400
 
-    code_hash = _otp_hash(contact, purpose, otp)
+    computed_hash = _otp_hash(contact, purpose, otp)
+    hash_col = "code_hash" if _has_column(WEB_OTP_TABLE, "code_hash") else "otp_hash"
+    contact_col = "contact" if _has_column(WEB_OTP_TABLE, "contact") else "phone_e164"
+    used_col = "used" if _has_column(WEB_OTP_TABLE, "used") else "revoked"
 
-    try:
-        q = (
-            _sb()
-            .table(WEB_OTP_TABLE)
-            .select("*")
-            .eq("contact", contact)
-            .eq("purpose", purpose)
-            .eq("code_hash", code_hash)
-            .eq("used", False)
-            .order("created_at", desc=True)
-            .limit(1)
-            .execute()
-        )
-        rows = (q.data or []) if hasattr(q, "data") else []
-    except Exception as e:
-        out = {"ok": False, "error": "otp_lookup_failed"}
-        if WEB_AUTH_DEBUG:
-            out["debug"] = {
-                "why": "db_select_failed",
-                "root_cause": f"{type(e).__name__}:{_clip(str(e), 220)}",
-                "req": meta,
-                **_safe_debug_info(),
-            }
-        return jsonify(out), 500
-
+    q = (
+        _sb()
+        .table(WEB_OTP_TABLE)
+        .select("*")
+        .eq(contact_col, contact)
+        .eq(hash_col, computed_hash)
+        .eq(used_col, False)
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    rows = (q.data or []) if hasattr(q, "data") else []
     if not rows:
-        out: Dict[str, Any] = {"ok": False, "error": "invalid_otp"}
+        out = {"ok": False, "error": "invalid_otp"}
         if WEB_AUTH_DEBUG:
             out["debug"] = {"why": "no_matching_otp_row", "req": meta, **_safe_debug_info()}
         return jsonify(out), 401
@@ -397,12 +364,13 @@ def verify_otp():
     except Exception:
         return jsonify({"ok": False, "error": "otp_expired"}), 401
 
-    # mark used (best effort)
+    # mark used/revoked best-effort
     try:
         if "id" in row:
-            _sb().table(WEB_OTP_TABLE).update(
-                {"used": True, "used_at": _now_utc().isoformat()}
-            ).eq("id", row["id"]).execute()
+            if used_col == "used":
+                _sb().table(WEB_OTP_TABLE).update({"used": True, "used_at": _now_utc().isoformat()}).eq("id", row["id"]).execute()
+            else:
+                _sb().table(WEB_OTP_TABLE).update({"revoked": True}).eq("id", row["id"]).execute()
     except Exception:
         pass
 
@@ -435,17 +403,12 @@ def verify_otp():
     except Exception as e:
         out = {"ok": False, "error": "token_issue_failed"}
         if WEB_AUTH_DEBUG:
-            out["debug"] = {
-                "why": "token_insert_failed",
-                "root_cause": f"{type(e).__name__}:{_clip(str(e), 220)}",
-                "req": meta,
-                **_safe_debug_info(),
-            }
+            out["debug"] = {"why": "token_insert_failed", "root_cause": _clip(repr(e), 300), "req": meta, **_safe_debug_info()}
         return jsonify(out), 500
 
     out: Dict[str, Any] = {
         "ok": True,
-        "token": raw_token,  # bearer token (also set as cookie)
+        "token": raw_token,  # bearer also returned (matches your screenshot)
         "account_id": account_id,
         "expires_at": expires_at.isoformat(),
         "auth_mode": "cookie+bearer",
