@@ -14,6 +14,11 @@ _PLAN_DAYS: Dict[str, int] = {
 }
 
 
+def _db():
+    # in your codebase, supabase is a factory function
+    return supabase()
+
+
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -43,14 +48,7 @@ def _ok(data: Dict[str, Any]) -> Dict[str, Any]:
     return {"ok": True, **data}
 
 
-def _fail(
-    error: str,
-    *,
-    where: str,
-    e: Optional[Exception] = None,
-    hint: Optional[str] = None,
-    extra: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+def _fail(error: str, *, where: str, e: Optional[Exception] = None, hint: Optional[str] = None, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     payload: Dict[str, Any] = {"ok": False, "error": error, "where": where}
     if e is not None:
         payload["root_cause"] = _rootcause(where, e, hint=hint, extra=extra)
@@ -61,68 +59,91 @@ def _fail(
     return payload
 
 
-def _db():
-    return supabase()
-
-
 # -----------------------------------------------------------------------------
-# Accounts prerequisite (FK safety)
-# Your schema: user_subscriptions.account_id (uuid) -> accounts.id (uuid)
+# Account resolution (CRITICAL)
+# user_subscriptions.account_id FK -> accounts.id
+# but your accounts table ALSO has accounts.account_id.
+# We accept either input and resolve to accounts.id.
 # -----------------------------------------------------------------------------
-def _account_exists(account_id: str) -> Tuple[bool, bool, Optional[Dict[str, Any]]]:
-    account_id = (account_id or "").strip()
+def _resolve_accounts_pk(account_id_or_public: str) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]]]:
+    where = "resolve_accounts_pk"
+    v = (account_id_or_public or "").strip()
+    if not v:
+        return False, None, {"where": where, "message": "missing_account_id"}
+
     try:
         db = _db()
-        res = db.table("accounts").select("id").eq("id", account_id).limit(1).execute()
-        rows = getattr(res, "data", None) or []
-        return True, bool(rows), None
+
+        # 1) Treat input as accounts.id
+        res1 = (
+            db.table("accounts")
+            .select("id, account_id")
+            .eq("id", v)
+            .limit(1)
+            .execute()
+        )
+        rows1 = getattr(res1, "data", None) or []
+        if rows1:
+            return True, rows1[0]["id"], None
+
+        # 2) Treat input as accounts.account_id
+        res2 = (
+            db.table("accounts")
+            .select("id, account_id")
+            .eq("account_id", v)
+            .limit(1)
+            .execute()
+        )
+        rows2 = getattr(res2, "data", None) or []
+        if rows2:
+            return True, rows2[0]["id"], None
+
+        return False, None, {
+            "where": where,
+            "type": "AccountNotFound",
+            "message": "No matching accounts row for provided account identifier.",
+            "hint": "Ensure the user completed OTP/login first so accounts row exists, then retry.",
+            "extra": {"provided": v, "tried": ["accounts.id", "accounts.account_id"]},
+        }
+
     except Exception as e:
-        return False, False, _rootcause(
-            "accounts.select",
+        return False, None, _rootcause(
+            where,
             e,
-            hint="Failed to read accounts table. Check Supabase credentials and RLS policies.",
-            extra={"account_id": account_id, "expected_pk": "accounts.id"},
+            hint="Failed to read accounts. Check Supabase key and RLS.",
+            extra={"provided": v},
         )
 
 
-def _ensure_account_exists(account_id: str) -> Tuple[bool, Optional[Dict[str, Any]]]:
-    ok, exists, err = _account_exists(account_id)
-    if not ok:
-        return False, err
-    if not exists:
-        return False, {
-            "where": "ensure_account_exists",
-            "type": "ForeignKeyViolation",
-            "message": f"account_id '{account_id}' does not exist in accounts.id, so user_subscriptions cannot reference it.",
-            "hint": "Create/login the account first (OTP flow) so it is inserted into accounts, then retry activation.",
-            "extra": {"account_id": account_id, "required_table": "accounts", "fk": "user_subscriptions.account_id -> accounts.id"},
-        }
-    return True, None
+def _overdue_predicate_sql(now_iso: str) -> str:
+    # used only for documentation/debug; we still do actual update with Supabase filters below
+    return (
+        "is_active = true AND expires_at IS NOT NULL AND "
+        f"'{now_iso}'::timestamptz > expires_at AND "
+        "(grace_until IS NULL OR '{now_iso}'::timestamptz > grace_until)"
+    )
 
 
-# -----------------------------------------------------------------------------
-# user_subscriptions helpers (match your real schema)
-# -----------------------------------------------------------------------------
-_SUB_SELECT = (
-    "id, account_id, plan_code, status, started_at, expires_at, grace_until, trial_until, "
-    "is_active, pending_plan_code, pending_starts_at, provider, provider_ref, created_at, updated_at"
-)
-
-
-def _get_user_subscription(account_id: str) -> Tuple[bool, Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
-    account_id = (account_id or "").strip()
+def _get_user_subscription(account_pk: str) -> Tuple[bool, Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     try:
         db = _db()
-        res = db.table("user_subscriptions").select(_SUB_SELECT).eq("account_id", account_id).limit(1).execute()
+        res = (
+            db.table("user_subscriptions")
+            .select(
+                "id, account_id, plan_code, status, is_active, started_at, expires_at, grace_until, trial_until, provider, provider_ref, created_at, updated_at"
+            )
+            .eq("account_id", account_pk)
+            .limit(1)
+            .execute()
+        )
         rows = getattr(res, "data", None) or []
-        row = rows[0] if rows else None
-        return True, row, None
+        return True, (rows[0] if rows else None), None
     except Exception as e:
         return False, None, _rootcause(
             "user_subscriptions.select",
             e,
-            hint="Read failed. Check RLS policy for user_subscriptions and service role key usage.",
-            extra={"account_id": account_id},
+            hint="Read failed. Check RLS/service role key.",
+            extra={"account_id": account_pk},
         )
 
 
@@ -130,7 +151,6 @@ def _upsert_user_subscription(payload: Dict[str, Any]) -> Tuple[bool, Optional[D
     try:
         db = _db()
         db.table("user_subscriptions").upsert(payload, on_conflict="account_id").execute()
-
         ok, row, err = _get_user_subscription(payload.get("account_id") or "")
         if not ok:
             return False, None, err
@@ -139,13 +159,13 @@ def _upsert_user_subscription(payload: Dict[str, Any]) -> Tuple[bool, Optional[D
         return False, None, _rootcause(
             "user_subscriptions.upsert",
             e,
-            hint="Upsert failed. Common causes: FK missing accounts row, RLS denies, or wrong Supabase key.",
+            hint="Upsert failed. Likely FK mismatch (accounts.id) or RLS denial.",
             extra={"on_conflict": "account_id", "payload_keys": sorted(list(payload.keys()))},
         )
 
 
 # -----------------------------------------------------------------------------
-# Public service functions
+# Public API
 # -----------------------------------------------------------------------------
 def activate_subscription_now(
     *,
@@ -154,173 +174,156 @@ def activate_subscription_now(
     days: Optional[int] = None,
     status: str = "active",
     provider: Optional[str] = None,
-    reference: Optional[str] = None,
+    provider_ref: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Idempotent activation:
-      - Upserts by account_id (unique exists)
-      - Sets is_active true
-      - Stores provider/provider_ref if supplied
-    """
     where = "activate_subscription_now"
 
-    account_id = (account_id or "").strip()
     plan_code = _norm_plan(plan_code)
-    status = (status or "active").strip().lower()
-
     if not account_id:
         return _fail("missing_account_id", where=where, hint="account_id is required")
     if not plan_code:
         return _fail("missing_plan_code", where=where, hint="plan_code is required")
 
-    ok_acc, acc_err = _ensure_account_exists(account_id)
-    if not ok_acc:
-        return {"ok": False, "error": "account_not_found", "where": where, "root_cause": acc_err}
+    ok_pk, account_pk, err = _resolve_accounts_pk(account_id)
+    if not ok_pk or not account_pk:
+        return {"ok": False, "error": "account_not_found", "where": where, "root_cause": err}
 
     now = _now_utc()
     dur = int(days) if days is not None else _duration_days(plan_code)
     expires_at = now + timedelta(days=dur)
 
-    # Keep started_at stable: if row exists, we don't want to overwrite it.
-    ok_existing, existing, _ = _get_user_subscription(account_id)
-
     payload: Dict[str, Any] = {
-        "account_id": account_id,
+        "account_id": account_pk,              # ✅ FK-safe: accounts.id
         "plan_code": plan_code,
-        "status": status,
+        "status": (status or "active").strip().lower(),
+        "is_active": True,
+        "started_at": _iso(now),
         "expires_at": _iso(expires_at),
         "grace_until": None,
         "trial_until": None,
-        "is_active": True,
+        "provider": provider,
+        "provider_ref": provider_ref,
         "updated_at": _iso(now),
     }
 
-    if not existing:
-        payload["started_at"] = _iso(now)
-
-    if provider:
-        payload["provider"] = provider.strip().lower()
-    if reference:
-        payload["provider_ref"] = reference.strip()
-
-    ok, row, err = _upsert_user_subscription(payload)
+    ok, row, upsert_err = _upsert_user_subscription(payload)
     if not ok:
         return {
             "ok": False,
             "error": "db_upsert_failed",
             "where": where,
-            "root_cause": err,
+            "root_cause": upsert_err,
             "table": "user_subscriptions",
             "attempted_payload_keys": sorted(list(payload.keys())),
         }
 
-    return _ok({"account_id": account_id, "subscription": row})
+    return _ok({"account_id": account_pk, "subscription": row})
 
 
 def cancel_subscription(*, account_id: str, status: str = "canceled") -> Dict[str, Any]:
     where = "cancel_subscription"
-    account_id = (account_id or "").strip()
     if not account_id:
         return _fail("missing_account_id", where=where, hint="account_id is required")
 
-    ok_acc, acc_err = _ensure_account_exists(account_id)
-    if not ok_acc:
-        return {"ok": False, "error": "account_not_found", "where": where, "root_cause": acc_err}
+    ok_pk, account_pk, err = _resolve_accounts_pk(account_id)
+    if not ok_pk or not account_pk:
+        return {"ok": False, "error": "account_not_found", "where": where, "root_cause": err}
 
     now = _now_utc()
-    payload = {"account_id": account_id, "status": (status or "canceled").strip().lower(), "is_active": False, "updated_at": _iso(now)}
+    payload = {
+        "account_id": account_pk,
+        "status": (status or "canceled").strip().lower(),
+        "is_active": False,
+        "updated_at": _iso(now),
+    }
 
-    ok, row, err = _upsert_user_subscription(payload)
+    ok, row, upsert_err = _upsert_user_subscription(payload)
     if not ok:
-        return {"ok": False, "error": "db_upsert_failed", "where": where, "root_cause": err}
+        return {"ok": False, "error": "db_upsert_failed", "where": where, "root_cause": upsert_err}
 
-    return _ok({"account_id": account_id, "subscription": row})
+    return _ok({"account_id": account_pk, "subscription": row})
 
 
 def debug_read_subscription(account_id: str) -> Dict[str, Any]:
     where = "debug_read_subscription"
-    account_id = (account_id or "").strip()
     if not account_id:
         return _fail("missing_account_id", where=where, hint="account_id is required")
 
-    ok, row, err = _get_user_subscription(account_id)
+    ok_pk, account_pk, err = _resolve_accounts_pk(account_id)
+    if not ok_pk or not account_pk:
+        return {"ok": False, "error": "account_not_found", "where": where, "root_cause": err}
+
+    ok, row, read_err = _get_user_subscription(account_pk)
     if not ok:
-        return {"ok": False, "error": "db_read_failed", "where": where, "root_cause": err}
+        return {"ok": False, "error": "db_read_failed", "where": where, "root_cause": read_err}
 
-    return _ok({"account_id": account_id, "subscription": row})
+    return _ok({"account_id": account_pk, "subscription": row})
 
 
 # -----------------------------------------------------------------------------
-# Overdue expiry (matches your columns)
+# Overdue handling (fixes your cron import error)
+# Overdue rule:
+#   is_active=true AND expires_at not null AND now>expires_at AND (grace_until null OR now>grace_until)
 # -----------------------------------------------------------------------------
-def expire_overdue_subscriptions(*, limit: int = 500) -> Dict[str, Any]:
-    """
-    Overdue = is_active true AND expires_at < now AND (grace_until is null OR grace_until < now)
-    Action  = set status='expired', is_active=false, updated_at=now
-    """
+def expire_overdue_subscriptions(*, mark_status: str = "past_due") -> Dict[str, Any]:
     where = "expire_overdue_subscriptions"
-    now_iso = _iso(_now_utc())
+    now = _now_utc()
+    now_iso = _iso(now) or _iso(datetime.now(timezone.utc))  # safety
 
     try:
         db = _db()
+
+        # Query overdue rows first (so we can return count deterministically)
         res = (
             db.table("user_subscriptions")
-            .select("id, account_id, status, expires_at, grace_until, is_active")
+            .select("id, account_id, status, is_active, expires_at, grace_until")
             .eq("is_active", True)
+            .not_.is_("expires_at", "null")
             .lt("expires_at", now_iso)
-            .limit(int(limit))
+            .or_(f"grace_until.is.null,grace_until.lt.{now_iso}")
             .execute()
         )
         rows: List[Dict[str, Any]] = getattr(res, "data", None) or []
+        if not rows:
+            return _ok({"updated": 0, "rule": _overdue_predicate_sql(now_iso)})
+
+        # Mark them
+        ids = [r["id"] for r in rows if r.get("id")]
+        db.table("user_subscriptions").update(
+            {"status": mark_status, "is_active": False, "updated_at": now_iso}
+        ).in_("id", ids).execute()
+
+        return _ok({"updated": len(ids), "rule": _overdue_predicate_sql(now_iso)})
+
     except Exception as e:
-        return _fail("db_read_failed", where=where, e=e, hint="Failed to scan overdue subscriptions.")
-
-    expired = 0
-    skipped_grace = 0
-    failed: List[Dict[str, Any]] = []
-
-    for r in rows:
-        sub_id = (r.get("id") or "").strip()
-        grace_until = r.get("grace_until")
-
-        # If grace_until exists and still in future => not overdue yet
-        if grace_until:
-            try:
-                if str(grace_until) > str(now_iso):
-                    skipped_grace += 1
-                    continue
-            except Exception:
-                # conservative: if cannot compare, skip
-                skipped_grace += 1
-                continue
-
-        try:
-            db.table("user_subscriptions").update(
-                {"status": "expired", "is_active": False, "updated_at": now_iso}
-            ).eq("id", sub_id).execute()
-            expired += 1
-        except Exception as e:
-            failed.append({"id": sub_id, "account_id": r.get("account_id"), "error": str(e)})
-
-    return _ok({"expired": expired, "scanned": len(rows), "skipped_grace": skipped_grace, "failed": failed})
+        return _fail(
+            "expire_failed",
+            where=where,
+            e=e,
+            hint="Failed to mark overdue subs. Check RLS/service role key.",
+            extra={"rule": _overdue_predicate_sql(now_iso)},
+        )
 
 
 # -----------------------------------------------------------------------------
-# Boot-safe compat shim used by ask_service (keep)
+# Compatibility shim: get_subscription_status
 # -----------------------------------------------------------------------------
 def get_subscription_status(account_id: str) -> Dict[str, Any]:
-    where = "get_subscription_status(fallback)"
-    account_id = (account_id or "").strip()
+    where = "get_subscription_status"
     if not account_id:
         return _fail("missing_account_id", where=where, hint="account_id is required")
 
-    ok, row, err = _get_user_subscription(account_id)
+    ok_pk, account_pk, err = _resolve_accounts_pk(account_id)
+    if not ok_pk or not account_pk:
+        return {"ok": False, "error": "account_not_found", "where": where, "root_cause": err}
+
+    ok, row, read_err = _get_user_subscription(account_pk)
     if not ok:
-        return {"ok": False, "error": "db_read_failed", "where": where, "root_cause": err}
+        return {"ok": False, "error": "db_read_failed", "where": where, "root_cause": read_err}
 
     if not row:
-        return _ok({"account_id": account_id, "status": "free", "plan_code": None, "active": False})
+        return _ok({"account_id": account_pk, "status": "free", "plan_code": None, "active": False})
 
     status = (row.get("status") or "").strip().lower() or "unknown"
-    active = bool(row.get("is_active")) and status == "active"
-    return _ok({"account_id": account_id, "status": status, "plan_code": row.get("plan_code"), "expires_at": row.get("expires_at"), "active": active})
+    is_active = bool(row.get("is_active")) and status == "active"
+    return _ok({"account_id": account_pk, "status": status, "plan_code": row.get("plan_code"), "active": is_active, "expires_at": row.get("expires_at")})
