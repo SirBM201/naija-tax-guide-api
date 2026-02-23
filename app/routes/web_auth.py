@@ -1,4 +1,3 @@
-# app/routes/web_auth.py
 from __future__ import annotations
 
 import hashlib
@@ -18,6 +17,9 @@ from app.services.email_service import send_email_otp, smtp_is_configured
 bp = Blueprint("web_auth", __name__)
 
 
+# -------------------------
+# Supabase wrapper (handles supabase being either a client or a factory function)
+# -------------------------
 def _sb():
     return supabase() if callable(supabase) else supabase
 
@@ -55,8 +57,8 @@ def _cookie_domain() -> Optional[str]:
 
 
 ENV = _env("ENV", "prod").lower()
-WEB_AUTH_ENABLED = _env("WEB_AUTH_ENABLED", "1").strip().lower() in {"1", "true", "yes", "y", "on"}
-WEB_AUTH_DEBUG = _env("WEB_AUTH_DEBUG", "0").strip().lower() in {"1", "true", "yes", "y", "on"}
+WEB_AUTH_ENABLED = _truthy(_env("WEB_AUTH_ENABLED", "1"))
+WEB_AUTH_DEBUG = _truthy(_env("WEB_AUTH_DEBUG", "0"))
 
 WEB_OTP_TABLE = _env("WEB_OTP_TABLE", "web_otps")
 WEB_TOKEN_TABLE = _env("WEB_TOKEN_TABLE", "web_tokens")
@@ -117,7 +119,7 @@ def _safe_debug_info() -> Dict[str, Any]:
 
 
 # -------------------------
-# Rootcause exposer helpers
+# Safe root-cause exposer helpers
 # -------------------------
 def _clip(s: str, n: int = 220) -> str:
     s = (s or "")
@@ -139,14 +141,12 @@ def _read_json_body() -> Tuple[Dict[str, Any], Dict[str, Any]]:
         "keys": [],
     }
 
-    # 1) Flask JSON parse
     data = request.get_json(silent=True)
     if isinstance(data, dict):
         meta["json_parsed"] = True
         meta["keys"] = sorted(list(data.keys()))
         return data, meta
 
-    # 2) Fallback: raw body
     raw = request.get_data(cache=False, as_text=True) or ""
     meta["raw_body_len"] = len(raw)
     meta["raw_body_preview"] = _clip(raw, 200)
@@ -163,6 +163,28 @@ def _read_json_body() -> Tuple[Dict[str, Any], Dict[str, Any]]:
     return {}, meta
 
 
+def _extract_contact(data: Dict[str, Any]) -> str:
+    """
+    Accept multiple payload shapes:
+      - contact (preferred)
+      - email / identifier / phone / login / handle
+    """
+    raw_contact = (
+        data.get("contact")
+        or data.get("email")
+        or data.get("identifier")
+        or data.get("phone")
+        or data.get("login")
+        or data.get("handle")
+        or ""
+    )
+    return _normalize_contact(str(raw_contact))
+
+
+def _extract_otp(data: Dict[str, Any]) -> str:
+    return str(data.get("otp") or data.get("code") or data.get("passcode") or "").strip()
+
+
 def _account_pk_column() -> str:
     if _has_column("accounts", "account_id"):
         return "account_id"
@@ -174,18 +196,21 @@ def _account_pk_column() -> str:
 def _upsert_account_for_contact(contact: str) -> Optional[str]:
     pk = _account_pk_column()
 
-    res = (
-        _sb()
-        .table("accounts")
-        .select(pk)
-        .eq("provider", "web")
-        .eq("provider_user_id", contact)
-        .limit(1)
-        .execute()
-    )
-    rows = (res.data or []) if hasattr(res, "data") else []
-    if rows and rows[0].get(pk):
-        return str(rows[0][pk])
+    try:
+        res = (
+            _sb()
+            .table("accounts")
+            .select(pk)
+            .eq("provider", "web")
+            .eq("provider_user_id", contact)
+            .limit(1)
+            .execute()
+        )
+        rows = (res.data or []) if hasattr(res, "data") else []
+        if rows and rows[0].get(pk):
+            return str(rows[0][pk])
+    except Exception:
+        pass
 
     payload: Dict[str, Any] = {"provider": "web", "provider_user_id": contact}
     if _has_column("accounts", "display_name"):
@@ -202,18 +227,21 @@ def _upsert_account_for_contact(contact: str) -> Optional[str]:
         pass
 
     # fallback re-query
-    res2 = (
-        _sb()
-        .table("accounts")
-        .select(pk)
-        .eq("provider", "web")
-        .eq("provider_user_id", contact)
-        .limit(1)
-        .execute()
-    )
-    rows2 = (res2.data or []) if hasattr(res2, "data") else []
-    if rows2 and rows2[0].get(pk):
-        return str(rows2[0][pk])
+    try:
+        res2 = (
+            _sb()
+            .table("accounts")
+            .select(pk)
+            .eq("provider", "web")
+            .eq("provider_user_id", contact)
+            .limit(1)
+            .execute()
+        )
+        rows2 = (res2.data or []) if hasattr(res2, "data") else []
+        if rows2 and rows2[0].get(pk):
+            return str(rows2[0][pk])
+    except Exception:
+        pass
 
     return None
 
@@ -228,12 +256,15 @@ def request_otp():
         return jsonify({"ok": False, "error": "web_auth_disabled"}), 403
 
     data, meta = _read_json_body()
-    contact = _normalize_contact(str(data.get("contact") or ""))
+
+    contact = _extract_contact(data)
     purpose = (str(data.get("purpose") or "web_login")).strip()
-    email_to = (str(data.get("email") or "") or "").strip().lower()
+
+    # Optional explicit email destination if contact is phone
+    email_to = (str(data.get("email_to") or data.get("email") or "") or "").strip().lower()
 
     if not contact:
-        out = {"ok": False, "error": "missing_contact"}
+        out: Dict[str, Any] = {"ok": False, "error": "missing_contact"}
         if WEB_AUTH_DEBUG:
             out["debug"] = {"why": "contact_missing_or_empty", "req": meta, **_safe_debug_info()}
         return jsonify(out), 400
@@ -251,12 +282,18 @@ def request_otp():
                 "used": False,
             }
         ).execute()
-    except Exception:
+    except Exception as e:
         out = {"ok": False, "error": "otp_store_failed"}
         if WEB_AUTH_DEBUG:
-            out["debug"] = {"why": "db_insert_failed", "req": meta, **_safe_debug_info()}
+            out["debug"] = {
+                "why": "db_insert_failed",
+                "root_cause": f"{type(e).__name__}:{_clip(str(e), 220)}",
+                "req": meta,
+                **_safe_debug_info(),
+            }
         return jsonify(out), 500
 
+    # Email destination
     dest_email = ""
     if _is_email(contact):
         dest_email = contact
@@ -299,12 +336,12 @@ def verify_otp():
 
     data, meta = _read_json_body()
 
-    contact = _normalize_contact(str(data.get("contact") or ""))
+    contact = _extract_contact(data)
     purpose = (str(data.get("purpose") or "web_login")).strip()
-    otp = str(data.get("otp") or "").strip()
+    otp = _extract_otp(data)
 
     if not contact or not otp:
-        out = {"ok": False, "error": "invalid_request"}
+        out: Dict[str, Any] = {"ok": False, "error": "invalid_request"}
         if WEB_AUTH_DEBUG:
             missing = []
             if not contact:
@@ -321,21 +358,33 @@ def verify_otp():
 
     code_hash = _otp_hash(contact, purpose, otp)
 
-    q = (
-        _sb()
-        .table(WEB_OTP_TABLE)
-        .select("*")
-        .eq("contact", contact)
-        .eq("purpose", purpose)
-        .eq("code_hash", code_hash)
-        .eq("used", False)
-        .order("created_at", desc=True)
-        .limit(1)
-        .execute()
-    )
-    rows = (q.data or []) if hasattr(q, "data") else []
+    try:
+        q = (
+            _sb()
+            .table(WEB_OTP_TABLE)
+            .select("*")
+            .eq("contact", contact)
+            .eq("purpose", purpose)
+            .eq("code_hash", code_hash)
+            .eq("used", False)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = (q.data or []) if hasattr(q, "data") else []
+    except Exception as e:
+        out = {"ok": False, "error": "otp_lookup_failed"}
+        if WEB_AUTH_DEBUG:
+            out["debug"] = {
+                "why": "db_select_failed",
+                "root_cause": f"{type(e).__name__}:{_clip(str(e), 220)}",
+                "req": meta,
+                **_safe_debug_info(),
+            }
+        return jsonify(out), 500
+
     if not rows:
-        out = {"ok": False, "error": "invalid_otp"}
+        out: Dict[str, Any] = {"ok": False, "error": "invalid_otp"}
         if WEB_AUTH_DEBUG:
             out["debug"] = {"why": "no_matching_otp_row", "req": meta, **_safe_debug_info()}
         return jsonify(out), 401
@@ -383,15 +432,20 @@ def verify_otp():
 
     try:
         _sb().table(WEB_TOKEN_TABLE).insert(insert_payload).execute()
-    except Exception:
+    except Exception as e:
         out = {"ok": False, "error": "token_issue_failed"}
         if WEB_AUTH_DEBUG:
-            out["debug"] = {"why": "token_insert_failed", "req": meta, **_safe_debug_info()}
+            out["debug"] = {
+                "why": "token_insert_failed",
+                "root_cause": f"{type(e).__name__}:{_clip(str(e), 220)}",
+                "req": meta,
+                **_safe_debug_info(),
+            }
         return jsonify(out), 500
 
     out: Dict[str, Any] = {
         "ok": True,
-        "token": raw_token,
+        "token": raw_token,  # bearer token (also set as cookie)
         "account_id": account_id,
         "expires_at": expires_at.isoformat(),
         "auth_mode": "cookie+bearer",
