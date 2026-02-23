@@ -1,41 +1,39 @@
 # app/core/supabase_client.py
-"""
-Central Supabase client factory for the backend.
-
-Rules:
-- Backend ALWAYS uses SERVICE ROLE key
-- Client is created once (singleton)
-- Codebase uses supabase() as a callable everywhere
-"""
-
 from __future__ import annotations
 
-from typing import Any, Optional
+import os
+from typing import Optional
 
-from supabase import create_client
-
-from .config import SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
-
-_client: Optional[Any] = None
+from supabase import create_client, Client
 
 
-def supabase() -> Any:
+_SUPABASE: Optional[Client] = None
+
+
+def get_supabase() -> Client:
     """
-    Returns a singleton Supabase client using SERVICE ROLE key.
-    Server-side only. Never expose to frontend.
+    Returns a singleton Supabase Client.
+    IMPORTANT:
+      - This must return a Client object (has .table()).
+      - If you accidentally export a function named `supabase`,
+        importing it as `supabase` will cause "'function' object has no attribute 'table'".
     """
-    global _client
+    global _SUPABASE
 
-    if _client is not None:
-        return _client
+    if _SUPABASE is not None:
+        return _SUPABASE
 
-    url = (SUPABASE_URL or "").strip()
-    key = (SUPABASE_SERVICE_ROLE_KEY or "").strip()
+    url = (os.getenv("SUPABASE_URL") or "").strip()
+    key = (
+        (os.getenv("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
+        or (os.getenv("SUPABASE_ANON_KEY") or "").strip()
+    )
 
-    if not url:
-        raise RuntimeError("SUPABASE_URL is not set")
-    if not key:
-        raise RuntimeError("SUPABASE_SERVICE_ROLE_KEY is not set")
+    if not url or not key:
+        raise RuntimeError(
+            "Supabase not configured. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY (recommended) "
+            "or SUPABASE_ANON_KEY."
+        )
 
-    _client = create_client(url, key)
-    return _client
+    _SUPABASE = create_client(url, key)
+    return _SUPABASE
