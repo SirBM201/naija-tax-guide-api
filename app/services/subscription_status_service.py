@@ -26,6 +26,18 @@ def _iso_or_none(value: Optional[str]) -> Optional[str]:
     return value if value else None
 
 
+def _sanitize_err(e: Exception) -> str:
+    """
+    Safe error string:
+    - no stack trace
+    - short
+    - does not include env values
+    """
+    s = str(e) or e.__class__.__name__
+    s = s.replace("\n", " ").strip()
+    return s[:280]
+
+
 def _compute_state(
     *,
     now: datetime,
@@ -35,20 +47,11 @@ def _compute_state(
     grace_until: Optional[str],
     trial_until: Optional[str],
 ) -> Dict[str, Any]:
-    """
-    Compute active/state from timestamps + status.
-    Priority:
-      1) trial_until (if present + in future)
-      2) expires_at (if present + in future)
-      3) grace_until (if present + in future)
-      4) else expired/none
-    """
     status_norm = (status or "").strip().lower()
     exp_dt = _parse_iso(expires_at)
     grace_dt = _parse_iso(grace_until)
     trial_dt = _parse_iso(trial_until)
 
-    # If DB explicitly marks inactive/canceled, respect it (unless trial is active)
     explicitly_inactive = status_norm in {"canceled", "cancelled", "inactive", "disabled", "paused"}
 
     if trial_dt and trial_dt > now and not explicitly_inactive:
@@ -84,7 +87,6 @@ def _compute_state(
             "trial_until": _iso_or_none(trial_until),
         }
 
-    # If we had any timestamps but they are in the past -> expired
     if exp_dt or grace_dt or trial_dt:
         return {
             "active": False,
@@ -96,7 +98,6 @@ def _compute_state(
             "trial_until": _iso_or_none(trial_until),
         }
 
-    # Otherwise: none
     return {
         "active": False,
         "state": "none",
@@ -115,10 +116,10 @@ def _try_fetch_latest_row(
     id_col: str,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """
-    Returns (row, error_string).
+    Returns (row, safe_error_string).
     """
     try:
-        db = supabase()  # IMPORTANT: supabase is a function in this project
+        db = supabase()
         res = (
             db.table(table_name)
             .select("*")
@@ -130,23 +131,23 @@ def _try_fetch_latest_row(
         rows = getattr(res, "data", None) or []
         return (rows[0] if rows else None), None
     except Exception as e:
-        return None, repr(e)
+        return None, _sanitize_err(e)
 
 
 def get_subscription_status(account_id: str) -> Dict[str, Any]:
     """
-    Attempts to read subscription status from Supabase with compatibility across schemas.
+    Compatibility reader across schemas.
 
-    Tries, in order:
-      - SUBSCRIPTIONS_TABLE env var (if provided)
+    Tries tables:
+      - SUBSCRIPTIONS_TABLE env var (if set)
       - user_subscriptions
       - subscriptions
 
-    And for each table, tries id columns:
+    Tries id columns:
       - account_id
       - user_id
 
-    Returns a stable shape:
+    Returns:
       {
         account_id: str,
         active: bool,
@@ -156,7 +157,7 @@ def get_subscription_status(account_id: str) -> Dict[str, Any]:
         grace_until: str|null,
         trial_until: str|null,
         reason: str,
-        debug_source: { table, id_col }   # safe
+        debug_source: { table, id_col, error? }   # safe
       }
     """
     account_id = (account_id or "").strip()
@@ -173,11 +174,8 @@ def get_subscription_status(account_id: str) -> Dict[str, Any]:
             "debug_source": {"table": None, "id_col": None},
         }
 
-    # Candidate tables (allow env override)
     env_table = (os.getenv("SUBSCRIPTIONS_TABLE", "") or "").strip()
     tables: List[str] = [t for t in [env_table, "user_subscriptions", "subscriptions"] if t]
-
-    # Candidate id columns
     id_cols = ["account_id", "user_id"]
 
     latest_row: Optional[Dict[str, Any]] = None
@@ -200,8 +198,6 @@ def get_subscription_status(account_id: str) -> Dict[str, Any]:
             break
 
     if not latest_row:
-        # If we failed because schema mismatched, still return "none" but include safe error hint
-        # (does not leak secrets)
         return {
             "account_id": account_id,
             "active": False,
@@ -220,9 +216,8 @@ def get_subscription_status(account_id: str) -> Dict[str, Any]:
     grace_until = latest_row.get("grace_until") or latest_row.get("grace") or None
     trial_until = latest_row.get("trial_until") or latest_row.get("trial") or None
 
-    now = _now_utc()
     computed = _compute_state(
-        now=now,
+        now=_now_utc(),
         plan_code=plan_code,
         status=status,
         expires_at=expires_at,
