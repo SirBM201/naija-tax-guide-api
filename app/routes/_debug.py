@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from flask import Blueprint, jsonify, request
 
@@ -23,86 +23,116 @@ def _env(name: str, default: str = "") -> str:
     return (os.getenv(name, default) or default).strip()
 
 
-DEBUG_ENABLED = _truthy(_env("DEBUG_ENDPOINTS_ENABLED", "1"))
-ADMIN_KEY = _env("ADMIN_API_KEY", "")
-
-WEB_OTP_TABLE = _env("WEB_OTP_TABLE", "web_otps")
-
-
-def _is_admin(req) -> bool:
-    # Allow turning off admin gating if you want (not recommended for prod)
-    if _truthy(_env("DEBUG_ENDPOINTS_PUBLIC", "0")):
+def _has_column(table: str, col: str) -> bool:
+    try:
+        _sb().table(table).select(col).limit(1).execute()
         return True
-    got = (req.headers.get("X-Admin-Key") or "").strip()
-    return bool(ADMIN_KEY) and got == ADMIN_KEY
+    except Exception:
+        return False
+
+
+def _require_admin() -> Optional[Dict[str, Any]]:
+    """
+    Lightweight admin guard.
+    Uses X-Admin-Key if ADMIN_API_KEY is set.
+    If ADMIN_API_KEY is not set, still allows in dev only.
+    """
+    env = _env("ENV", "prod").lower()
+    admin_key = _env("ADMIN_API_KEY", "")
+    incoming = (request.headers.get("X-Admin-Key") or "").strip()
+
+    if admin_key:
+        if incoming != admin_key:
+            return {"ok": False, "error": "forbidden", "why": "missing_or_invalid_admin_key"}
+        return None
+
+    # no admin key configured
+    if env == "dev":
+        return None
+
+    return {"ok": False, "error": "forbidden", "why": "admin_key_not_configured_in_prod"}
+
+
+@bp.get("/_debug/config")
+def debug_config():
+    guard = _require_admin()
+    if guard:
+        return jsonify(guard), 403
+
+    safe = {
+        "ok": True,
+        "env": _env("ENV", "prod"),
+        "web_auth": {
+            "WEB_AUTH_ENABLED": _env("WEB_AUTH_ENABLED", ""),
+            "WEB_AUTH_DEBUG": _env("WEB_AUTH_DEBUG", ""),
+            "WEB_OTP_TABLE": _env("WEB_OTP_TABLE", "web_otps"),
+            "WEB_TOKEN_TABLE": _env("WEB_TOKEN_TABLE", "web_tokens"),
+            "WEB_OTP_TTL_MINUTES": _env("WEB_OTP_TTL_MINUTES", "10"),
+            "WEB_SESSION_TTL_DAYS": _env("WEB_SESSION_TTL_DAYS", "30"),
+        },
+    }
+    return jsonify(safe), 200
 
 
 @bp.get("/_debug/otp/latest")
-def debug_latest_otp():
-    if not DEBUG_ENABLED:
-        return jsonify({"ok": False, "error": "debug_disabled"}), 403
-    if not _is_admin(request):
-        return jsonify({"ok": False, "error": "admin_required"}), 401
+def debug_otp_latest():
+    guard = _require_admin()
+    if guard:
+        return jsonify(guard), 403
 
-    email = (request.args.get("email") or "").strip().lower()
-    contact = (request.args.get("contact") or "").strip().lower()
-    target = email or contact
-    if not target:
+    table = _env("WEB_OTP_TABLE", "web_otps")
+    contact = (request.args.get("email") or request.args.get("contact") or "").strip().lower()
+
+    if not contact:
         return jsonify({"ok": False, "error": "missing_email_or_contact"}), 400
 
-    # Try both schema variants safely
-    # New schema: contact / code_hash / used
-    # Legacy schema: phone_e164 / otp_hash / revoked
+    # Choose safe columns dynamically (avoid non-existent columns like 'otp')
+    cols: List[str] = []
+    for c in [
+        "id",
+        "created_at",
+        "contact",
+        "purpose",
+        "expires_at",
+        "used",
+        "used_at",
+        "revoked",
+        "revoked_at",
+        "code_hash",
+    ]:
+        if _has_column(table, c):
+            cols.append(c)
+
+    # Must at least be able to select contact + expires_at to be meaningful
+    if "contact" not in cols and not _has_column(table, "contact"):
+        return jsonify({"ok": False, "error": "schema_mismatch", "why": "otp_table_missing_contact"}), 500
+
+    select_cols = ",".join(cols) if cols else "*"
+
     try:
         q = (
             _sb()
-            .table(WEB_OTP_TABLE)
-            .select("id, created_at, expires_at, purpose, contact, code_hash, used")
-            .eq("contact", target)
+            .table(table)
+            .select(select_cols)
+            .eq("contact", contact)
             .order("created_at", desc=True)
             .limit(1)
             .execute()
         )
         rows = (q.data or []) if hasattr(q, "data") else []
-        if rows:
-            row = rows[0]
-            # never return hashes if you don’t want; but hashes are not secrets.
-            safe = {
-                "id": row.get("id"),
-                "created_at": row.get("created_at"),
-                "expires_at": row.get("expires_at"),
-                "purpose": row.get("purpose"),
-                "contact": row.get("contact"),
-                "used": row.get("used"),
-            }
-            return jsonify({"ok": True, "row": safe, "schema": "contact/code_hash/used"}), 200
-    except Exception:
-        pass
+        if not rows:
+            return jsonify({"ok": True, "found": False, "row": None}), 200
 
-    # Legacy schema fallback
-    try:
-        q2 = (
-            _sb()
-            .table(WEB_OTP_TABLE)
-            .select("id, created_at, expires_at, device_id, phone_e164, otp_hash, revoked")
-            .eq("phone_e164", target)
-            .order("created_at", desc=True)
-            .limit(1)
-            .execute()
-        )
-        rows2 = (q2.data or []) if hasattr(q2, "data") else []
-        if rows2:
-            row = rows2[0]
-            safe = {
-                "id": row.get("id"),
-                "created_at": row.get("created_at"),
-                "expires_at": row.get("expires_at"),
-                "device_id": row.get("device_id"),
-                "phone_e164": row.get("phone_e164"),
-                "revoked": row.get("revoked"),
-            }
-            return jsonify({"ok": True, "row": safe, "schema": "phone_e164/otp_hash/revoked"}), 200
+        row = rows[0]
+
+        # remove any sensitive content (even though we never store plaintext OTP)
+        # code_hash is OK for debugging but can be optionally removed:
+        if not _truthy(_env("DEBUG_RETURN_CODE_HASH", "0")) and "code_hash" in row:
+            row.pop("code_hash", None)
+
+        return jsonify({"ok": True, "found": True, "row": row}), 200
+
     except Exception as e:
-        return jsonify({"ok": False, "error": "debug_otp_failed", "root_cause": repr(e)}), 500
-
-    return jsonify({"ok": False, "error": "no_rows_found"}), 404
+        return jsonify(
+            {"ok": False, "error": "debug_otp_failed", "root_cause": repr(e)[:240]}
+        ), 500
