@@ -65,43 +65,61 @@ def _fail(error: str, *, where: str, e: Optional[Exception] = None, hint: Option
 
 
 def _db():
-    # IMPORTANT: in your codebase, supabase is a function (factory)
+    # IMPORTANT: in your codebase, supabase is a factory function.
     return supabase()
 
 
 # -----------------------------------------------------------------------------
-# DB helpers (compatible with supabase/postgrest versions that DO NOT support
-# chaining .select() after .upsert())
+# Accounts prerequisite (FK safety)
 # -----------------------------------------------------------------------------
-def _upsert_user_subscription(payload: Dict[str, Any]) -> Tuple[bool, Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+def _account_exists(account_id: str) -> Tuple[bool, bool, Optional[Dict[str, Any]]]:
     """
-    Upsert into user_subscriptions using UNIQUE(account_id).
-    Compatible with older/newer postgrest builders by NOT chaining .select().
-
-    Returns: (ok, row, error_info)
+    Returns: (ok, exists, error_info)
     """
+    account_id = (account_id or "").strip()
     try:
         db = _db()
-
-        # Many postgrest/supabase-py versions return a builder without `.select`
-        # after `.upsert()`. So: execute upsert, then read back the row.
-        db.table("user_subscriptions").upsert(payload, on_conflict="account_id").execute()
-
-        # Read back
-        ok, row, err = _get_user_subscription(payload.get("account_id") or "")
-        if not ok:
-            return False, None, err
-        return True, row, None
-
+        res = (
+            db.table("accounts")
+            .select("account_id")
+            .eq("account_id", account_id)
+            .limit(1)
+            .execute()
+        )
+        rows = getattr(res, "data", None) or []
+        return True, bool(rows), None
     except Exception as e:
-        return False, None, _rootcause(
-            "user_subscriptions.upsert",
+        return False, False, _rootcause(
+            "accounts.select",
             e,
-            hint="Upsert failed. Verify table exists, Supabase URL/KEY are set, and RLS allows the service role.",
-            extra={"on_conflict": "account_id", "payload_keys": sorted(list(payload.keys()))},
+            hint="Failed to read accounts table. Check Supabase credentials and RLS policies.",
+            extra={"account_id": account_id},
         )
 
 
+def _ensure_account_exists(account_id: str) -> Tuple[bool, Optional[Dict[str, Any]]]:
+    """
+    Ensures FK prerequisite: accounts.account_id exists.
+    We do NOT auto-create accounts here because accounts row usually carries provider info.
+    If missing, return a clean error telling you what to do.
+    """
+    ok, exists, err = _account_exists(account_id)
+    if not ok:
+        return False, err
+    if not exists:
+        return False, {
+            "where": "ensure_account_exists",
+            "type": "ForeignKeyViolation",
+            "message": f"account_id '{account_id}' does not exist in accounts, so user_subscriptions cannot reference it.",
+            "hint": "Create/login the account first (OTP flow) so it is inserted into accounts, then retry activation.",
+            "extra": {"account_id": account_id, "required_table": "accounts", "fk": "user_subscriptions.account_id -> accounts.account_id"},
+        }
+    return True, None
+
+
+# -----------------------------------------------------------------------------
+# Subscriptions DB helpers (compatible with client that cannot chain .select after .upsert)
+# -----------------------------------------------------------------------------
 def _get_user_subscription(account_id: str) -> Tuple[bool, Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     account_id = (account_id or "").strip()
     try:
@@ -120,13 +138,36 @@ def _get_user_subscription(account_id: str) -> Tuple[bool, Optional[Dict[str, An
         return False, None, _rootcause(
             "user_subscriptions.select",
             e,
-            hint="Read failed. Check Supabase credentials and RLS policies for user_subscriptions.",
+            hint="Read failed. Check RLS policy for user_subscriptions and service role key usage.",
             extra={"account_id": account_id},
         )
 
 
+def _upsert_user_subscription(payload: Dict[str, Any]) -> Tuple[bool, Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """
+    Upsert then read back (no chained select).
+    Returns: (ok, row, error_info)
+    """
+    try:
+        db = _db()
+        db.table("user_subscriptions").upsert(payload, on_conflict="account_id").execute()
+
+        ok, row, err = _get_user_subscription(payload.get("account_id") or "")
+        if not ok:
+            return False, None, err
+        return True, row, None
+
+    except Exception as e:
+        return False, None, _rootcause(
+            "user_subscriptions.upsert",
+            e,
+            hint="Upsert failed. Common causes: FK missing accounts row, RLS denies, or wrong Supabase key.",
+            extra={"on_conflict": "account_id", "payload_keys": sorted(list(payload.keys()))},
+        )
+
+
 # -----------------------------------------------------------------------------
-# Public functions used by routes
+# Public service functions
 # -----------------------------------------------------------------------------
 def activate_subscription_now(
     *,
@@ -144,6 +185,11 @@ def activate_subscription_now(
         return _fail("missing_account_id", where=where, hint="account_id is required")
     if not plan_code:
         return _fail("missing_plan_code", where=where, hint="plan_code is required")
+
+    # FK prerequisite: accounts row must exist
+    ok_acc, acc_err = _ensure_account_exists(account_id)
+    if not ok_acc:
+        return {"ok": False, "error": "account_not_found", "where": where, "root_cause": acc_err}
 
     now = _now_utc()
     dur = int(days) if days is not None else _duration_days(plan_code)
@@ -173,15 +219,15 @@ def activate_subscription_now(
     return _ok({"account_id": account_id, "subscription": row, "table": "user_subscriptions"})
 
 
-def cancel_subscription(
-    *,
-    account_id: str,
-    status: str = "canceled",
-) -> Dict[str, Any]:
+def cancel_subscription(*, account_id: str, status: str = "canceled") -> Dict[str, Any]:
     where = "cancel_subscription"
     account_id = (account_id or "").strip()
     if not account_id:
         return _fail("missing_account_id", where=where, hint="account_id is required")
+
+    ok_acc, acc_err = _ensure_account_exists(account_id)
+    if not ok_acc:
+        return {"ok": False, "error": "account_not_found", "where": where, "root_cause": acc_err}
 
     now = _now_utc()
     payload = {
@@ -197,16 +243,15 @@ def cancel_subscription(
     return _ok({"account_id": account_id, "subscription": row})
 
 
-def set_trial(
-    *,
-    account_id: str,
-    plan_code: str = "trial",
-    trial_days: int = 7,
-) -> Dict[str, Any]:
+def set_trial(*, account_id: str, plan_code: str = "trial", trial_days: int = 7) -> Dict[str, Any]:
     where = "set_trial"
     account_id = (account_id or "").strip()
     if not account_id:
         return _fail("missing_account_id", where=where, hint="account_id is required")
+
+    ok_acc, acc_err = _ensure_account_exists(account_id)
+    if not ok_acc:
+        return {"ok": False, "error": "account_not_found", "where": where, "root_cause": acc_err}
 
     now = _now_utc()
     trial_until = now + timedelta(days=int(trial_days))
@@ -240,14 +285,9 @@ def debug_read_subscription(account_id: str) -> Dict[str, Any]:
 
 
 # -----------------------------------------------------------------------------
-# Compatibility shims (prevent REQUIRED blueprint boot crashes)
+# Compatibility shims (boot-safe)
 # -----------------------------------------------------------------------------
 def get_subscription_status(account_id: str) -> Dict[str, Any]:
-    """
-    app.routes.ask imports get_subscription_status from this module.
-    Delegate to subscription_status_service if present; fallback to DB.
-    Never crash boot.
-    """
     where = "get_subscription_status(shim)"
     account_id = (account_id or "").strip()
     if not account_id:
@@ -277,29 +317,14 @@ def get_subscription_status(account_id: str) -> Dict[str, Any]:
         )
 
 
-def handle_payment_success(
-    *,
-    account_id: str,
-    plan_code: Optional[str] = None,
-    days: Optional[int] = None,
-    meta: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """
-    app.routes.webhooks imports handle_payment_success from this module.
-    Safe default behavior: activate subscription now.
-    """
+def handle_payment_success(*, account_id: str, plan_code: Optional[str] = None, days: Optional[int] = None, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     where = "handle_payment_success(shim)"
     account_id = (account_id or "").strip()
     if not account_id:
         return _fail("missing_account_id", where=where, hint="account_id is required")
 
     try:
-        return activate_subscription_now(
-            account_id=account_id,
-            plan_code=(plan_code or "monthly"),
-            days=days,
-            status="active",
-        )
+        return activate_subscription_now(account_id=account_id, plan_code=(plan_code or "monthly"), days=days, status="active")
     except Exception as e:
         return _fail(
             "handle_payment_success_failed",
@@ -310,12 +335,7 @@ def handle_payment_success(
         )
 
 
-def handle_payment_failed(
-    *,
-    account_id: str,
-    reason: Optional[str] = None,
-    meta: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+def handle_payment_failed(*, account_id: str, reason: Optional[str] = None, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     where = "handle_payment_failed(shim)"
     account_id = (account_id or "").strip()
     if not account_id:
