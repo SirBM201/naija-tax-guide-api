@@ -162,7 +162,12 @@ def create_app() -> Flask:
         entry["registered"] = True
         (boot["required"] if required else boot["optional"]).append(entry)
 
+    # ------------------------------------------------------------
     # REQUIRED: core API routes
+    # ------------------------------------------------------------
+    # NOTE:
+    # - Paystack + debug routes are OPTIONAL (to avoid "healthy deploy but missing endpoints",
+    #   we register paystack in optional section with both bp names)
     required_modules = [
         "app.routes.health",
         "app.routes.accounts",
@@ -177,18 +182,39 @@ def create_app() -> Flask:
         "app.routes.email_link",
         "app.routes.web_auth",
         "app.routes.web_session",
-        "app.routes.paystack_webhook",
-        "app.routes.debug_routes",
-        "app.routes._debug",
     ]
     for dotted in required_modules:
         _register_bp(dotted, "bp", required=True, url_prefix=api_prefix)
 
-    # OPTIONAL: paystack helpers and cron (cron typically has NO api prefix)
+    # ------------------------------------------------------------
+    # OPTIONAL: Paystack + Cron
+    # ------------------------------------------------------------
+    # Paystack blueprint export varies across versions:
+    #  - some export `bp`
+    #  - some export `paystack_bp`
+    #
+    # We attempt BOTH so you never end up with /api/paystack/* returning 404
+    # just because of an attribute name mismatch.
+    _register_bp("app.routes.paystack", "bp", required=False, url_prefix=api_prefix)
     _register_bp("app.routes.paystack", "paystack_bp", required=False, url_prefix=api_prefix)
+
+    # Paystack webhook module (if separated)
+    _register_bp("app.routes.paystack_webhook", "bp", required=False, url_prefix=api_prefix)
+
+    # Cron typically has NO api prefix
     _register_bp("app.routes.cron", "bp", required=False, url_prefix=None)
 
+    # ------------------------------------------------------------
+    # OPTIONAL: Debug routes (gated)
+    # ------------------------------------------------------------
+    # Enable only when explicitly requested (avoid exposing route lists in prod)
+    if _truthy(os.getenv("ENABLE_DEBUG_ROUTES", "0")):
+        _register_bp("app.routes.debug_routes", "bp", required=False, url_prefix=api_prefix)
+        _register_bp("app.routes._debug", "bp", required=False, url_prefix=api_prefix)
+
+    # ------------------------------------------------------------
     # OPTIONAL: multi-channel + web UI helpers
+    # ------------------------------------------------------------
     optional_modules = [
         "app.routes.whatsapp",
         "app.routes.telegram",
@@ -199,13 +225,17 @@ def create_app() -> Flask:
     for dotted in optional_modules:
         _register_bp(dotted, "bp", required=False, url_prefix=api_prefix)
 
-    # --- Safe diagnostics endpoint for production ---
+    # ------------------------------------------------------------
+    # Safe diagnostics endpoint
+    # ------------------------------------------------------------
     @app.get(f"{api_prefix}/_boot")
     def boot_report():
         return jsonify({"ok": True, "boot": boot, "strict": strict})
 
-    # --- Root-cause exposer (SAFE) ---
-    # Only returns a short reason + request id. Full trace is NOT returned.
+    # ------------------------------------------------------------
+    # Root-cause exposer (SAFE)
+    # ------------------------------------------------------------
+    # Only returns a short reason + request metadata. Full trace is NOT returned.
     @app.errorhandler(Exception)
     def _handle_any_error(e: Exception):
         # Keep prod safe: do NOT leak secrets or stacktraces.
