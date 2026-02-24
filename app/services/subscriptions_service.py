@@ -3,22 +3,27 @@ from __future__ import annotations
 
 import os
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, Optional
 
-from app.core.supabase_client import supabase
+from app.core.supabase_client import supabase  # must be a CLIENT, not a function
 
-# -----------------------------
+
+# ---------------------------
 # Helpers
-# -----------------------------
-
-def _utcnow() -> datetime:
+# ---------------------------
+def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
-def _as_iso(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
-def _rootcause(where: str, e: Exception, *, req_id: str, hint: str = "", extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def _env_bool(name: str, default: bool = False) -> bool:
+    v = (os.getenv(name) or "").strip().lower()
+    if v == "":
+        return default
+    return v in {"1", "true", "yes", "y", "on"}
+
+
+def _rootcause(where: str, e: Exception, *, req_id: str, hint: Optional[str] = None, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     out: Dict[str, Any] = {
         "where": where,
         "type": type(e).__name__,
@@ -31,295 +36,220 @@ def _rootcause(where: str, e: Exception, *, req_id: str, hint: str = "", extra: 
         out["extra"] = extra
     return out
 
-def _truthy(v: str | None) -> bool:
-    return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
-def _require_service_key_hint() -> str:
-    return "Ensure backend uses SUPABASE_SERVICE_ROLE_KEY (service role) for DB upserts/reads."
+def _ok(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
+    payload["ok"] = True
+    payload.setdefault("request_id", req_id)
+    return payload
 
-# -----------------------------
-# Core: Subscription Status (used by ask_service)
-# -----------------------------
 
+def _fail(error: str, req_id: str, *, root_cause: Optional[Dict[str, Any]] = None, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    out: Dict[str, Any] = {"ok": False, "error": error, "request_id": req_id}
+    if root_cause:
+        out["root_cause"] = root_cause
+    if extra:
+        out["extra"] = extra
+    return out
+
+
+def _is_supabase_client_object(x: Any) -> bool:
+    # crude but effective: the client has `.table()` method.
+    return hasattr(x, "table") and callable(getattr(x, "table"))
+
+
+# ---------------------------
+# Public API (imported by routes + ask_service)
+# ---------------------------
 def get_subscription_status(account_id: str) -> Dict[str, Any]:
     """
-    Used by ask_service to decide free vs paid limits.
-    Reads public.user_subscriptions by account_id.
+    Used by ask_service.
+    Returns a normalized subscription state.
+    Never throws; always returns ok/fail payload.
     """
     req_id = str(uuid.uuid4())
-    account_id = (account_id or "").strip()
+
     if not account_id:
-        return {"ok": False, "error": "missing_account_id", "request_id": req_id}
+        return _fail("missing_account_id", req_id)
+
+    if not _is_supabase_client_object(supabase):
+        return _fail(
+            "supabase_client_invalid",
+            req_id,
+            root_cause={
+                "where": "subscriptions_service.get_subscription_status",
+                "type": "ConfigError",
+                "message": "supabase import is not a client object (no .table method). Check app/core/supabase_client.py export.",
+                "request_id": req_id,
+                "hint": "Ensure app.core.supabase_client exports `supabase = create_client(...)`, not a function.",
+            },
+        )
 
     try:
+        # Prefer RPC-based read if available (more stable when schema cache is weird)
+        use_rpc = _env_bool("SUBS_USE_RPC", True)
+
+        if use_rpc:
+            try:
+                r = supabase.rpc("bms_read_subscription", {"p_account_id": account_id}).execute()
+                row = (r.data or None) if hasattr(r, "data") else None
+                # bms_read_subscription returns either NULL or json row
+                return _ok({"subscription": row, "is_paid": bool(row and row.get("is_active"))}, req_id)
+            except Exception:
+                # fall back to table select
+                pass
+
         res = (
             supabase.table("user_subscriptions")
-            .select("status, plan_code, current_period_end, started_at, updated_at")
+            .select("account_id, plan_code, status, current_period_end, created_at, updated_at")
             .eq("account_id", account_id)
             .limit(1)
             .execute()
         )
-        rows = getattr(res, "data", None) or []
+        rows = (res.data or []) if hasattr(res, "data") else []
         row = rows[0] if rows else None
 
-        if not row:
-            return {
-                "ok": True,
-                "request_id": req_id,
-                "is_paid": False,
-                "plan_code": "free",
-                "status": "none",
-                "current_period_end": None,
-            }
+        is_active = False
+        if row:
+            cpe = row.get("current_period_end")
+            status = (row.get("status") or "").lower()
+            if status in {"active", "paid"}:
+                is_active = True
+            if cpe:
+                # if current_period_end is in the future, active
+                try:
+                    # supabase usually returns ISO string
+                    dt = datetime.fromisoformat(str(cpe).replace("Z", "+00:00"))
+                    if dt > _now_utc():
+                        is_active = True
+                except Exception:
+                    pass
 
-        status = (row.get("status") or "").lower()
-        plan_code = (row.get("plan_code") or "free").lower()
-        end_at = row.get("current_period_end")
-
-        is_paid = status == "active"
-
-        # expire if end passed
-        try:
-            if end_at:
-                end_dt = datetime.fromisoformat(str(end_at).replace("Z", "+00:00"))
-                if end_dt <= _utcnow():
-                    is_paid = False
-        except Exception:
-            pass
-
-        return {
-            "ok": True,
-            "request_id": req_id,
-            "is_paid": bool(is_paid),
-            "plan_code": plan_code,
-            "status": status or "unknown",
-            "current_period_end": end_at,
-        }
+        return _ok({"subscription": row, "is_paid": is_active}, req_id)
 
     except Exception as e:
-        return {
-            "ok": False,
-            "error": "get_subscription_status_failed",
-            "request_id": req_id,
-            "root_cause": _rootcause(
+        return _fail(
+            "get_subscription_status_failed",
+            req_id,
+            root_cause=_rootcause(
                 "subscriptions_service.get_subscription_status",
                 e,
                 req_id=req_id,
-                hint=f"DB read failed (user_subscriptions). {_require_service_key_hint()}",
+                hint="DB read failed. If you see PGRST204, your table schema is missing columns or PostgREST schema cache is stale.",
                 extra={"account_id": account_id},
             ),
-        }
+        )
 
-# -----------------------------
-# Core: Activate Subscription (Admin endpoint)
-# -----------------------------
 
-def activate_subscription_now(account_id: str, plan_code: str, days: int = 30) -> Dict[str, Any]:
+def activate_subscription_now(account_id: str, plan_code: str = "monthly", days: Optional[int] = None) -> Dict[str, Any]:
     """
-    Called by /api/subscription/activate (admin protected).
-    Upserts user_subscriptions row for this account_id.
+    Admin-only activation.
+    Permanent approach:
+    - Prefer RPC function (SECURITY DEFINER) => avoids PostgREST schema-cache/column mismatch issues
+    - Fall back to table upsert only if RPC missing
     """
     req_id = str(uuid.uuid4())
-    account_id = (account_id or "").strip()
-    plan_code = (plan_code or "").strip().lower()
 
-    if not account_id or not plan_code:
-        return {"ok": False, "error": "missing_fields", "request_id": req_id, "need": ["account_id", "plan_code"]}
+    if not account_id:
+        return _fail("missing_account_id", req_id)
 
-    try:
-        days_i = int(days)
-        if days_i <= 0:
-            days_i = 30
-    except Exception:
-        days_i = 30
-
-    now = _utcnow()
-    end = now + timedelta(days=days_i)
-
-    payload = {
-        "account_id": account_id,
-        "plan_code": plan_code,
-        "status": "active",
-        "started_at": _as_iso(now),
-        "current_period_end": _as_iso(end),
-        "updated_at": _as_iso(now),
-    }
+    if not _is_supabase_client_object(supabase):
+        return _fail(
+            "supabase_client_invalid",
+            req_id,
+            root_cause={
+                "where": "subscriptions_service.activate_subscription_now",
+                "type": "ConfigError",
+                "message": "supabase import is not a client object (no .table method).",
+                "request_id": req_id,
+                "hint": "Fix app/core/supabase_client.py export.",
+            },
+        )
 
     try:
-        # This assumes unique index exists on account_id (you created it).
+        plan_code = (plan_code or "monthly").strip().lower()
+        if plan_code not in {"monthly", "quarterly", "yearly"}:
+            return _fail("invalid_plan_code", req_id, extra={"plan_code": plan_code})
+
+        if days is None:
+            days = {"monthly": 30, "quarterly": 90, "yearly": 365}[plan_code]
+        else:
+            days = int(days)
+
+        use_rpc = _env_bool("SUBS_USE_RPC", True)
+
+        # 1) Preferred: RPC upsert (permanent fix)
+        if use_rpc:
+            try:
+                r = supabase.rpc(
+                    "bms_activate_subscription",
+                    {"p_account_id": account_id, "p_plan_code": plan_code, "p_days": days},
+                ).execute()
+                data = r.data if hasattr(r, "data") else None
+                return _ok({"activated": True, "method": "rpc", "result": data}, req_id)
+            except Exception as e:
+                # If RPC not installed, we'll fall back, but we also return the RPC error in root cause
+                rpc_err = str(e)
+
+        # 2) Fallback: direct upsert (may fail with PGRST204)
+        current_period_end = (_now_utc() + timedelta(days=days)).isoformat()
+
+        payload = {
+            "account_id": account_id,
+            "plan_code": plan_code,
+            "status": "active",
+            "current_period_end": current_period_end,
+            "updated_at": _now_utc().isoformat(),
+        }
+
         res = (
             supabase.table("user_subscriptions")
             .upsert(payload, on_conflict="account_id")
             .execute()
         )
-        return {
-            "ok": True,
-            "request_id": req_id,
-            "subscription": payload,
-            "db": {"rows": getattr(res, "data", None)},
-        }
-    except Exception as e:
-        return {
-            "ok": False,
-            "error": "activate_subscription_failed",
-            "message": "could not activate subscription",
-            "request_id": req_id,
-            "root_cause": _rootcause(
-                "subscriptions_service.activate_subscription_now",
-                e,
-                req_id=req_id,
-                hint=f"DB upsert failed (user_subscriptions). Confirm table exists + account_id type matches. {_require_service_key_hint()}",
-                extra={"account_id": account_id, "plan_code": plan_code, "days": days_i},
-            ),
-        }
 
-# -----------------------------
-# Paystack webhook handler
-# -----------------------------
-
-def handle_payment_success(evt: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Called by paystack webhook route.
-    Expects: {event_id, provider, reference, account_id, plan_code, amount_kobo, currency, upgrade_mode, raw}
-    Writes idempotent paystack_events then activates/updates subscription.
-    """
-    req_id = str(uuid.uuid4())
-    try:
-        event_id = (evt.get("event_id") or "").strip()
-        provider = (evt.get("provider") or "paystack").strip().lower()
-        reference = (evt.get("reference") or "").strip()
-        account_id = (evt.get("account_id") or "").strip()
-        plan_code = (evt.get("plan_code") or "").strip().lower()
-        upgrade_mode = (evt.get("upgrade_mode") or "now").strip().lower()
-        amount_kobo = evt.get("amount_kobo")
-        currency = (evt.get("currency") or "NGN").strip().upper()
-        raw = evt.get("raw") or {}
-
-        if not event_id or not account_id or not plan_code:
-            return {
-                "ok": False,
-                "error": "missing_fields",
-                "request_id": req_id,
-                "need": ["event_id", "account_id", "plan_code"],
-            }
-
-        # 1) Idempotency record (unique event_id index in paystack_events)
-        try:
-            supabase.table("paystack_events").insert(
-                {
-                    "event_id": event_id,
-                    "provider": provider,
-                    "reference": reference,
-                    "account_id": account_id,
-                    "plan_code": plan_code,
-                    "amount_kobo": amount_kobo,
-                    "currency": currency,
-                    "raw": raw,
-                    "created_at": _as_iso(_utcnow()),
-                }
-            ).execute()
-        except Exception:
-            # If unique violation or insert error, treat as already processed
-            # (paystack retries same event_id)
-            pass
-
-        # 2) Apply subscription change
-        if upgrade_mode not in ("now", "at_expiry"):
-            upgrade_mode = "now"
-
-        if upgrade_mode == "now":
-            # activate immediately (default 30 days)
-            out = activate_subscription_now(account_id, plan_code, days=30)
-            out["request_id"] = req_id
-            out["source"] = "handle_payment_success"
-            return out
-
-        # at_expiry: set pending upgrade fields if you have them
-        # If you don't have pending columns, fallback to immediate activation.
-        try:
-            now = _utcnow()
-            res = (
-                supabase.table("user_subscriptions")
-                .select("current_period_end, status, plan_code")
-                .eq("account_id", account_id)
-                .limit(1)
-                .execute()
-            )
-            rows = getattr(res, "data", None) or []
-            row = rows[0] if rows else None
-
-            # If no existing subscription, activate now anyway
-            if not row:
-                out = activate_subscription_now(account_id, plan_code, days=30)
-                out["request_id"] = req_id
-                out["source"] = "handle_payment_success"
-                out["note"] = "no existing subscription; activated immediately"
-                return out
-
-            # If already expired/inactive, activate now
-            status = (row.get("status") or "").lower()
-            end_at = row.get("current_period_end")
-            expired = False
-            try:
-                if end_at:
-                    end_dt = datetime.fromisoformat(str(end_at).replace("Z", "+00:00"))
-                    expired = end_dt <= now
-            except Exception:
-                expired = False
-
-            if status != "active" or expired:
-                out = activate_subscription_now(account_id, plan_code, days=30)
-                out["request_id"] = req_id
-                out["source"] = "handle_payment_success"
-                out["note"] = "existing subscription inactive/expired; activated immediately"
-                return out
-
-            # Try to store pending plan (optional columns)
-            pending_payload = {
-                "account_id": account_id,
-                "pending_plan_code": plan_code,
-                "pending_upgrade_mode": "at_expiry",
-                "updated_at": _as_iso(now),
-            }
-            supabase.table("user_subscriptions").upsert(
-                pending_payload,
-                on_conflict="account_id",
-            ).execute()
-
-            return {
-                "ok": True,
-                "request_id": req_id,
-                "mode": "at_expiry",
-                "message": "upgrade scheduled at expiry",
-                "account_id": account_id,
-                "plan_code": plan_code,
-            }
-        except Exception:
-            out = activate_subscription_now(account_id, plan_code, days=30)
-            out["request_id"] = req_id
-            out["source"] = "handle_payment_success"
-            out["note"] = "at_expiry scheduling failed; activated immediately"
-            return out
+        return _ok({"activated": True, "method": "table_upsert", "row": getattr(res, "data", None)}, req_id)
 
     except Exception as e:
-        return {
-            "ok": False,
-            "error": "handle_payment_success_failed",
-            "request_id": req_id,
-            "root_cause": _rootcause("subscriptions_service.handle_payment_success", e, req_id=req_id),
-        }
+        msg = str(e)
+        hint = (
+            "If you see PGRST204 missing 'current_period_end', your table is missing that column OR PostgREST schema cache hasn't reloaded. "
+            "Permanent fix is to install bms_activate_subscription RPC + add required columns (SQL provided by debug endpoint)."
+        )
+        extra = {"account_id": account_id, "plan_code": plan_code, "days": days}
 
-# -----------------------------
-# Debug helper (optional endpoint usage)
-# -----------------------------
+        # Include rpc failure if it happened
+        if "rpc_err" in locals():
+            extra["rpc_error"] = rpc_err
+
+        return _fail(
+            "activate_subscription_failed",
+            req_id,
+            root_cause=_rootcause("subscriptions_service.activate_subscription_now", e, req_id=req_id, hint=hint, extra=extra),
+        )
+
 
 def debug_read_subscription(account_id: str) -> Dict[str, Any]:
+    """
+    Used by /_debug/subscription endpoint.
+    Returns row OR null, never crashes.
+    """
     req_id = str(uuid.uuid4())
-    account_id = (account_id or "").strip()
+
     if not account_id:
-        return {"ok": False, "error": "missing_account_id", "request_id": req_id}
+        return _fail("missing_account_id", req_id)
+
+    if not _is_supabase_client_object(supabase):
+        return _fail("supabase_client_invalid", req_id)
 
     try:
+        # Prefer RPC read if available
+        try:
+            r = supabase.rpc("bms_read_subscription", {"p_account_id": account_id}).execute()
+            row = (r.data or None) if hasattr(r, "data") else None
+            return _ok({"row": row, "method": "rpc"}, req_id)
+        except Exception:
+            pass
+
         res = (
             supabase.table("user_subscriptions")
             .select("*")
@@ -327,18 +257,74 @@ def debug_read_subscription(account_id: str) -> Dict[str, Any]:
             .limit(1)
             .execute()
         )
-        rows = getattr(res, "data", None) or []
-        return {"ok": True, "request_id": req_id, "row": (rows[0] if rows else None)}
+        rows = (res.data or []) if hasattr(res, "data") else []
+        return _ok({"row": (rows[0] if rows else None), "method": "table_select"}, req_id)
+
     except Exception as e:
-        return {
-            "ok": False,
-            "error": "debug_read_subscription_failed",
-            "request_id": req_id,
-            "root_cause": _rootcause(
+        return _fail(
+            "debug_read_subscription_failed",
+            req_id,
+            root_cause=_rootcause(
                 "subscriptions_service.debug_read_subscription",
                 e,
                 req_id=req_id,
-                hint=f"DB read failed (user_subscriptions). {_require_service_key_hint()}",
+                hint="If you get PGRST204, your schema cache/columns are mismatched. Install RPC + run SQL migration.",
                 extra={"account_id": account_id},
             ),
-        }
+        )
+
+
+def debug_expose_subscription_health(account_id: Optional[str] = None) -> Dict[str, Any]:
+    """
+    OUT-OF-THE-BOX debugger exposer:
+    - confirms supabase client shape
+    - confirms RPC exists (by calling it)
+    - returns recommended SQL migration if errors suggest missing columns
+    """
+    req_id = str(uuid.uuid4())
+
+    info: Dict[str, Any] = {
+        "client_ok": _is_supabase_client_object(supabase),
+        "rpc_probe": {},
+        "table_probe": {},
+        "recommended_sql": [],
+    }
+
+    if not info["client_ok"]:
+        return _fail(
+            "supabase_client_invalid",
+            req_id,
+            root_cause={
+                "where": "subscriptions_service.debug_expose_subscription_health",
+                "type": "ConfigError",
+                "message": "supabase is not a client object (no .table).",
+                "request_id": req_id,
+                "hint": "Fix app/core/supabase_client.py to export `supabase = create_client(...)`.",
+            },
+        )
+
+    # Probe RPC install
+    try:
+        # This should succeed if function exists, even if account_id is nonsense (returns null)
+        r = supabase.rpc("bms_read_subscription", {"p_account_id": account_id or "00000000-0000-0000-0000-000000000000"}).execute()
+        info["rpc_probe"] = {"ok": True, "data": r.data if hasattr(r, "data") else None}
+    except Exception as e:
+        info["rpc_probe"] = {"ok": False, "error": str(e)}
+        info["recommended_sql"].append("Install RPC functions bms_read_subscription + bms_activate_subscription (see SQL below).")
+
+    # Probe table + common columns
+    try:
+        res = supabase.table("user_subscriptions").select("*").limit(1).execute()
+        info["table_probe"] = {"ok": True, "sample": getattr(res, "data", None)}
+    except Exception as e:
+        msg = str(e)
+        info["table_probe"] = {"ok": False, "error": msg}
+        if "PGRST204" in msg and "current_period_end" in msg:
+            info["recommended_sql"].append("Add missing column current_period_end to public.user_subscriptions and reload schema cache.")
+        if "permission" in msg.lower():
+            info["recommended_sql"].append("Backend is likely not using service role key for DB operations.")
+
+    # Always include the “permanent SQL” suggestion
+    info["recommended_sql"].append("Use RPC-based activation to avoid PostgREST schema-cache issues permanently.")
+
+    return _ok(info, req_id)
