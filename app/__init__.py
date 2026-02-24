@@ -24,31 +24,16 @@ def _truthy(v: str | None) -> bool:
 
 
 def _cookie_mode_enabled() -> bool:
-    """
-    Cookie auth should be explicitly enabled.
-    Otherwise you'll accidentally force credentialed CORS and break '*' origins.
-    """
-    # Preferred explicit flag
     if _truthy(os.getenv("COOKIE_AUTH_ENABLED", "")):
         return True
-
-    # Backwards compat: allow enabling via WEB_AUTH_ENABLED + explicit cookie samesite/secure
     if _truthy(os.getenv("WEB_AUTH_ENABLED", "")) and os.getenv("WEB_AUTH_COOKIE_SAMESITE"):
         return True
-
     return False
 
 
 def _parse_origins(
     origins_raw: str, *, cookie_mode: bool
 ) -> Tuple[Union[str, List[str]], bool, Optional[str]]:
-    """
-    Returns (origins, supports_credentials, error_message_if_any)
-
-    IMPORTANT:
-      - If cookie_mode=True, origins MUST be an explicit list, not '*'
-      - supports_credentials must be True for cookies
-    """
     raw = (origins_raw or "").strip()
 
     if not raw:
@@ -89,11 +74,9 @@ def create_app() -> Flask:
 
     cookie_mode = _cookie_mode_enabled()
     origins, supports_credentials, cors_err = _parse_origins(CORS_ORIGINS, cookie_mode=cookie_mode)
-
     if cors_err:
         raise RuntimeError(f"[CORS] {cors_err}")
 
-    # CORS
     CORS(
         app,
         resources={rf"{api_prefix}/*": {"origins": origins}},
@@ -118,6 +101,7 @@ def create_app() -> Flask:
         "required": [],
         "optional": [],
         "errors": [],
+        "debug_routes_enabled": _truthy(os.getenv("ENABLE_DEBUG_ROUTES", "0")),
     }
 
     strict = (os.getenv("STRICT_BLUEPRINTS", "1").strip() != "0")
@@ -162,12 +146,7 @@ def create_app() -> Flask:
         entry["registered"] = True
         (boot["required"] if required else boot["optional"]).append(entry)
 
-    # ------------------------------------------------------------
-    # REQUIRED: core API routes
-    # ------------------------------------------------------------
-    # NOTE:
-    # - Paystack + debug routes are OPTIONAL (to avoid "healthy deploy but missing endpoints",
-    #   we register paystack in optional section with both bp names)
+    # REQUIRED modules
     required_modules = [
         "app.routes.health",
         "app.routes.accounts",
@@ -186,69 +165,32 @@ def create_app() -> Flask:
     for dotted in required_modules:
         _register_bp(dotted, "bp", required=True, url_prefix=api_prefix)
 
-    # ------------------------------------------------------------
-    # OPTIONAL: Paystack + Cron
-    # ------------------------------------------------------------
-    # Paystack blueprint export varies across versions:
-    #  - some export `bp`
-    #  - some export `paystack_bp`
-    #
-    # We attempt BOTH so you never end up with /api/paystack/* returning 404
-    # just because of an attribute name mismatch.
+    # OPTIONAL modules
     _register_bp("app.routes.paystack", "bp", required=False, url_prefix=api_prefix)
     _register_bp("app.routes.paystack", "paystack_bp", required=False, url_prefix=api_prefix)
-
-    # Paystack webhook module (if separated)
     _register_bp("app.routes.paystack_webhook", "bp", required=False, url_prefix=api_prefix)
 
-    # Cron typically has NO api prefix
     _register_bp("app.routes.cron", "bp", required=False, url_prefix=None)
 
-    # ------------------------------------------------------------
-    # OPTIONAL: Debug routes (gated)
-    # ------------------------------------------------------------
-    # Enable only when explicitly requested (avoid exposing route lists in prod)
+    # DEBUG routes (THIS is what you need for /api/_debug/subscription_health)
     if _truthy(os.getenv("ENABLE_DEBUG_ROUTES", "0")):
-        _register_bp("app.routes.debug_routes", "bp", required=False, url_prefix=api_prefix)
         _register_bp("app.routes._debug", "bp", required=False, url_prefix=api_prefix)
+        _register_bp("app.routes.debug_routes", "bp", required=False, url_prefix=api_prefix)
 
-    # ------------------------------------------------------------
-    # OPTIONAL: multi-channel + web UI helpers
-    # ------------------------------------------------------------
-    optional_modules = [
-        "app.routes.whatsapp",
-        "app.routes.telegram",
-        "app.routes.web_ask",
-        "app.routes.web_chat",
-        "app.routes.billing",
-    ]
-    for dotted in optional_modules:
-        _register_bp(dotted, "bp", required=False, url_prefix=api_prefix)
-
-    # ------------------------------------------------------------
-    # Safe diagnostics endpoint
-    # ------------------------------------------------------------
+    # Boot report
     @app.get(f"{api_prefix}/_boot")
     def boot_report():
         return jsonify({"ok": True, "boot": boot, "strict": strict})
 
-    # ------------------------------------------------------------
-    # Root-cause exposer (SAFE)
-    # ------------------------------------------------------------
-    # Only returns a short reason + request metadata. Full trace is NOT returned.
+    # Root-cause exposer (safe)
     @app.errorhandler(Exception)
     def _handle_any_error(e: Exception):
-        # Keep prod safe: do NOT leak secrets or stacktraces.
-        # You can still see full trace in Koyeb logs.
         status = getattr(e, "code", 500)
         msg = str(e) or type(e).__name__
-
-        # Allow a tiny bit more info if X-Debug: 1 is present (still clipped).
         debug_on = (request.headers.get("X-Debug") or "").strip() == "1"
         out: Dict[str, Any] = {"ok": False, "error": type(e).__name__, "message": msg[:220]}
         if debug_on:
             out["debug"] = {"path": request.path, "method": request.method}
-
         return jsonify(out), status
 
     return app
