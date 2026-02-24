@@ -58,11 +58,10 @@ def _parse_origins(
     return origins, False, None
 
 
-def _import_attr(dotted: str, attr: str) -> Tuple[Optional[Any], Optional[str]]:
+def _import_attr(dotted: str, attr: str):
     try:
         mod = __import__(dotted, fromlist=[attr])
-        obj = getattr(mod, attr)
-        return obj, None
+        return getattr(mod, attr), None
     except Exception as e:
         return None, f"{dotted}:{attr} -> {repr(e)}"
 
@@ -98,27 +97,21 @@ def create_app() -> Flask:
         "api_prefix": api_prefix,
         "cookie_mode": cookie_mode,
         "cors": {"origins": origins, "supports_credentials": supports_credentials},
-        "required": [],
-        "optional": [],
-        "errors": [],
+        "strict": (os.getenv("STRICT_BLUEPRINTS", "1").strip() != "0"),
         "debug_routes_enabled": _truthy(os.getenv("ENABLE_DEBUG_ROUTES", "0")),
+        "registered": [],
+        "failed": [],
     }
 
-    strict = (os.getenv("STRICT_BLUEPRINTS", "1").strip() != "0")
+    strict = boot["strict"]
 
-    def _register_bp(
-        dotted: str,
-        attr: str = "bp",
-        required: bool = True,
-        url_prefix: Optional[str] = api_prefix,
-    ):
+    def _register_bp(dotted: str, attr: str = "bp", required: bool = True, url_prefix: Optional[str] = api_prefix):
         obj, err = _import_attr(dotted, attr)
-        entry = {"module": dotted, "attr": attr, "registered": False, "url_prefix": url_prefix, "error": err}
+        entry = {"module": dotted, "attr": attr, "url_prefix": url_prefix, "required": required}
 
         if obj is None:
-            (boot["required"] if required else boot["optional"]).append(entry)
-            if err:
-                boot["errors"].append(entry)
+            entry["error"] = err
+            boot["failed"].append(entry)
             if required and strict:
                 raise RuntimeError(f"[boot] REQUIRED blueprint import failed: {err}")
             return
@@ -131,7 +124,7 @@ def create_app() -> Flask:
         if bp_name in app._bp_names:  # type: ignore[attr-defined]
             msg = f"[boot] Duplicate blueprint name detected: {bp_name} from {dotted}:{attr}"
             entry["error"] = msg
-            boot["errors"].append(entry)
+            boot["failed"].append(entry)
             if required and strict:
                 raise RuntimeError(msg)
             return
@@ -143,10 +136,10 @@ def create_app() -> Flask:
         else:
             app.register_blueprint(obj)
 
-        entry["registered"] = True
-        (boot["required"] if required else boot["optional"]).append(entry)
+        entry["bp_name"] = bp_name
+        boot["registered"].append(entry)
 
-    # REQUIRED modules
+    # REQUIRED routes
     required_modules = [
         "app.routes.health",
         "app.routes.accounts",
@@ -165,24 +158,21 @@ def create_app() -> Flask:
     for dotted in required_modules:
         _register_bp(dotted, "bp", required=True, url_prefix=api_prefix)
 
-    # OPTIONAL modules
+    # OPTIONAL routes
     _register_bp("app.routes.paystack", "bp", required=False, url_prefix=api_prefix)
     _register_bp("app.routes.paystack", "paystack_bp", required=False, url_prefix=api_prefix)
     _register_bp("app.routes.paystack_webhook", "bp", required=False, url_prefix=api_prefix)
-
     _register_bp("app.routes.cron", "bp", required=False, url_prefix=None)
 
-    # DEBUG routes (THIS is what you need for /api/_debug/subscription_health)
+    # DEBUG routes
     if _truthy(os.getenv("ENABLE_DEBUG_ROUTES", "0")):
         _register_bp("app.routes._debug", "bp", required=False, url_prefix=api_prefix)
         _register_bp("app.routes.debug_routes", "bp", required=False, url_prefix=api_prefix)
 
-    # Boot report
     @app.get(f"{api_prefix}/_boot")
     def boot_report():
-        return jsonify({"ok": True, "boot": boot, "strict": strict})
+        return jsonify({"ok": True, "boot": boot}), 200
 
-    # Root-cause exposer (safe)
     @app.errorhandler(Exception)
     def _handle_any_error(e: Exception):
         status = getattr(e, "code", 500)
