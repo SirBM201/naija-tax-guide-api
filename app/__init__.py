@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, Optional, Tuple, List, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -24,8 +24,14 @@ def _truthy(v: str | None) -> bool:
 
 
 def _cookie_mode_enabled() -> bool:
+    """
+    Cookie auth should be explicitly enabled. Otherwise you can accidentally force
+    credentialed CORS and break the frontend.
+    """
     if _truthy(os.getenv("COOKIE_AUTH_ENABLED", "")):
         return True
+    # Backward-compat: if someone enables WEB_AUTH + sets cookie samesite,
+    # treat it as "cookie mode".
     if _truthy(os.getenv("WEB_AUTH_ENABLED", "")) and os.getenv("WEB_AUTH_COOKIE_SAMESITE"):
         return True
     return False
@@ -36,6 +42,9 @@ def _parse_origins(
 ) -> Tuple[Union[str, List[str]], bool, Optional[str]]:
     raw = (origins_raw or "").strip()
 
+    # If not provided:
+    # - in cookie mode => must be explicit origins
+    # - otherwise => allow "*"
     if not raw:
         if cookie_mode:
             return [], True, "CORS_ORIGINS is empty but cookie auth requires explicit origins."
@@ -53,8 +62,10 @@ def _parse_origins(
         return "*", False, None
 
     if cookie_mode:
+        # credentialed
         return origins, True, None
 
+    # non-credentialed (still explicit list)
     return origins, False, None
 
 
@@ -87,6 +98,9 @@ def create_app() -> Flask:
             "X-Requested-With",
             "X-Admin-Key",
             "X-Debug",
+            # webhook signatures
+            "X-Paystack-Signature",
+            "x-paystack-signature",
         ],
         expose_headers=["Set-Cookie"],
         methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
@@ -102,10 +116,18 @@ def create_app() -> Flask:
         "registered": [],
         "failed": [],
     }
+    strict = bool(boot["strict"])
 
-    strict = boot["strict"]
-
-    def _register_bp(dotted: str, attr: str = "bp", required: bool = True, url_prefix: Optional[str] = api_prefix):
+    def _register_bp(
+        dotted: str,
+        attr: str = "bp",
+        *,
+        required: bool = True,
+        url_prefix: Optional[str] = api_prefix,
+    ) -> bool:
+        """
+        Returns True if registered, False if not.
+        """
         obj, err = _import_attr(dotted, attr)
         entry = {"module": dotted, "attr": attr, "url_prefix": url_prefix, "required": required}
 
@@ -114,7 +136,7 @@ def create_app() -> Flask:
             boot["failed"].append(entry)
             if required and strict:
                 raise RuntimeError(f"[boot] REQUIRED blueprint import failed: {err}")
-            return
+            return False
 
         bp_name = getattr(obj, "name", None) or f"{dotted}:{attr}"
 
@@ -127,7 +149,7 @@ def create_app() -> Flask:
             boot["failed"].append(entry)
             if required and strict:
                 raise RuntimeError(msg)
-            return
+            return False
 
         app._bp_names.add(bp_name)  # type: ignore[attr-defined]
 
@@ -138,8 +160,28 @@ def create_app() -> Flask:
 
         entry["bp_name"] = bp_name
         boot["registered"].append(entry)
+        return True
 
-    # REQUIRED routes
+    def _register_bp_first(
+        dotted: str,
+        attrs: List[str],
+        *,
+        required: bool,
+        url_prefix: Optional[str],
+    ) -> None:
+        """
+        Try multiple attribute names in a safe order; register at most one.
+        """
+        for a in attrs:
+            if _register_bp(dotted, a, required=False, url_prefix=url_prefix):
+                return
+        # If none registered, mark as failed (already recorded in boot["failed"])
+        if required and strict:
+            raise RuntimeError(f"[boot] REQUIRED blueprint import failed: {dotted} (tried attrs={attrs})")
+
+    # ---------------------------
+    # REQUIRED blueprints (must exist)
+    # ---------------------------
     required_modules = [
         "app.routes.health",
         "app.routes.accounts",
@@ -158,29 +200,63 @@ def create_app() -> Flask:
     for dotted in required_modules:
         _register_bp(dotted, "bp", required=True, url_prefix=api_prefix)
 
-    # OPTIONAL routes
-    _register_bp("app.routes.paystack", "bp", required=False, url_prefix=api_prefix)
-    _register_bp("app.routes.paystack", "paystack_bp", required=False, url_prefix=api_prefix)
-    _register_bp("app.routes.paystack_webhook", "bp", required=False, url_prefix=api_prefix)
-    _register_bp("app.routes.cron", "bp", required=False, url_prefix=None)
+    # ---------------------------
+    # OPTIONAL blueprints
+    # ---------------------------
 
-    # DEBUG routes
+    # Paystack: register exactly ONE bp from that module to avoid duplicate blueprint name.
+    # Some older versions export paystack_bp, newer export bp.
+    _register_bp_first(
+        "app.routes.paystack",
+        ["bp", "paystack_bp"],
+        required=False,
+        url_prefix=api_prefix,
+    )
+
+    # If you split webhook into its own module.
+    _register_bp_first(
+        "app.routes.paystack_webhook",
+        ["bp"],
+        required=False,
+        url_prefix=api_prefix,
+    )
+
+    # Cron SHOULD live under /api so your calls to $Base/api/internal/cron/... work.
+    _register_bp("app.routes.cron", "bp", required=False, url_prefix=api_prefix)
+
+    # ---------------------------
+    # DEBUG routes (optional)
+    # ---------------------------
     if _truthy(os.getenv("ENABLE_DEBUG_ROUTES", "0")):
         _register_bp("app.routes._debug", "bp", required=False, url_prefix=api_prefix)
         _register_bp("app.routes.debug_routes", "bp", required=False, url_prefix=api_prefix)
 
+    # Always-on boot report
     @app.get(f"{api_prefix}/_boot")
     def boot_report():
         return jsonify({"ok": True, "boot": boot}), 200
 
+    # Error root-cause exposer (only when X-Debug: 1 header is set)
     @app.errorhandler(Exception)
     def _handle_any_error(e: Exception):
         status = getattr(e, "code", 500)
         msg = str(e) or type(e).__name__
         debug_on = (request.headers.get("X-Debug") or "").strip() == "1"
-        out: Dict[str, Any] = {"ok": False, "error": type(e).__name__, "message": msg[:220]}
+
+        out: Dict[str, Any] = {
+            "ok": False,
+            "error": type(e).__name__,
+            "message": msg[:500],
+        }
+
         if debug_on:
-            out["debug"] = {"path": request.path, "method": request.method}
+            out["debug"] = {
+                "path": request.path,
+                "method": request.method,
+                "remote_addr": request.headers.get("X-Forwarded-For") or request.remote_addr,
+                "ua": request.headers.get("User-Agent"),
+            }
+
         return jsonify(out), status
 
     return app
