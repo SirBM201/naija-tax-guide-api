@@ -1,21 +1,23 @@
 # app/routes/debug_routes.py
 from __future__ import annotations
 
-import os
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, current_app, request
+
+from app.core.security import require_admin_key
+
 
 bp = Blueprint("debug_routes", __name__)
 
-def _admin_ok(req) -> bool:
-    expected = (os.getenv("ADMIN_KEY") or "").strip()
-    got = (req.headers.get("X-Admin-Key") or "").strip()
-    return bool(expected) and got == expected
 
 @bp.get("/_debug/routes")
 def list_routes():
-    if not _admin_ok(request):
-        return jsonify({"ok": False, "error": "forbidden"}), 403
+    guard = require_admin_key()
+    if guard is not None:
+        return guard
 
-    # We don’t enumerate app.url_map here because we don't have access to app in blueprint.
-    # This endpoint simply confirms that debug blueprint is active.
-    return jsonify({"ok": True, "debug_routes_enabled": True}), 200
+    out = []
+    for rule in sorted(current_app.url_map.iter_rules(), key=lambda r: r.rule):
+        methods = sorted([m for m in rule.methods if m not in ("HEAD", "OPTIONS")])
+        out.append({"rule": rule.rule, "methods": methods, "endpoint": rule.endpoint})
+
+    return jsonify({"ok": True, "count": len(out), "routes": out}), 200
