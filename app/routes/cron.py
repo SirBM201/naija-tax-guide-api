@@ -2,55 +2,62 @@
 from __future__ import annotations
 
 import traceback
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from flask import Blueprint, jsonify, request
 
-from ..core.security import require_admin_key
-from ..core.supabase_client import supabase
-from ..services.subscriptions_service import expire_overdue_subscriptions
+from app.core.security import require_admin_key
+from app.core.supabase_client import supabase
+
+# If you still want to keep the Python service path as fallback:
+# from app.services.subscriptions_service import expire_overdue_subscriptions
 
 bp = Blueprint("cron", __name__)
 
-def _want_debug() -> bool:
+DEFAULT_BATCH = 1000
+MAX_BATCH = 5000
+
+
+def _debug_enabled() -> bool:
     return (request.headers.get("X-Debug") or "").strip() == "1"
 
-def _ok(payload: Dict[str, Any], status: int = 200):
-    return jsonify(payload), status
 
-def _fail(where: str, e: Exception, status: int = 500):
-    payload: Dict[str, Any] = {
+def _get_json() -> Dict[str, Any]:
+    data = request.get_json(silent=True)
+    return data if isinstance(data, dict) else {}
+
+
+def _get_batch_limit(payload: Dict[str, Any]) -> int:
+    v = payload.get("batch_limit", DEFAULT_BATCH)
+    try:
+        n = int(v)
+    except Exception:
+        n = DEFAULT_BATCH
+    if n < 1:
+        n = 1
+    if n > MAX_BATCH:
+        n = MAX_BATCH
+    return n
+
+
+def _err(e: Exception, *, where: str, extra: Optional[Dict[str, Any]] = None):
+    out: Dict[str, Any] = {
         "ok": False,
-        "where": where,
         "error": type(e).__name__,
-        "message": (str(e) or "")[:500],
+        "message": str(e)[:800],
+        "where": where,
     }
-    if _want_debug():
-        payload["debug"] = {
+    if extra:
+        out["extra"] = extra
+    if _debug_enabled():
+        out["traceback"] = traceback.format_exc(limit=50)
+        out["debug"] = {
             "path": request.path,
             "method": request.method,
-            "headers": {
-                "content_type": request.content_type,
-                "has_admin_key": bool(request.headers.get("X-Admin-Key")),
-            },
-            "trace": traceback.format_exc(),
-            "json": request.get_json(silent=True),
+            "content_type": request.content_type,
         }
-    return _ok(payload, status)
+    return jsonify(out), 500
 
-def _get_batch_limit(default: int) -> int:
-    body = request.get_json(silent=True) or {}
-    raw = body.get("batch_limit", body.get("batchLimit", default))
-    try:
-        v = int(raw)
-    except Exception:
-        v = default
-    # prevent silly values
-    if v < 1:
-        v = 1
-    if v > 20000:
-        v = 20000
-    return v
 
 @bp.post("/internal/cron/expire-subscriptions")
 def expire_subscriptions():
@@ -58,12 +65,31 @@ def expire_subscriptions():
     if guard is not None:
         return guard
 
+    payload = _get_json()
+    batch_limit = _get_batch_limit(payload)
+
     try:
-        batch_limit = _get_batch_limit(1000)
-        result = expire_overdue_subscriptions(batch_limit=batch_limit)
-        return _ok({"ok": True, "batch_limit": batch_limit, "result": result}, 200)
+        # Prefer DB RPC (fast + reliable + avoids Python/service drift)
+        res = supabase().rpc("expire_overdue_subscriptions", {"batch_limit": batch_limit}).execute()
+        data = getattr(res, "data", None)
+
+        # Some supabase clients return list for single-row jsonb
+        if isinstance(data, list):
+            data = data[0] if data else {}
+
+        return jsonify(
+            {
+                "ok": True,
+                "method": "rpc",
+                "rpc": "expire_overdue_subscriptions",
+                "batch_limit": batch_limit,
+                "result": data,
+            }
+        ), 200
+
     except Exception as e:
-        return _fail("expire_subscriptions", e, 500)
+        return _err(e, where="cron.expire_subscriptions(rpc)", extra={"batch_limit": batch_limit})
+
 
 @bp.post("/internal/cron/expire-credits")
 def expire_credits():
@@ -71,16 +97,33 @@ def expire_credits():
     if guard is not None:
         return guard
 
+    payload = _get_json()
+    batch_limit = _get_batch_limit(payload)
+
     try:
-        batch_limit = _get_batch_limit(5000)
-
-        # IMPORTANT: supabase is a client object (not callable)
-        res = supabase.rpc("expire_ai_credits", {"batch_limit": batch_limit}).execute()
-
+        res = supabase().rpc("expire_ai_credits", {"batch_limit": batch_limit}).execute()
         data = getattr(res, "data", None)
         if isinstance(data, list):
             data = data[0] if data else {}
 
-        return _ok({"ok": True, "batch_limit": batch_limit, "result": data}, 200)
+        return jsonify(
+            {
+                "ok": True,
+                "method": "rpc",
+                "rpc": "expire_ai_credits",
+                "batch_limit": batch_limit,
+                "result": data,
+            }
+        ), 200
+
     except Exception as e:
-        return _fail("expire_credits", e, 500)
+        return _err(e, where="cron.expire_credits(rpc)", extra={"batch_limit": batch_limit})
+
+
+# Optional: quick sanity route (helps confirm auth + bp registration)
+@bp.get("/internal/cron/ping")
+def cron_ping():
+    guard = require_admin_key()
+    if guard is not None:
+        return guard
+    return jsonify({"ok": True, "pong": True}), 200
