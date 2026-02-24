@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import uuid
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from app.core.supabase_client import supabase  # must be a CLIENT, not a function
 
@@ -23,7 +23,14 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return v in {"1", "true", "yes", "y", "on"}
 
 
-def _rootcause(where: str, e: Exception, *, req_id: str, hint: Optional[str] = None, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def _rootcause(
+    where: str,
+    e: Exception,
+    *,
+    req_id: str,
+    hint: Optional[str] = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     out: Dict[str, Any] = {
         "where": where,
         "type": type(e).__name__,
@@ -43,7 +50,13 @@ def _ok(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
     return payload
 
 
-def _fail(error: str, req_id: str, *, root_cause: Optional[Dict[str, Any]] = None, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def _fail(
+    error: str,
+    req_id: str,
+    *,
+    root_cause: Optional[Dict[str, Any]] = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     out: Dict[str, Any] = {"ok": False, "error": error, "request_id": req_id}
     if root_cause:
         out["root_cause"] = root_cause
@@ -55,6 +68,117 @@ def _fail(error: str, req_id: str, *, root_cause: Optional[Dict[str, Any]] = Non
 def _is_supabase_client_object(x: Any) -> bool:
     # crude but effective: the client has `.table()` method.
     return hasattr(x, "table") and callable(getattr(x, "table"))
+
+
+def _parse_iso_dt(v: Any) -> Optional[datetime]:
+    if not v:
+        return None
+    try:
+        s = str(v)
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _days_for_plan(plan_code: str) -> int:
+    plan_code = (plan_code or "monthly").strip().lower()
+    if plan_code == "monthly":
+        return 30
+    if plan_code == "quarterly":
+        return 90
+    if plan_code == "yearly":
+        return 365
+    raise ValueError(f"invalid plan_code: {plan_code}")
+
+
+def _recommended_sql_pack() -> Dict[str, str]:
+    """
+    Copy-paste SQL to permanently fix schema + enable RPC (bypasses PostgREST schema cache headaches).
+    """
+    sql_table = r"""
+-- Ensure table exists with the exact columns our API expects
+create table if not exists public.user_subscriptions (
+  account_id uuid primary key,
+  plan_code text not null default 'free',
+  status text not null default 'inactive',
+  current_period_end timestamptz null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+-- Helpful index
+create index if not exists idx_user_subscriptions_status on public.user_subscriptions(status);
+
+-- Keep updated_at fresh
+create or replace function public.bms_touch_updated_at()
+returns trigger language plpgsql as $$
+begin
+  new.updated_at = now();
+  return new;
+end $$;
+
+drop trigger if exists trg_user_subscriptions_touch on public.user_subscriptions;
+create trigger trg_user_subscriptions_touch
+before update on public.user_subscriptions
+for each row execute function public.bms_touch_updated_at();
+""".strip()
+
+    sql_rpc = r"""
+-- RPC READ (stable)
+create or replace function public.bms_read_subscription(p_account_id uuid)
+returns jsonb
+language sql
+stable
+as $$
+  select to_jsonb(us)
+  from public.user_subscriptions us
+  where us.account_id = p_account_id
+  limit 1;
+$$;
+
+-- RPC ACTIVATE (permanent bypass of PostgREST schema cache)
+create or replace function public.bms_activate_subscription(
+  p_account_id uuid,
+  p_plan_code text,
+  p_days int
+)
+returns jsonb
+language plpgsql
+security definer
+as $$
+declare
+  v_end timestamptz;
+  v_row jsonb;
+begin
+  v_end := now() + make_interval(days => p_days);
+
+  insert into public.user_subscriptions (account_id, plan_code, status, current_period_end, created_at, updated_at)
+  values (p_account_id, p_plan_code, 'active', v_end, now(), now())
+  on conflict (account_id) do update
+    set plan_code = excluded.plan_code,
+        status = excluded.status,
+        current_period_end = excluded.current_period_end,
+        updated_at = now();
+
+  select to_jsonb(us) into v_row
+  from public.user_subscriptions us
+  where us.account_id = p_account_id
+  limit 1;
+
+  return jsonb_build_object(
+    'account_id', p_account_id,
+    'plan_code', p_plan_code,
+    'current_period_end', v_end,
+    'row', v_row
+  );
+end $$;
+
+-- IMPORTANT: allow your service role / API roles to execute the RPC
+grant execute on function public.bms_read_subscription(uuid) to anon, authenticated, service_role;
+grant execute on function public.bms_activate_subscription(uuid, text, int) to service_role;
+""".strip()
+
+    return {"table_and_trigger.sql": sql_table, "rpc.sql": sql_rpc}
 
 
 # ---------------------------
@@ -78,25 +202,32 @@ def get_subscription_status(account_id: str) -> Dict[str, Any]:
             root_cause={
                 "where": "subscriptions_service.get_subscription_status",
                 "type": "ConfigError",
-                "message": "supabase import is not a client object (no .table method). Check app/core/supabase_client.py export.",
+                "message": "supabase import is not a client object (no .table method).",
                 "request_id": req_id,
                 "hint": "Ensure app.core.supabase_client exports `supabase = create_client(...)`, not a function.",
             },
         )
 
     try:
-        # Prefer RPC-based read if available (more stable when schema cache is weird)
         use_rpc = _env_bool("SUBS_USE_RPC", True)
 
         if use_rpc:
             try:
                 r = supabase.rpc("bms_read_subscription", {"p_account_id": account_id}).execute()
                 row = (r.data or None) if hasattr(r, "data") else None
-                # bms_read_subscription returns either NULL or json row
-                return _ok({"subscription": row, "is_paid": bool(row and row.get("is_active"))}, req_id)
+                # NOTE: our bms_read_subscription returns jsonb row (or null)
+                # Normalize paid logic:
+                is_active = False
+                if isinstance(row, dict):
+                    status = (row.get("status") or "").lower()
+                    cpe = _parse_iso_dt(row.get("current_period_end"))
+                    if status in {"active", "paid"}:
+                        is_active = True
+                    if cpe and cpe > _now_utc():
+                        is_active = True
+                return _ok({"subscription": row, "is_paid": is_active, "method": "rpc"}, req_id)
             except Exception:
-                # fall back to table select
-                pass
+                pass  # fall back to table read
 
         res = (
             supabase.table("user_subscriptions")
@@ -109,22 +240,15 @@ def get_subscription_status(account_id: str) -> Dict[str, Any]:
         row = rows[0] if rows else None
 
         is_active = False
-        if row:
-            cpe = row.get("current_period_end")
+        if isinstance(row, dict):
             status = (row.get("status") or "").lower()
+            cpe = _parse_iso_dt(row.get("current_period_end"))
             if status in {"active", "paid"}:
                 is_active = True
-            if cpe:
-                # if current_period_end is in the future, active
-                try:
-                    # supabase usually returns ISO string
-                    dt = datetime.fromisoformat(str(cpe).replace("Z", "+00:00"))
-                    if dt > _now_utc():
-                        is_active = True
-                except Exception:
-                    pass
+            if cpe and cpe > _now_utc():
+                is_active = True
 
-        return _ok({"subscription": row, "is_paid": is_active}, req_id)
+        return _ok({"subscription": row, "is_paid": is_active, "method": "table_select"}, req_id)
 
     except Exception as e:
         return _fail(
@@ -134,7 +258,7 @@ def get_subscription_status(account_id: str) -> Dict[str, Any]:
                 "subscriptions_service.get_subscription_status",
                 e,
                 req_id=req_id,
-                hint="DB read failed. If you see PGRST204, your table schema is missing columns or PostgREST schema cache is stale.",
+                hint="DB read failed. If you see PGRST204, PostgREST schema cache sees different columns than your DB.",
                 extra={"account_id": account_id},
             ),
         )
@@ -171,13 +295,13 @@ def activate_subscription_now(account_id: str, plan_code: str = "monthly", days:
             return _fail("invalid_plan_code", req_id, extra={"plan_code": plan_code})
 
         if days is None:
-            days = {"monthly": 30, "quarterly": 90, "yearly": 365}[plan_code]
+            days = _days_for_plan(plan_code)
         else:
             days = int(days)
 
         use_rpc = _env_bool("SUBS_USE_RPC", True)
+        rpc_err: Optional[str] = None
 
-        # 1) Preferred: RPC upsert (permanent fix)
         if use_rpc:
             try:
                 r = supabase.rpc(
@@ -187,10 +311,9 @@ def activate_subscription_now(account_id: str, plan_code: str = "monthly", days:
                 data = r.data if hasattr(r, "data") else None
                 return _ok({"activated": True, "method": "rpc", "result": data}, req_id)
             except Exception as e:
-                # If RPC not installed, we'll fall back, but we also return the RPC error in root cause
                 rpc_err = str(e)
 
-        # 2) Fallback: direct upsert (may fail with PGRST204)
+        # Fallback: direct upsert (can fail if schema cache mismatch)
         current_period_end = (_now_utc() + timedelta(days=days)).isoformat()
 
         payload = {
@@ -201,30 +324,32 @@ def activate_subscription_now(account_id: str, plan_code: str = "monthly", days:
             "updated_at": _now_utc().isoformat(),
         }
 
-        res = (
-            supabase.table("user_subscriptions")
-            .upsert(payload, on_conflict="account_id")
-            .execute()
+        res = supabase.table("user_subscriptions").upsert(payload, on_conflict="account_id").execute()
+        return _ok(
+            {
+                "activated": True,
+                "method": "table_upsert",
+                "row": getattr(res, "data", None),
+                "rpc_error": rpc_err,
+            },
+            req_id,
         )
-
-        return _ok({"activated": True, "method": "table_upsert", "row": getattr(res, "data", None)}, req_id)
 
     except Exception as e:
-        msg = str(e)
         hint = (
-            "If you see PGRST204 missing 'current_period_end', your table is missing that column OR PostgREST schema cache hasn't reloaded. "
-            "Permanent fix is to install bms_activate_subscription RPC + add required columns (SQL provided by debug endpoint)."
+            "If you see PGRST204 missing 'current_period_end', PostgREST schema cache is stale or your DB schema differs. "
+            "Permanent fix: create RPC functions (bms_activate_subscription + bms_read_subscription) and use service role key."
         )
-        extra = {"account_id": account_id, "plan_code": plan_code, "days": days}
-
-        # Include rpc failure if it happened
-        if "rpc_err" in locals():
-            extra["rpc_error"] = rpc_err
-
         return _fail(
             "activate_subscription_failed",
             req_id,
-            root_cause=_rootcause("subscriptions_service.activate_subscription_now", e, req_id=req_id, hint=hint, extra=extra),
+            root_cause=_rootcause(
+                "subscriptions_service.activate_subscription_now",
+                e,
+                req_id=req_id,
+                hint=hint,
+                extra={"account_id": account_id, "plan_code": plan_code, "days": days},
+            ),
         )
 
 
@@ -242,7 +367,6 @@ def debug_read_subscription(account_id: str) -> Dict[str, Any]:
         return _fail("supabase_client_invalid", req_id)
 
     try:
-        # Prefer RPC read if available
         try:
             r = supabase.rpc("bms_read_subscription", {"p_account_id": account_id}).execute()
             row = (r.data or None) if hasattr(r, "data") else None
@@ -250,13 +374,7 @@ def debug_read_subscription(account_id: str) -> Dict[str, Any]:
         except Exception:
             pass
 
-        res = (
-            supabase.table("user_subscriptions")
-            .select("*")
-            .eq("account_id", account_id)
-            .limit(1)
-            .execute()
-        )
+        res = supabase.table("user_subscriptions").select("*").eq("account_id", account_id).limit(1).execute()
         rows = (res.data or []) if hasattr(res, "data") else []
         return _ok({"row": (rows[0] if rows else None), "method": "table_select"}, req_id)
 
@@ -268,7 +386,7 @@ def debug_read_subscription(account_id: str) -> Dict[str, Any]:
                 "subscriptions_service.debug_read_subscription",
                 e,
                 req_id=req_id,
-                hint="If you get PGRST204, your schema cache/columns are mismatched. Install RPC + run SQL migration.",
+                hint="If you get PGRST204, schema cache/columns are mismatched. Install RPC + run SQL migration.",
                 extra={"account_id": account_id},
             ),
         )
@@ -278,16 +396,19 @@ def debug_expose_subscription_health(account_id: Optional[str] = None) -> Dict[s
     """
     OUT-OF-THE-BOX debugger exposer:
     - confirms supabase client shape
-    - confirms RPC exists (by calling it)
-    - returns recommended SQL migration if errors suggest missing columns
+    - probes RPC functions
+    - probes table access
+    - returns concrete SQL for permanent fix
     """
     req_id = str(uuid.uuid4())
 
+    sql_pack = _recommended_sql_pack()
     info: Dict[str, Any] = {
         "client_ok": _is_supabase_client_object(supabase),
         "rpc_probe": {},
         "table_probe": {},
-        "recommended_sql": [],
+        "diagnosis": [],
+        "recommended_sql_files": sql_pack,  # <-- copy-paste ready SQL
     }
 
     if not info["client_ok"]:
@@ -303,28 +424,102 @@ def debug_expose_subscription_health(account_id: Optional[str] = None) -> Dict[s
             },
         )
 
-    # Probe RPC install
+    # Probe RPC
     try:
-        # This should succeed if function exists, even if account_id is nonsense (returns null)
-        r = supabase.rpc("bms_read_subscription", {"p_account_id": account_id or "00000000-0000-0000-0000-000000000000"}).execute()
+        probe_id = account_id or "00000000-0000-0000-0000-000000000000"
+        r = supabase.rpc("bms_read_subscription", {"p_account_id": probe_id}).execute()
         info["rpc_probe"] = {"ok": True, "data": r.data if hasattr(r, "data") else None}
     except Exception as e:
-        info["rpc_probe"] = {"ok": False, "error": str(e)}
-        info["recommended_sql"].append("Install RPC functions bms_read_subscription + bms_activate_subscription (see SQL below).")
+        msg = str(e)
+        info["rpc_probe"] = {"ok": False, "error": msg}
+        info["diagnosis"].append("RPC bms_read_subscription not installed OR no execute permission. Install rpc.sql.")
 
-    # Probe table + common columns
+    # Probe table
     try:
         res = supabase.table("user_subscriptions").select("*").limit(1).execute()
         info["table_probe"] = {"ok": True, "sample": getattr(res, "data", None)}
     except Exception as e:
         msg = str(e)
         info["table_probe"] = {"ok": False, "error": msg}
-        if "PGRST204" in msg and "current_period_end" in msg:
-            info["recommended_sql"].append("Add missing column current_period_end to public.user_subscriptions and reload schema cache.")
+        if "PGRST204" in msg:
+            info["diagnosis"].append("PostgREST schema cache mismatch (PGRST204). RPC activation avoids this permanently.")
         if "permission" in msg.lower():
-            info["recommended_sql"].append("Backend is likely not using service role key for DB operations.")
+            info["diagnosis"].append("Permission issue: ensure backend uses SUPABASE_SERVICE_ROLE_KEY for admin writes.")
 
-    # Always include the “permanent SQL” suggestion
-    info["recommended_sql"].append("Use RPC-based activation to avoid PostgREST schema-cache issues permanently.")
+    # Always include permanent recommendation
+    info["diagnosis"].append("Permanent fix: use RPC bms_activate_subscription for activation; keep table schema stable.")
 
     return _ok(info, req_id)
+
+
+# ---------------------------
+# Webhook-facing functions (MUST exist if routes import them)
+# ---------------------------
+def handle_payment_success(
+    *,
+    account_id: str,
+    plan_code: str,
+    paid_days: Optional[int] = None,
+    provider: str = "paystack",
+    provider_ref: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Called by app.routes.webhooks.
+    Keeps boot stable + makes subscription activation consistent.
+    """
+    req_id = str(uuid.uuid4())
+
+    if not account_id:
+        return _fail("missing_account_id", req_id)
+
+    try:
+        days = int(paid_days) if paid_days is not None else _days_for_plan(plan_code)
+        # Reuse activation logic (prefer RPC)
+        r = activate_subscription_now(account_id=account_id, plan_code=plan_code, days=days)
+        # Add webhook context (doesn't break existing consumer code)
+        r.setdefault("webhook", {})
+        r["webhook"].update(
+            {
+                "provider": provider,
+                "provider_ref": provider_ref,
+                "event": "payment_success",
+            }
+        )
+        r.setdefault("request_id", req_id)
+        return r
+    except Exception as e:
+        return _fail(
+            "handle_payment_success_failed",
+            req_id,
+            root_cause=_rootcause(
+                "subscriptions_service.handle_payment_success",
+                e,
+                req_id=req_id,
+                hint="Webhook success handler crashed. Check payload mapping for account_id/plan_code.",
+                extra={"account_id": account_id, "plan_code": plan_code, "provider": provider, "provider_ref": provider_ref},
+            ),
+        )
+
+
+def handle_payment_failed(
+    *,
+    account_id: str,
+    provider: str = "paystack",
+    provider_ref: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Safe handler so imports never break even if you later implement full logic.
+    """
+    req_id = str(uuid.uuid4())
+    return _ok(
+        {
+            "handled": True,
+            "event": "payment_failed",
+            "account_id": account_id,
+            "provider": provider,
+            "provider_ref": provider_ref,
+            "reason": reason,
+        },
+        req_id,
+    )
