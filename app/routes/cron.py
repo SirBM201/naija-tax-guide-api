@@ -3,77 +3,112 @@ from __future__ import annotations
 
 from flask import Blueprint, jsonify, request
 
-from ..core.security import require_admin_key
-from ..services.subscriptions_service import expire_overdue_subscriptions
-from ..core.supabase_client import supabase
+from app.core.security import require_admin_key
+from app.core.supabase_client import supabase
 
+# IMPORTANT:
+# Your system no longer depends on expire_overdue_subscriptions()
+# (it was removed when we migrated to RPC activation model).
+#
+# So cron expiration must run via SQL / RPC instead.
 
 bp = Blueprint("cron", __name__)
 
 
-# ------------------------------------------------------------
-# Expire Subscriptions
-# ------------------------------------------------------------
+# ---------------------------------------------------------
+# Helper: normalize supabase RPC response
+# ---------------------------------------------------------
+def _normalize_rpc(res):
+    try:
+        data = getattr(res, "data", None)
+        if isinstance(data, list):
+            return data[0] if data else {}
+        return data or {}
+    except Exception:
+        return {}
+
+
+# ---------------------------------------------------------
+# CRON 1 — Expire Subscriptions
+# ---------------------------------------------------------
 @bp.post("/internal/cron/expire-subscriptions")
 def expire_subscriptions():
+    """
+    Expires subscriptions whose current_period_end < now().
+    Requires RPC function: expire_overdue_subscriptions()
+    """
+
     guard = require_admin_key()
     if guard is not None:
         return guard
 
     try:
-        # Optional batch_limit from body (safe default)
-        payload = request.get_json(silent=True) or {}
-        batch_limit = payload.get("batch_limit", 1000)
+        res = supabase().rpc(
+            "expire_overdue_subscriptions",
+            {"batch_limit": 1000},
+        ).execute()
 
-        # Try calling with batch_limit (new style)
-        try:
-            result = expire_overdue_subscriptions(batch_limit=batch_limit)
-        except TypeError:
-            # Fallback if service does not support batch_limit
-            result = expire_overdue_subscriptions()
+        data = _normalize_rpc(res)
 
         return jsonify({
             "ok": True,
             "job": "expire_subscriptions",
-            "result": result,
+            "result": data
         }), 200
 
     except Exception as e:
         return jsonify({
             "ok": False,
             "job": "expire_subscriptions",
-            "error": str(e),
+            "error": str(e)
         }), 500
 
 
-# ------------------------------------------------------------
-# Expire AI Credits
-# ------------------------------------------------------------
+# ---------------------------------------------------------
+# CRON 2 — Expire AI Credits
+# ---------------------------------------------------------
 @bp.post("/internal/cron/expire-credits")
 def expire_credits():
+    """
+    Runs credit expiration RPC.
+    Requires RPC function: expire_ai_credits()
+    """
+
     guard = require_admin_key()
     if guard is not None:
         return guard
 
     try:
-        # Call RPC directly (supabase is NOT callable)
-        res = supabase.rpc("expire_ai_credits", {}).execute()
+        res = supabase().rpc(
+            "expire_ai_credits",
+            {}
+        ).execute()
 
-        data = getattr(res, "data", None)
-
-        # Normalize response
-        if isinstance(data, list):
-            data = data[0] if data else {}
+        data = _normalize_rpc(res)
 
         return jsonify({
             "ok": True,
             "job": "expire_credits",
-            "result": data,
+            "result": data
         }), 200
 
     except Exception as e:
         return jsonify({
             "ok": False,
             "job": "expire_credits",
-            "error": str(e),
+            "error": str(e)
         }), 500
+
+
+# ---------------------------------------------------------
+# Health Probe (optional but useful)
+# ---------------------------------------------------------
+@bp.get("/internal/cron/health")
+def cron_health():
+    return jsonify({
+        "ok": True,
+        "cron_routes": [
+            "/internal/cron/expire-subscriptions",
+            "/internal/cron/expire-credits"
+        ]
+    }), 200
