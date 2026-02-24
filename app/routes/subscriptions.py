@@ -7,22 +7,20 @@ from typing import Any, Dict, Optional
 
 from flask import Blueprint, jsonify, request
 
-# IMPORTANT:
-# Define bp immediately so it always exists during module import.
-bp = Blueprint("subscriptions", __name__)
-
-# Import services AFTER bp is created to reduce circular-import risk.
-from app.services.subscriptions_service import (  # noqa: E402
+from app.services.subscriptions_service import (
     activate_subscription_now,
     debug_read_subscription,
     debug_expose_subscription_health,
 )
+
+bp = Blueprint("subscriptions", __name__)
 
 
 # -----------------------------------------------------------------------------
 # Admin guard
 # -----------------------------------------------------------------------------
 def _admin_key() -> str:
+    # Add aliases here if you use different names across environments
     return (os.getenv("ADMIN_KEY") or os.getenv("X_ADMIN_KEY") or os.getenv("BMS_ADMIN_KEY") or "").strip()
 
 
@@ -32,20 +30,8 @@ def _is_admin(req) -> bool:
     return bool(want) and got == want
 
 
-def _rootcause(
-    where: str,
-    e: Exception,
-    *,
-    req_id: str,
-    hint: Optional[str] = None,
-    extra: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    out: Dict[str, Any] = {
-        "where": where,
-        "type": type(e).__name__,
-        "message": str(e),
-        "request_id": req_id,
-    }
+def _rootcause(where: str, e: Exception, *, req_id: str, hint: Optional[str] = None, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    out: Dict[str, Any] = {"where": where, "type": type(e).__name__, "message": str(e), "request_id": req_id}
     if hint:
         out["hint"] = hint
     if extra:
@@ -53,20 +39,15 @@ def _rootcause(
     return out
 
 
-def _fail(
-    status_code: int,
-    error: str,
-    *,
-    req_id: str,
-    root_cause: Optional[Dict[str, Any]] = None,
-    extra: Optional[Dict[str, Any]] = None,
-):
+def _fail(status: int, error: str, *, req_id: str, message: Optional[str] = None, root_cause: Optional[Dict[str, Any]] = None, extra: Optional[Dict[str, Any]] = None):
     payload: Dict[str, Any] = {"ok": False, "error": error, "request_id": req_id}
+    if message:
+        payload["message"] = message
     if root_cause:
         payload["root_cause"] = root_cause
     if extra:
         payload["extra"] = extra
-    return jsonify(payload), status_code
+    return jsonify(payload), status
 
 
 # -----------------------------------------------------------------------------
@@ -86,12 +67,7 @@ def subscription_activate():
             401,
             "unauthorized",
             req_id=req_id,
-            root_cause={
-                "where": "admin_guard",
-                "message": "Missing/invalid X-Admin-Key",
-                "request_id": req_id,
-                "hint": "Set ADMIN_KEY on Koyeb and pass X-Admin-Key header.",
-            },
+            root_cause={"where": "admin_guard", "message": "Missing/invalid X-Admin-Key", "request_id": req_id},
         )
 
     try:
@@ -116,16 +92,17 @@ def subscription_activate():
 
         result = activate_subscription_now(account_id=account_id, plan_code=plan_code, days=days)
 
-        # attach req_id
-        result.setdefault("request_id", req_id)
-        if isinstance(result.get("root_cause"), dict):
-            result["root_cause"].setdefault("request_id", req_id)
-
         if not result.get("ok"):
+            # normalize request_id
+            result.setdefault("request_id", req_id)
+            if isinstance(result.get("root_cause"), dict):
+                result["root_cause"].setdefault("request_id", req_id)
+
             err = (result.get("error") or "").lower()
             status = 400 if err.startswith(("missing_", "invalid_")) else 500
             return jsonify(result), status
 
+        result["request_id"] = req_id
         return jsonify(result), 200
 
     except Exception as e:
@@ -137,7 +114,7 @@ def subscription_activate():
                 "routes.subscriptions.subscription_activate",
                 e,
                 req_id=req_id,
-                hint="Unexpected exception in route handler. Search logs by request_id.",
+                hint="Unexpected exception in route handler. Check logs by request_id.",
             ),
         )
 
@@ -151,7 +128,12 @@ def debug_subscription():
     req_id = str(uuid.uuid4())
 
     if not _is_admin(request):
-        return _fail(401, "unauthorized", req_id=req_id, root_cause={"where": "admin_guard", "message": "Missing/invalid X-Admin-Key", "request_id": req_id})
+        return _fail(
+            401,
+            "unauthorized",
+            req_id=req_id,
+            root_cause={"where": "admin_guard", "message": "Missing/invalid X-Admin-Key", "request_id": req_id},
+        )
 
     try:
         account_id = (request.args.get("account_id") or "").strip()
@@ -159,6 +141,45 @@ def debug_subscription():
             return _fail(400, "missing_account_id", req_id=req_id)
 
         result = debug_read_subscription(account_id)
+        result.setdefault("request_id", req_id)
+        return jsonify(result), (200 if result.get("ok") else 500)
+
+    except Exception as e:
+        return _fail(
+            500,
+            "internal_error",
+            req_id=req_id,
+            root_cause=_rootcause(
+                "routes.subscriptions.debug_subscription",
+                e,
+                req_id=req_id,
+                hint="Unexpected exception in debug handler. Check logs by request_id.",
+            ),
+        )
+
+
+@bp.get("/_debug/subscription_health")
+def debug_subscription_health():
+    """
+    Admin diagnostic endpoint.
+    Query: optional ?account_id=<uuid> (used only for rpc probe)
+    Returns: PowerShell-friendly shallow JSON with recommended SQL strings.
+    """
+    req_id = str(uuid.uuid4())
+
+    if not _is_admin(request):
+        return _fail(
+            401,
+            "unauthorized",
+            req_id=req_id,
+            root_cause={"where": "admin_guard", "message": "Missing/invalid X-Admin-Key", "request_id": req_id},
+        )
+
+    try:
+        account_id = (request.args.get("account_id") or "").strip() or None
+        result = debug_expose_subscription_health(account_id)
+
+        # normalize request id
         result.setdefault("request_id", req_id)
         if isinstance(result.get("root_cause"), dict):
             result["root_cause"].setdefault("request_id", req_id)
@@ -171,44 +192,9 @@ def debug_subscription():
             "internal_error",
             req_id=req_id,
             root_cause=_rootcause(
-                "routes.subscriptions.debug_subscription",
-                e,
-                req_id=req_id,
-                hint="Unexpected exception in debug handler.",
-            ),
-        )
-
-
-@bp.get("/_debug/subscription_health")
-def debug_subscription_health():
-    """
-    Admin debugger exposer:
-    - confirms supabase client shape
-    - probes RPC availability
-    - probes table access
-    - returns recommended SQL actions
-    Query: ?account_id=<uuid> (optional)
-    """
-    req_id = str(uuid.uuid4())
-
-    if not _is_admin(request):
-        return _fail(401, "unauthorized", req_id=req_id, root_cause={"where": "admin_guard", "message": "Missing/invalid X-Admin-Key", "request_id": req_id})
-
-    try:
-        account_id = (request.args.get("account_id") or "").strip() or None
-        result = debug_expose_subscription_health(account_id)
-        result.setdefault("request_id", req_id)
-        return jsonify(result), (200 if result.get("ok") else 500)
-
-    except Exception as e:
-        return _fail(
-            500,
-            "internal_error",
-            req_id=req_id,
-            root_cause=_rootcause(
                 "routes.subscriptions.debug_subscription_health",
                 e,
                 req_id=req_id,
-                hint="Unexpected exception in debugger exposer.",
+                hint="Unexpected exception in health exposer. Check logs by request_id.",
             ),
         )
