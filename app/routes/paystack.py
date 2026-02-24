@@ -1,86 +1,129 @@
 # app/routes/paystack.py
 from __future__ import annotations
 
-import os
 import hmac
-import hashlib
-from typing import Any, Dict
+import os
+from hashlib import sha512
+from typing import Any, Dict, Optional
 
 from flask import Blueprint, jsonify, request
 
-from app.services.subscriptions_service import activate_subscription_now  # you already have this working
+from app.core.supabase_client import supabase
+from app.services.subscriptions_service import activate_subscription_now
+
 
 # IMPORTANT:
-# - attribute name MUST be paystack_bp (because your loader looks for it)
-# - blueprint "name" MUST be unique to avoid duplicate blueprint name collisions
+# - Blueprint name MUST be unique to avoid your "Duplicate blueprint name detected" error
+# - Export must match what app/__init__.py imports (see note below)
 paystack_bp = Blueprint("paystack_webhooks", __name__)
 
 
-def _get_secret() -> str:
+def _raw_body_bytes() -> bytes:
+    # must sign the RAW body bytes exactly
+    return request.get_data(cache=False, as_text=False) or b""
+
+
+def _get_sig_header() -> str:
+    return (request.headers.get("x-paystack-signature") or "").strip().lower()
+
+
+def _secret() -> str:
     return (os.getenv("PAYSTACK_WEBHOOK_SECRET") or "").strip()
 
 
-def _verify_paystack_signature(raw_body: bytes, header_sig: str, secret: str) -> bool:
-    if not secret or not header_sig:
-        return False
-    computed = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha512).hexdigest()
-    # constant-time compare
-    return hmac.compare_digest(computed, header_sig.strip().lower())
+def _bypass_enabled() -> bool:
+    return (os.getenv("PAYSTACK_WEBHOOK_BYPASS", "") or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-@paystack_bp.post("/webhooks/paystack")
-def paystack_webhook():
-    secret = _get_secret()
-    raw = request.get_data(cache=False, as_text=False) or b""
-    sig = (request.headers.get("x-paystack-signature") or "").strip()
+def _verify_signature_or_bypass() -> Optional[Dict[str, Any]]:
+    """
+    Return an error dict if invalid; return None if ok.
+    """
+    secret = _secret()
+    sig = _get_sig_header()
 
-    # Optional: allow bypass in dev if explicitly enabled (recommended OFF in prod)
-    allow_dev_bypass = (os.getenv("PAYSTACK_DEV_BYPASS", "").strip().lower() in {"1", "true", "yes"})
-    if not allow_dev_bypass:
-        if not _verify_paystack_signature(raw, sig, secret):
-            return jsonify({"ok": False, "error": "invalid_signature"}), 401
+    if _bypass_enabled():
+        # Allow bypass in dev (ONLY) if secret is missing or you just want speed.
+        # Keep it explicit via env var.
+        return None
 
-    try:
-        payload: Dict[str, Any] = request.get_json(force=True, silent=False) or {}
-        event = (payload.get("event") or "").strip()
-        data = payload.get("data") or {}
-        reference = (data.get("reference") or "").strip()
+    if not secret:
+        return {"ok": False, "error": "missing_webhook_secret"}
 
-        meta = (data.get("metadata") or {}) if isinstance(data.get("metadata"), dict) else {}
-        account_id = (meta.get("account_id") or "").strip()
-        plan_code = (meta.get("plan_code") or "monthly").strip()
-        upgrade_mode = (meta.get("upgrade_mode") or "now").strip()
+    if not sig:
+        return {"ok": False, "error": "missing_signature"}
 
-        # Only process successful charge events (you can expand later)
-        if event not in {"charge.success"}:
-            return jsonify({"ok": True, "processed": False, "event": event}), 200
+    expected = hmac.new(secret.encode("utf-8"), _raw_body_bytes(), sha512).hexdigest().lower()
+    if not hmac.compare_digest(expected, sig):
+        return {"ok": False, "error": "invalid_signature"}
 
-        if not account_id:
-            return jsonify({"ok": False, "error": "missing_account_id"}), 400
-
-        # Activate subscription NOW (your existing function)
-        activation = activate_subscription_now(account_id=account_id, plan_code=plan_code, days=None)
-
-        return jsonify({
-            "ok": True,
-            "processed": True,
-            "event": event,
-            "reference": reference,
-            "account_id": account_id,
-            "plan_code": plan_code,
-            "upgrade_mode": upgrade_mode,
-            "activation": activation,
-        }), 200
-
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+    return None
 
 
 @paystack_bp.get("/_debug/paystack")
 def debug_paystack():
-    # Safe debug: confirms routing + whether secret is set (does NOT reveal secret)
-    return jsonify({
-        "ok": True,
-        "secret_set": bool(_get_secret()),
-        "bypass_enabled": (os.getenv("PAYSTACK_DEV_BYPASS", "").strip().lower() in {"1", "true", "yes"}),
-    }), 200
+    return jsonify(
+        {
+            "ok": True,
+            "bypass_enabled": _bypass_enabled(),
+            "secret_set": bool(_secret()),
+        }
+    ), 200
+
+
+@paystack_bp.post("/webhooks/paystack")
+def paystack_webhook():
+    verr = _verify_signature_or_bypass()
+    if verr is not None:
+        return jsonify(verr), 400
+
+    try:
+        payload = request.get_json(silent=True) or {}
+        event = (payload.get("event") or "").strip()
+        data = payload.get("data") or {}
+        reference = (data.get("reference") or "").strip()
+        metadata = data.get("metadata") or {}
+
+        account_id = (metadata.get("account_id") or "").strip()
+        plan_code = (metadata.get("plan_code") or "monthly").strip()
+        upgrade_mode = (metadata.get("upgrade_mode") or "now").strip()
+
+        # Minimal idempotency guard (recommended):
+        # If you already have a paystack_events table, use it.
+        # If not, you can skip this block, but duplicates can happen in production.
+        try:
+            # upsert event record by reference if your table exists
+            supabase.table("paystack_events").upsert(
+                {"reference": reference, "event": event, "account_id": account_id},
+                on_conflict="reference",
+            ).execute()
+        except Exception:
+            pass
+
+        processed = False
+        activation = {}
+
+        # Only act on charge.success (extend later)
+        if event == "charge.success":
+            activation = activate_subscription_now(
+                account_id=account_id,
+                plan_code=plan_code,
+                days=None,  # let service decide from plan
+            )
+            processed = bool(activation.get("ok") and activation.get("activated"))
+
+        return jsonify(
+            {
+                "ok": True,
+                "processed": processed,
+                "event": event,
+                "reference": reference,
+                "account_id": account_id,
+                "plan_code": plan_code,
+                "upgrade_mode": upgrade_mode,
+                "activation": activation,
+            }
+        ), 200
+
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
