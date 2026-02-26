@@ -11,7 +11,6 @@ Supports schema drift:
 
 Auto-repair:
   - if accounts.account_id is NULL, set it to accounts.id
-
 """
 
 from flask import Blueprint, jsonify
@@ -80,7 +79,6 @@ def me():
             "fix": "Ensure auth_service returns a valid user object with id.",
         }), 401
 
-    # Pick whichever column exists
     key_col = "auth_user_id" if _has_column("accounts", "auth_user_id") else ("supabase_user_id" if _has_column("accounts", "supabase_user_id") else "")
     if not key_col:
         return jsonify({
@@ -90,7 +88,6 @@ def me():
             "fix": "Add accounts.auth_user_id (preferred) or accounts.supabase_user_id to map Supabase Auth users.",
         }), 500
 
-    # Lookup
     try:
         res = sb.table("accounts").select("id,account_id").eq(key_col, uid).limit(1).execute()
         row = (getattr(res, "data", None) or [None])[0] or None
@@ -108,7 +105,6 @@ def me():
             return jsonify(rep), 500
         return jsonify({"ok": True, "account_id": rep["account_id"], "user_id": uid, "repaired": bool(rep.get("repaired"))}), 200
 
-    # Create if missing
     payload = {key_col: uid, "provider": "web"}
     try:
         created = sb.table("accounts").insert(payload).select("id,account_id").execute()
