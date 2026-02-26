@@ -95,6 +95,22 @@ def _random_token() -> str:
     return secrets.token_urlsafe(TOKEN_LENGTH_BYTES)
 
 
+def _revoke_token(sb, token: str) -> Tuple[bool, Optional[str]]:
+    """
+    Best-effort revoke: set revoked_at. If table doesn't have revoked_at,
+    update will fail; we surface the root cause for debugging.
+    """
+    if not token:
+        return False, "token_required"
+    try:
+        res = sb.table(TOKEN_TABLE).update({"revoked_at": _now_ts()}).eq("token", token).execute()
+        if getattr(res, "error", None):
+            return False, str(res.error)
+        return True, None
+    except Exception as e:
+        return False, repr(e)
+
+
 # -----------------------------
 # OTP API
 # -----------------------------
@@ -197,7 +213,6 @@ def verify_email_otp(email: str, otp_code: str, purpose: str | None = None) -> D
     if not chosen:
         return {"ok": False, "error": "otp_not_found"}
 
-    # Expiry check (string timestamps are ISO; lexicographic works for Z format)
     expires_at = (chosen.get("expires_at") or "").strip()
     if expires_at and expires_at < _now_ts():
         return {"ok": False, "error": "otp_expired"}
@@ -232,7 +247,6 @@ def _ensure_web_account(contact_email: str) -> Tuple[Optional[str], Optional[str
     """
     Ensures an accounts row exists for this web user.
     Returns (account_id, error).
-    Assumes accounts table has at least: id, provider, provider_user_id, display_name, email/phone optional.
     """
     sb = get_supabase_client(admin=True)
 
@@ -240,7 +254,6 @@ def _ensure_web_account(contact_email: str) -> Tuple[Optional[str], Optional[str
     provider_user_id = contact_email  # stable mapping
 
     try:
-        # try fetch
         res = (
             sb.table(ACCOUNTS_TABLE)
             .select("id")
@@ -256,7 +269,6 @@ def _ensure_web_account(contact_email: str) -> Tuple[Optional[str], Optional[str
         if row and row.get("id"):
             return row["id"], None
 
-        # insert
         ins = {
             "provider": provider,
             "provider_user_id": provider_user_id,
@@ -270,12 +282,10 @@ def _ensure_web_account(contact_email: str) -> Tuple[Optional[str], Optional[str
         if getattr(res2, "error", None):
             return None, str(res2.error)
 
-        # inserted row
         row2 = (res2.data or [None])[0]
         if row2 and row2.get("id"):
             return row2["id"], None
 
-        # if supabase doesn't return row due to settings, refetch
         res3 = (
             sb.table(ACCOUNTS_TABLE)
             .select("id")
@@ -298,7 +308,6 @@ def _ensure_web_account(contact_email: str) -> Tuple[Optional[str], Optional[str
 def _issue_web_token(account_id: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """
     Inserts a token into web_tokens and returns (token, expires_at, error).
-    Assumes web_tokens has at least: token, account_id, created_at, expires_at, revoked_at
     """
     sb = get_supabase_client(admin=True)
 
@@ -353,6 +362,37 @@ def verify_web_otp_and_issue_token(contact: str, otp: str, purpose: str | None =
 
 
 # -----------------------------
+# REQUIRED by routes: logout
+# -----------------------------
+def logout_web_session(req: Request) -> Dict[str, Any]:
+    """
+    REQUIRED by app.routes.web_auth.
+
+    Behavior:
+      - If Bearer token exists -> revoke it in web_tokens
+      - Else if session cookie exists -> revoke it in web_tokens
+      - Else return ok (idempotent logout)
+    """
+    sb = get_supabase_client(admin=True)
+
+    bearer = _extract_bearer(req)
+    if bearer:
+        ok, err = _revoke_token(sb, bearer)
+        if not ok and err:
+            return {"ok": False, "error": "logout_failed", "root_cause": err}
+        return {"ok": True, "logged_out": True, "source": "bearer"}
+
+    cookie_token = (req.cookies.get(SESSION_COOKIE_NAME) or "").strip()
+    if cookie_token:
+        ok, err = _revoke_token(sb, cookie_token)
+        if not ok and err:
+            return {"ok": False, "error": "logout_failed", "root_cause": err}
+        return {"ok": True, "logged_out": True, "source": "cookie"}
+
+    return {"ok": True, "logged_out": True, "source": "none"}
+
+
+# -----------------------------
 # Backwards-compatible exports expected by routes
 # -----------------------------
 def request_web_otp(contact: str, purpose: str | None = None, request_ip: str | None = None) -> Dict[str, Any]:
@@ -369,7 +409,6 @@ def verify_web_otp(contact: str, otp: str, purpose: str | None = None) -> Dict[s
 def get_account_id_from_request(req: Request) -> Tuple[Optional[str], Dict[str, Any]]:
     debug: Dict[str, Any] = {"cookie": {"name": SESSION_COOKIE_NAME}}
 
-    # JSON body account_id
     try:
         body = req.get_json(silent=True) or {}
     except Exception:
@@ -380,7 +419,6 @@ def get_account_id_from_request(req: Request) -> Tuple[Optional[str], Dict[str, 
             debug["source"] = "body.account_id"
             return aid, debug
 
-    # Dev bypass
     if _extract_dev_bypass(req):
         debug["source"] = "bypass"
         debug["bypass"] = True
@@ -388,7 +426,6 @@ def get_account_id_from_request(req: Request) -> Tuple[Optional[str], Dict[str, 
 
     sb = get_supabase_client(admin=True)
 
-    # Bearer token -> web_tokens
     bearer = _extract_bearer(req)
     if bearer:
         debug["source"] = "bearer"
@@ -410,7 +447,6 @@ def get_account_id_from_request(req: Request) -> Tuple[Optional[str], Dict[str, 
         except Exception as e:
             debug["token_error"] = repr(e)
 
-    # Session cookie -> token lookup
     cookie_token = (req.cookies.get(SESSION_COOKIE_NAME) or "").strip()
     if cookie_token:
         debug["source"] = "cookie"
@@ -432,7 +468,6 @@ def get_account_id_from_request(req: Request) -> Tuple[Optional[str], Dict[str, 
         except Exception as e:
             debug["cookie_error"] = repr(e)
 
-    # Header fallback
     xaid = (req.headers.get("X-Account-Id") or "").strip()
     if xaid:
         debug["source"] = "header:X-Account-Id"
