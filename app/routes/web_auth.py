@@ -1,34 +1,20 @@
 # app/routes/web_auth.py
 from __future__ import annotations
 
-"""
-WEB AUTH ROUTES (HARDENED — CANONICAL account_id)
-
-This version keeps your public endpoints the same, but it delegates
-identity correctness to app.services.web_auth_service:
-
-- request-otp: stores OTP row and (optionally) sends via SMTP (unchanged pattern)
-- verify-otp: validates OTP and issues token (cookie/bearer) using CANONICAL accounts.account_id
-
-✅ Strong failure exposers:
-    - debug block includes root cause + fix, plus SAFE request metadata
-
-IMPORTANT:
-This file assumes your DB FK is correct:
-    web_tokens.account_id -> accounts.account_id
-"""
-
 import os
-from typing import Any, Dict, Tuple, Optional
+import smtplib
+import ssl
+from email.message import EmailMessage
+from typing import Any, Dict
 
 from flask import Blueprint, jsonify, request, make_response
 
-from app.services.email_service import send_email_otp, smtp_is_configured
 from app.services.web_auth_service import (
-    WEB_AUTH_COOKIE_NAME,
     request_web_otp,
     verify_web_otp_and_issue_token,
     logout_web_session,
+    get_account_id_from_request,
+    WEB_AUTH_COOKIE_NAME,
 )
 
 bp = Blueprint("web_auth", __name__)
@@ -38,131 +24,144 @@ def _truthy(v: str | None) -> bool:
     return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-def _clip(s: str, n: int = 220) -> str:
-    s = str(s or "")
-    return s if len(s) <= n else s[:n] + "…"
+def _smtp_enabled() -> bool:
+    return all(
+        (os.getenv("SMTP_HOST"), os.getenv("SMTP_PORT"), os.getenv("SMTP_USER"), os.getenv("SMTP_PASS"), os.getenv("SMTP_FROM"))
+    )
 
 
-def _debug_enabled() -> bool:
-    return _truthy(os.getenv("WEB_AUTH_DEBUG", "0")) or _truthy(os.getenv("AUTH_DEBUG", "0"))
+def _send_otp_email(to_email: str, otp: str) -> None:
+    host = os.getenv("SMTP_HOST", "")
+    port = int(os.getenv("SMTP_PORT", "587"))
+    user = os.getenv("SMTP_USER", "")
+    pw = os.getenv("SMTP_PASS", "")
+    from_email = os.getenv("SMTP_FROM", user)
+
+    subject = os.getenv("WEB_OTP_EMAIL_SUBJECT", "Your Naija Tax Guide OTP")
+    body = f"Your OTP code is: {otp}\n\nIt expires in a few minutes. If you did not request this, ignore this email."
+
+    msg = EmailMessage()
+    msg["From"] = from_email
+    msg["To"] = to_email
+    msg["Subject"] = subject
+    msg.set_content(body)
+
+    ctx = ssl.create_default_context()
+    with smtplib.SMTP(host, port, timeout=20) as server:
+        server.starttls(context=ctx)
+        server.login(user, pw)
+        server.send_message(msg)
 
 
-def _safe_req_meta() -> Dict[str, Any]:
-    data = request.get_json(silent=True)
-    return {
-        "content_type": (request.headers.get("Content-Type") or "").strip(),
-        "content_length": request.content_length,
-        "keys": sorted(list(data.keys())) if isinstance(data, dict) else [],
-    }
-
-
-def _pick_contact(data: Dict[str, Any]) -> str:
-    for k in ("contact", "email", "identifier", "login", "handle", "user"):
-        v = str(data.get(k) or "").strip()
-        if v:
-            return v.strip().lower()
-    return ""
-
-
-@bp.post("/request-otp")
 @bp.post("/web/auth/request-otp")
 def request_otp():
-    data = request.get_json(silent=True) or {}
-    contact = _pick_contact(data)
-    purpose = (str(data.get("purpose") or "web_login")).strip()
-    device_id = (str(data.get("device_id") or "")).strip() or None
+    body = request.get_json(silent=True) or {}
+
+    contact = (body.get("contact") or body.get("email") or "").strip().lower()
+    purpose = (body.get("purpose") or "web_login").strip().lower()
+    device_id = (body.get("device_id") or "").strip()
 
     if not contact:
-        out = {"ok": False, "error": "missing_contact"}
-        if _debug_enabled():
-            out["debug"] = {"root_cause": "no contact/email provided", "fix": "Send JSON {email:<...>} or {contact:<...>}.", "req": _safe_req_meta()}
-        return jsonify(out), 400
+        return jsonify({"ok": False, "error": "contact_required"}), 400
 
-    # store OTP
-    r = request_web_otp(contact=contact, purpose=purpose, device_id=device_id, ip=request.remote_addr, user_agent=request.headers.get("User-Agent"))
-    if not r.get("ok"):
-        out = dict(r)
-        if _debug_enabled():
-            out["debug"] = {**(out.get("debug") or {}), "req": _safe_req_meta()}
-        return jsonify(out), 400
-
-    # send OTP (email only) – keep existing behavior
-    if "@" in contact:
-        if not smtp_is_configured():
-            out = {"ok": False, "error": "smtp_not_configured"}
-            if _debug_enabled():
-                out["debug"] = {"root_cause": "SMTP not configured", "fix": "Set SMTP_* env vars or disable email OTP sending.", "req": _safe_req_meta()}
-            return jsonify(out), 500
-
-        otp_dev = r.get("otp_dev")
-        # In prod we should not have otp_dev; this is dev-only.
-        # send_email_otp expects the raw OTP; we only have it in dev.
-        # For prod, you should generate OTP in this route OR in send_email_otp flow.
-        if not otp_dev and _debug_enabled():
-            # tell you clearly why the email isn't sent
-            out = {"ok": False, "error": "otp_not_returned_for_email_send"}
-            out["debug"] = {
-                "root_cause": "request_web_otp does not return raw OTP in prod (by design).",
-                "fix": "Either (A) move OTP generation + email sending into this route, OR (B) set WEB_DEV_RETURN_OTP=1 for testing only.",
-            }
-            return jsonify(out), 500
-
-        if otp_dev:
-            try:
-                send_email_otp(contact, otp_dev)
-            except Exception as e:
-                out = {"ok": False, "error": "email_send_failed"}
-                if _debug_enabled():
-                    out["debug"] = {"root_cause": f"{type(e).__name__}: {_clip(str(e))}", "fix": "Check SMTP settings and sender domain.", "req": _safe_req_meta()}
-                return jsonify(out), 500
-
-    return jsonify({"ok": True, "contact": contact, "purpose": purpose, "expires_at": r.get("expires_at")}), 200
-
-
-@bp.post("/verify-otp")
-@bp.post("/web/auth/verify-otp")
-def verify_otp():
-    data = request.get_json(silent=True) or {}
-    contact = _pick_contact(data)
-    otp = str(data.get("otp") or "").strip()
-    purpose = (str(data.get("purpose") or "web_login")).strip()
-    device_id = (str(data.get("device_id") or "")).strip() or None
-
-    if not contact or not otp:
-        out = {"ok": False, "error": "missing_contact_or_otp"}
-        if _debug_enabled():
-            out["debug"] = {"root_cause": "contact or otp missing", "fix": "Send JSON {email/contact:<...>, otp:<6digits>}.", "req": _safe_req_meta()}
-        return jsonify(out), 400
-
-    r = verify_web_otp_and_issue_token(contact=contact, otp=otp, purpose=purpose, device_id=device_id, ip=request.remote_addr, user_agent=request.headers.get("User-Agent"))
-    if not r.get("ok"):
-        out = dict(r)
-        if _debug_enabled():
-            out["debug"] = {**(out.get("debug") or {}), "req": _safe_req_meta()}
-        return jsonify(out), 400
-
-    # set cookie
-    resp = make_response(jsonify({"ok": True, "account_id": r["account_id"], "expires_at": r.get("expires_at")}))
-    resp.set_cookie(
-        WEB_AUTH_COOKIE_NAME,
-        r["token"],
-        httponly=True,
-        secure=True,
-        samesite="None",
-        max_age=int(60 * 60 * 24 * 30),
-        path="/",
+    r = request_web_otp(
+        contact=contact,
+        purpose=purpose,
+        device_id=device_id or None,
+        ip=request.remote_addr,
+        user_agent=request.headers.get("User-Agent"),
     )
-    return resp, 200
 
-
-@bp.post("/logout")
-@bp.post("/web/auth/logout")
-def logout():
-    auth = (request.headers.get("Authorization") or "").strip()
-    r = logout_web_session(auth)
     if not r.get("ok"):
         return jsonify(r), 400
 
-    resp = make_response(jsonify({"ok": True}))
-    resp.set_cookie(WEB_AUTH_COOKIE_NAME, "", expires=0, path="/")
-    return resp, 200
+    otp_plain = r.get("_otp_plain")  # server-only
+    dev_return_plain = _truthy(os.getenv("WEB_OTP_RETURN_PLAIN"))
+
+    delivery: Dict[str, Any] = {"mode": "email", "sent": False}
+
+    # If SMTP configured, email it
+    if otp_plain and _smtp_enabled():
+        try:
+            _send_otp_email(contact, otp_plain)
+            delivery["sent"] = True
+            delivery["provider"] = "smtp"
+        except Exception as e:
+            # Do NOT 500; return ok but show delivery error
+            delivery["sent"] = False
+            delivery["error"] = "email_send_failed"
+            delivery["root_cause"] = repr(e)
+
+    # If SMTP not configured, do NOT 500. Optionally return OTP in dev.
+    if not delivery.get("sent") and not _smtp_enabled():
+        delivery["sent"] = False
+        delivery["error"] = "email_not_configured"
+        delivery["fix"] = "Set SMTP_* env vars on backend OR set WEB_OTP_RETURN_PLAIN=1 for dev testing."
+
+    out = {
+        "ok": True,
+        "contact": r.get("contact"),
+        "purpose": r.get("purpose"),
+        "expires_at": r.get("expires_at"),
+        "delivery": delivery,
+        "debug": r.get("debug", {}),
+    }
+
+    if dev_return_plain and otp_plain:
+        out["otp"] = otp_plain  # DEV ONLY
+
+    return jsonify(out), 200
+
+
+@bp.post("/web/auth/verify-otp")
+def verify_otp():
+    body = request.get_json(silent=True) or {}
+
+    contact = (body.get("contact") or body.get("email") or "").strip().lower()
+    otp = (body.get("otp") or body.get("code") or "").strip()
+    purpose = (body.get("purpose") or "web_login").strip().lower()
+
+    if not contact or not otp:
+        return jsonify({"ok": False, "error": "contact_and_otp_required"}), 400
+
+    r = verify_web_otp_and_issue_token(contact=contact, otp=otp, purpose=purpose)
+    if not r.get("ok"):
+        return jsonify(r), 400
+
+    token = r["token"]
+
+    resp = make_response(jsonify(r), 200)
+
+    # cookie is optional: only enable if you want cookie auth
+    if _truthy(os.getenv("COOKIE_AUTH_ENABLED", "1")):
+        secure = _truthy(os.getenv("COOKIE_SECURE", "1"))
+        samesite = os.getenv("COOKIE_SAMESITE", "None")
+        max_age = int(os.getenv("COOKIE_MAX_AGE", "2592000"))
+
+        resp.set_cookie(
+            WEB_AUTH_COOKIE_NAME,
+            token,
+            max_age=max_age,
+            httponly=True,
+            secure=secure,
+            samesite=samesite,
+            path="/",
+        )
+
+    return resp
+
+
+@bp.get("/web/auth/me")
+def me():
+    account_id, debug = get_account_id_from_request(request)
+    if not account_id:
+        return jsonify({"ok": False, "error": "unauthorized", "debug": debug}), 401
+    return jsonify({"ok": True, "account_id": account_id, "debug": debug}), 200
+
+
+@bp.post("/web/auth/logout")
+def logout():
+    r = logout_web_session(request)
+    resp = make_response(jsonify(r), 200)
+    resp.delete_cookie(WEB_AUTH_COOKIE_NAME, path="/")
+    return resp
