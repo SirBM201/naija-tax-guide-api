@@ -2,14 +2,13 @@
 from __future__ import annotations
 
 import os
-from typing import Optional, Any
+from typing import Optional
 
-# supabase-py
 from supabase import create_client
 from supabase.client import Client
 
 
-# Singleton client instances (lazy)
+# Lazy singletons
 _client_admin: Optional[Client] = None
 _client_anon: Optional[Client] = None
 
@@ -58,7 +57,6 @@ def get_supabase_client(admin: bool = True) -> Client:
         _client_admin = create_client(url, key)
         return _client_admin
 
-    # anon
     if _client_anon is not None:
         return _client_anon
     anon = _get_anon_key()
@@ -68,7 +66,13 @@ def get_supabase_client(admin: bool = True) -> Client:
     return _client_anon
 
 
-# Backwards-compatible aliases (to prevent future boot crashes)
+# -------- Backwards-compatible exports --------
+
+# Many routes/services expect a module-level `supabase` object.
+# Provide it as an ADMIN client by default.
+supabase: Client = get_supabase_client(admin=True)
+
+
 def get_supabase() -> Client:
     return get_supabase_client(admin=True)
 
