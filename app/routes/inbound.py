@@ -1,4 +1,14 @@
 # app/routes/inbound.py
+from __future__ import annotations
+
+"""
+Inbound WhatsApp + Telegram (HARDENED)
+
+✅ Uses canonical accounts.account_id everywhere (NEVER accounts.id)
+✅ Fixes the object misuse bug (upsert_account returns {"ok":..., "account":...})
+✅ Adds failure exposers so inbound failures show root cause + fix
+"""
+
 from flask import Blueprint, request, jsonify
 
 from ..services.accounts_service import upsert_account
@@ -8,15 +18,8 @@ from ..services.outbound_service import send_whatsapp_text, send_telegram_text
 
 bp = Blueprint("inbound", __name__)
 
-# -------------------------------------------------
-# Helpers
-# -------------------------------------------------
 
 def _consume_link(provider: str, code: str, provider_user_id: str):
-    """
-    Call RPC consume_link_token(provider, code, provider_user_id)
-    Uses service role (admin) because this is server-side.
-    """
     provider = (provider or "").strip().lower()
     code = (code or "").strip()
     provider_user_id = (provider_user_id or "").strip()
@@ -37,13 +40,9 @@ def _consume_link(provider: str, code: str, provider_user_id: str):
 
 
 def _maybe_link_from_message(provider: str, text: str, provider_user_id: str):
-    """
-    Detect: LINK <code>
-    """
     txt = (text or "").strip()
     if not txt:
         return None
-
     if not txt.lower().startswith("link "):
         return None
 
@@ -59,10 +58,6 @@ def _json_body():
 
 
 def _extract_whatsapp_text(body: dict):
-    """
-    Extract WhatsApp text message from Meta Cloud webhook payload.
-    Returns (wa_user_id, text) or (None, None) if not a text message.
-    """
     try:
         entry = body["entry"][0]
         change = entry["changes"][0]
@@ -70,7 +65,7 @@ def _extract_whatsapp_text(body: dict):
 
         messages = value.get("messages")
         if not messages:
-            return (None, None)  # statuses/delivery receipts
+            return (None, None)
 
         msg = messages[0]
         wa_user_id = str(msg.get("from", "")).strip()
@@ -86,10 +81,6 @@ def _extract_whatsapp_text(body: dict):
 
 
 def _extract_telegram_text(body: dict):
-    """
-    Telegram update extractor.
-    Returns (chat_id, user_id, text) or (None, None, None) if not a text message.
-    """
     msg = body.get("message") or body.get("edited_message") or {}
     if not msg and body.get("callback_query"):
         msg = (body.get("callback_query") or {}).get("message") or {}
@@ -111,10 +102,34 @@ def _extract_telegram_text(body: dict):
     return (tg_chat_id, tg_user_id, text)
 
 
-# -------------------------------------------------
-# WhatsApp inbound
-# -------------------------------------------------
+def _extract_account_id_from_upsert(result: dict) -> str | None:
+    """
+    upsert_account returns:
+      {"ok": True, "account_id": "...", "account": {...}}
+    but older versions sometimes returned:
+      {"ok": True, "account": {...}} where account["account_id"] exists
 
+    This helper safely extracts canonical account_id.
+    """
+    if not isinstance(result, dict):
+        return None
+
+    v = str(result.get("account_id") or "").strip()
+    if v:
+        return v
+
+    acct = result.get("account") or {}
+    if isinstance(acct, dict):
+        v2 = str(acct.get("account_id") or "").strip()
+        if v2:
+            return v2
+
+    return None
+
+
+# -------------------------
+# WhatsApp inbound
+# -------------------------
 @bp.post("/inbound/whatsapp")
 def whatsapp_inbound():
     body = _json_body()
@@ -126,8 +141,18 @@ def whatsapp_inbound():
     if not text:
         return jsonify({"ok": True, "ignored": True, "reason": "no_text"}), 200
 
-    # ensure account exists
-    account = upsert_account(provider="wa", provider_user_id=wa_user_id, display_name=None, phone=None)
+    # ✅ ensure account exists (provider for account table should match your canonical mapping)
+    up = upsert_account(provider="wa", provider_user_id=wa_user_id, display_name=None, phone=None)
+    account_id = _extract_account_id_from_upsert(up)
+
+    if not account_id:
+        return jsonify({
+            "ok": False,
+            "error": "account_upsert_failed",
+            "root_cause": up.get("root_cause") or up.get("error") or "upsert_account returned no account_id",
+            "fix": up.get("fix") or "Fix accounts_service.upsert_account to always return accounts.account_id.",
+            "details": {"provider": "wa", "provider_user_id": wa_user_id},
+        }), 500
 
     # linking flow
     link_result = _maybe_link_from_message("whatsapp", text, wa_user_id)
@@ -135,8 +160,8 @@ def whatsapp_inbound():
         send_whatsapp_text(wa_user_id, "✅ Linked successfully. You can now use the service.")
         return jsonify({"ok": True, "linked": True, "link": link_result}), 200
 
-    # normal question flow
-    resp = ask_guarded({"account_id": account["id"], "question": text})
+    # normal question flow (STRICT account_id)
+    resp = ask_guarded({"account_id": account_id, "provider": "wa", "provider_user_id": wa_user_id, "question": text})
 
     answer = ""
     if isinstance(resp, dict):
@@ -147,10 +172,9 @@ def whatsapp_inbound():
     return jsonify(resp), 200
 
 
-# -------------------------------------------------
+# -------------------------
 # Telegram inbound
-# -------------------------------------------------
-
+# -------------------------
 @bp.post("/inbound/telegram")
 def telegram_inbound():
     body = _json_body()
@@ -162,8 +186,17 @@ def telegram_inbound():
     if not text:
         return jsonify({"ok": True, "ignored": True, "reason": "no_text"}), 200
 
-    # ensure account exists
-    account = upsert_account(provider="telegram", provider_user_id=tg_user_id, display_name=None, phone=None)
+    up = upsert_account(provider="tg", provider_user_id=tg_user_id, display_name=None, phone=None)
+    account_id = _extract_account_id_from_upsert(up)
+
+    if not account_id:
+        return jsonify({
+            "ok": False,
+            "error": "account_upsert_failed",
+            "root_cause": up.get("root_cause") or up.get("error") or "upsert_account returned no account_id",
+            "fix": up.get("fix") or "Fix accounts_service.upsert_account to always return accounts.account_id.",
+            "details": {"provider": "tg", "provider_user_id": tg_user_id},
+        }), 500
 
     # linking flow
     link_result = _maybe_link_from_message("telegram", text, tg_user_id)
@@ -171,8 +204,7 @@ def telegram_inbound():
         send_telegram_text(tg_chat_id, "✅ Linked successfully. You can now use the service.")
         return jsonify({"ok": True, "linked": True, "link": link_result}), 200
 
-    # normal question flow
-    resp = ask_guarded({"account_id": account["id"], "question": text})
+    resp = ask_guarded({"account_id": account_id, "provider": "tg", "provider_user_id": tg_user_id, "question": text})
 
     answer = ""
     if isinstance(resp, dict):
