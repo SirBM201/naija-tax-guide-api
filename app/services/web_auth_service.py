@@ -1,4 +1,3 @@
-# app/services/web_auth_service.py
 from __future__ import annotations
 
 import hashlib
@@ -60,42 +59,9 @@ WEB_OTPS_TABLE = _env("WEB_OTPS_TABLE", "web_otps")
 WEB_TOKENS_TABLE = _env("WEB_TOKENS_TABLE", "web_tokens")
 ACCOUNTS_TABLE = _env("ACCOUNTS_TABLE", "accounts")
 
-# Accounts PK (your schema shows accounts.id is uuid and is the real FK target)
-ACCOUNTS_PK_FIELD = _env("ACCOUNTS_PK_FIELD", "id")  # default to "id"
-
 
 def _sb():
     return supabase() if callable(supabase) else supabase
-
-
-# --------------------------------------------------
-# Supabase response helpers
-# --------------------------------------------------
-def _sb_data(resp) -> Any:
-    return getattr(resp, "data", None)
-
-
-def _sb_err(resp) -> Any:
-    return getattr(resp, "error", None)
-
-
-def _err_text(err: Any) -> str:
-    if not err:
-        return ""
-    # supabase-py errors often have .message
-    msg = getattr(err, "message", None)
-    if msg:
-        return str(msg)
-    return str(err)
-
-
-def _is_conflict(err: Any) -> bool:
-    """
-    Best-effort detection of uniqueness conflict.
-    PostgREST often returns 409 for unique violations; supabase-py may surface message text.
-    """
-    t = _err_text(err).lower()
-    return ("409" in t) or ("conflict" in t) or ("duplicate key" in t) or ("unique constraint" in t) or ("23505" in t)
 
 
 # --------------------------------------------------
@@ -148,27 +114,49 @@ def _dev_guard(contact: str, shared_secret: Optional[str]) -> Optional[str]:
 
 # --------------------------------------------------
 # Account binding (provider=web, provider_user_id=contact)
-# IMPORTANT: Use accounts.id as the FK target (matches your schema + FK constraints)
+#
+# IMPORTANT:
+# - web_tokens.account_id FK now points to accounts.id
+# - therefore we must use accounts.id as the session account id
 # --------------------------------------------------
-def _get_or_create_web_account(contact: str) -> Tuple[bool, Optional[str], Optional[str]]:
-    pk = ACCOUNTS_PK_FIELD or "id"
+def _extract_account_pk(row: Dict[str, Any]) -> Optional[str]:
+    """
+    Return the canonical account identifier that web_tokens.account_id should store.
+    With FK(account_id) -> accounts.id, this MUST be accounts.id.
+    """
+    v = row.get("id")
+    if v:
+        return str(v)
+    return None
 
+
+def _get_or_create_web_account(contact: str) -> Tuple[bool, Optional[str], Optional[str]]:
+    # Try fetch existing
     q = (
         _sb()
         .table(ACCOUNTS_TABLE)
-        .select(pk)
+        .select("id, account_id")
         .eq("provider", "web")
         .eq("provider_user_id", contact)
         .limit(1)
         .execute()
     )
 
-    if _sb_err(q):
-        return False, None, f"accounts_select_failed: {_err_text(_sb_err(q))}"
+    if getattr(q, "data", None):
+        row = q.data[0]
+        account_pk = _extract_account_pk(row)
+        if not account_pk:
+            return False, None, "Account exists but missing primary key (id)"
+        # Optional: keep account_id alias in sync if blank
+        try:
+            if not row.get("account_id"):
+                _sb().table(ACCOUNTS_TABLE).update({"account_id": account_pk}).eq("id", account_pk).execute()
+        except Exception:
+            pass
+        return True, account_pk, None
 
-    if _sb_data(q):
-        return True, str(q.data[0][pk]), None
-
+    # Create new: set account_id to match id for compatibility (if your app still reads account_id)
+    # Note: Postgres will generate 'id' automatically if default exists; Supabase returns it if selected.
     ins = (
         _sb()
         .table(ACCOUNTS_TABLE)
@@ -181,17 +169,22 @@ def _get_or_create_web_account(contact: str) -> Tuple[bool, Optional[str], Optio
                 "phone_e164": contact,
             }
         )
-        .select(pk)
+        .select("id")
         .execute()
     )
 
-    if _sb_err(ins):
-        return False, None, f"accounts_insert_failed: {_err_text(_sb_err(ins))}"
-
-    if not _sb_data(ins):
+    if not getattr(ins, "data", None):
         return False, None, "Failed to create account"
 
-    return True, str(ins.data[0][pk]), None
+    account_pk = str(ins.data[0]["id"])
+
+    # Best-effort: sync account_id alias to id (if column exists)
+    try:
+        _sb().table(ACCOUNTS_TABLE).update({"account_id": account_pk}).eq("id", account_pk).execute()
+    except Exception:
+        pass
+
+    return True, account_pk, None
 
 
 # --------------------------------------------------
@@ -244,9 +237,7 @@ def request_web_otp(
     if user_agent:
         payload["user_agent"] = user_agent
 
-    ins = _sb().table(WEB_OTPS_TABLE).insert(payload).execute()
-    if _sb_err(ins):
-        return {"ok": False, "error": f"otp_insert_failed: {_err_text(_sb_err(ins))}"}
+    _sb().table(WEB_OTPS_TABLE).insert(payload).execute()
 
     out: Dict[str, Any] = {
         "ok": True,
@@ -259,60 +250,7 @@ def request_web_otp(
 
 
 # --------------------------------------------------
-# TOKEN CREATE (web_tokens) -> revoked BOOLEAN
-# Handles 409 conflicts by revoking old tokens then retrying once.
-# --------------------------------------------------
-def _create_web_token(
-    account_id: str,
-    ip: Optional[str] = None,
-    user_agent: Optional[str] = None,
-    device_id: Optional[str] = None,
-) -> Dict[str, Any]:
-    now = _now_utc()
-    expires_at = now + timedelta(days=int(WEB_AUTH_TOKEN_TTL_DAYS))
-
-    def _attempt_insert() -> Tuple[bool, Optional[str], Optional[str]]:
-        raw_token = secrets.token_hex(32)  # 64 hex chars
-        token_hash = _hash_token(raw_token)
-
-        payload: Dict[str, Any] = {
-            "account_id": account_id,
-            "token_hash": token_hash,
-            "expires_at": _iso(expires_at),
-            "revoked": False,
-            "last_seen_at": _iso(now),
-        }
-        if ip:
-            payload["ip"] = ip
-        if user_agent:
-            payload["user_agent"] = user_agent
-        if device_id:
-            payload["device_id"] = device_id
-
-        resp = _sb().table(WEB_TOKENS_TABLE).insert(payload).execute()
-        if _sb_err(resp):
-            return False, None, _err_text(_sb_err(resp))
-        return True, raw_token, None
-
-    # First try
-    ok, raw, err = _attempt_insert()
-    if ok and raw:
-        return {"token": raw, "expires_at": _iso(expires_at)}
-
-    # If conflict, revoke existing active tokens for this account and retry once
-    if err and ("conflict" in err.lower() or "duplicate" in err.lower() or "unique" in err.lower() or "409" in err):
-        _sb().table(WEB_TOKENS_TABLE).update({"revoked": True}).eq("account_id", account_id).eq("revoked", False).execute()
-        ok2, raw2, err2 = _attempt_insert()
-        if ok2 and raw2:
-            return {"token": raw2, "expires_at": _iso(expires_at)}
-        raise RuntimeError(f"web_token_insert_failed_after_retry: {err2 or err}")
-
-    raise RuntimeError(f"web_token_insert_failed: {err or 'unknown_error'}")
-
-
-# --------------------------------------------------
 # OTP VERIFY (web_otps -> web_tokens)
-# IMPORTANT: Do NOT consume OTP (used_at) until token creation succeeds.
 # --------------------------------------------------
 def verify_web_otp(
     contact: str,
@@ -361,37 +299,22 @@ def verify_web_otp(
         .execute()
     )
 
-    if _sb_err(q):
-        return {"ok": False, "error": f"otp_lookup_failed: {_err_text(_sb_err(q))}"}
-
-    if not _sb_data(q):
+    if not getattr(q, "data", None):
         return {"ok": False, "error": "invalid_or_expired_otp"}
 
     row = q.data[0]
-    try:
-        exp = datetime.fromisoformat(str(row["expires_at"]).replace("Z", "+00:00"))
-    except Exception:
-        return {"ok": False, "error": "otp_bad_expires_at"}
-
+    exp = datetime.fromisoformat(str(row["expires_at"]).replace("Z", "+00:00"))
     if now > exp:
         _sb().table(WEB_OTPS_TABLE).update({"revoked_at": _iso(now)}).eq("id", row["id"]).execute()
         return {"ok": False, "error": "otp_expired"}
 
-    # 1) ensure account exists
+    _sb().table(WEB_OTPS_TABLE).update({"used_at": _iso(now)}).eq("id", row["id"]).execute()
+
     ok, account_id, err = _get_or_create_web_account(contact)
     if not ok:
         return {"ok": False, "error": err}
 
-    # 2) create token FIRST (so we don't consume OTP on failure)
-    try:
-        tok = _create_web_token(account_id, ip=ip, user_agent=user_agent, device_id=device_id)
-    except Exception as e:
-        # leave OTP unused so user can retry; optionally revoke to be strict:
-        # _sb().table(WEB_OTPS_TABLE).update({"revoked_at": _iso(now)}).eq("id", row["id"]).execute()
-        return {"ok": False, "error": f"token_create_failed: {str(e)}"}
-
-    # 3) now mark OTP used
-    _sb().table(WEB_OTPS_TABLE).update({"used_at": _iso(now)}).eq("id", row["id"]).execute()
+    tok = _create_web_token(account_id, ip=ip, user_agent=user_agent, device_id=device_id)
 
     return {
         "ok": True,
@@ -400,6 +323,40 @@ def verify_web_otp(
         "token": tok["token"],
         "expires_at": tok["expires_at"],
     }
+
+
+# --------------------------------------------------
+# TOKEN CREATE (web_tokens) -> revoked BOOLEAN
+# account_id stored here MUST match accounts.id (FK)
+# --------------------------------------------------
+def _create_web_token(
+    account_id: str,
+    ip: Optional[str] = None,
+    user_agent: Optional[str] = None,
+    device_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    raw_token = secrets.token_hex(32)  # 64 hex chars
+    token_hash = _hash_token(raw_token)
+    now = _now_utc()
+    expires_at = now + timedelta(days=int(WEB_AUTH_TOKEN_TTL_DAYS))
+
+    payload: Dict[str, Any] = {
+        "account_id": account_id,     # ✅ accounts.id (FK target)
+        "token_hash": token_hash,
+        "expires_at": _iso(expires_at),
+        "revoked": False,
+        "last_seen_at": _iso(now),
+    }
+    if ip:
+        payload["ip"] = ip
+    if user_agent:
+        payload["user_agent"] = user_agent
+    if device_id:
+        payload["device_id"] = device_id
+
+    _sb().table(WEB_TOKENS_TABLE).insert(payload).execute()
+
+    return {"token": raw_token, "expires_at": _iso(expires_at)}
 
 
 # --------------------------------------------------
@@ -423,10 +380,7 @@ def require_web_session(auth_header: str) -> Dict[str, Any]:
         .execute()
     )
 
-    if _sb_err(q):
-        return {"ok": False, "error": f"token_lookup_failed: {_err_text(_sb_err(q))}"}
-
-    if not _sb_data(q):
+    if not getattr(q, "data", None):
         return {"ok": False, "error": "invalid_token"}
 
     row = q.data[0]
@@ -467,7 +421,7 @@ def get_account_id_from_request(flask_request) -> Tuple[Optional[str], str]:
             .execute()
         )
 
-        if _sb_data(q):
+        if getattr(q, "data", None):
             row = q.data[0]
             try:
                 exp = datetime.fromisoformat(str(row["expires_at"]).replace("Z", "+00:00"))
