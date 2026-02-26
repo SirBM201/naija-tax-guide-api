@@ -4,23 +4,11 @@ from __future__ import annotations
 """
 WEB AUTH SERVICE (CANONICAL, FAILURE-EXPOSING)
 
-✅ Canonical identity rule (ZERO TOLERANCE):
-    - Every place in the app, "account_id" MUST mean: accounts.account_id
+✅ Canonical identity rule:
+    - "account_id" MUST mean: accounts.account_id
     - accounts.id is ONLY the row PK and must never be used as the app identity
 
-Primary responsibilities:
-- Request OTP (store only)
-- Verify OTP (validate + mark used + issue token in web_tokens)
-- Validate session (bearer/cookie) -> return canonical account_id
-- Provide get_account_id_from_request() helper used by routes
-
-Designed to:
-- survive schema drift (optional columns may not exist)
-- expose failures with {root_cause, fix, details}
-- avoid silent fallbacks that mask DB identity mismatches
-
-Token hashing compatibility:
-- MUST match your backend's token hash convention:
+Token hashing:
     sha256(f"{WEB_TOKEN_PEPPER}:{raw_token}")
 """
 
@@ -33,16 +21,10 @@ from typing import Any, Dict, Optional, Tuple
 from app.core.supabase_client import supabase
 
 
-# -----------------------------
-# Supabase client
-# -----------------------------
 def _sb():
     return supabase() if callable(supabase) else supabase
 
 
-# -----------------------------
-# Time helpers
-# -----------------------------
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -51,9 +33,6 @@ def _iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat()
 
 
-# -----------------------------
-# Env helpers
-# -----------------------------
 def _env(name: str, default: str = "") -> str:
     return (os.getenv(name, default) or default).strip()
 
@@ -76,9 +55,6 @@ def _dbg(msg: str) -> None:
         print(msg, flush=True)
 
 
-# -----------------------------
-# Config
-# -----------------------------
 WEB_AUTH_ENABLED = _truthy(_env("WEB_AUTH_ENABLED", "1"))
 
 WEB_OTPS_TABLE = _env("WEB_OTPS_TABLE", _env("WEB_OTP_TABLE", "web_otps"))
@@ -90,14 +66,10 @@ WEB_AUTH_TOKEN_TTL_DAYS = int(_env("WEB_AUTH_TOKEN_TTL_DAYS", _env("WEB_SESSION_
 
 WEB_AUTH_COOKIE_NAME = _env("WEB_AUTH_COOKIE_NAME", _env("WEB_COOKIE_NAME", "ntg_session"))
 
-# Pepper must match your core token hash implementation
 WEB_TOKEN_PEPPER = _env("WEB_TOKEN_PEPPER", _env("ADMIN_API_KEY", "dev-pepper"))
 WEB_OTP_PEPPER = _env("WEB_OTP_PEPPER", WEB_TOKEN_PEPPER)
 
 
-# -----------------------------
-# Hashing
-# -----------------------------
 def _sha256_hex(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
@@ -112,9 +84,6 @@ def otp_hash(contact: str, purpose: str, otp: str) -> str:
     return _sha256_hex(f"{pepper}:{contact}:{purpose}:{otp}")
 
 
-# -----------------------------
-# Schema-safe helpers
-# -----------------------------
 def _has_column(table: str, col: str) -> bool:
     try:
         _sb().table(table).select(col).limit(1).execute()
@@ -156,16 +125,7 @@ def _parse_iso_dt(v: Any) -> Optional[datetime]:
     return None
 
 
-# ============================================================
-# CANONICAL ACCOUNT RESOLUTION (accounts.account_id ONLY)
-# ============================================================
 def ensure_web_account_id(contact: str) -> Dict[str, Any]:
-    """
-    Ensure a web account exists for `contact` and return canonical accounts.account_id.
-
-    Auto-repair rule:
-      - if accounts.account_id is NULL, set it to accounts.id (one-time migration bridge)
-    """
     contact = (contact or "").strip().lower()
     if not contact:
         return {"ok": False, "error": "missing_contact", "root_cause": "contact_empty", "fix": "Send non-empty email/contact."}
@@ -178,7 +138,6 @@ def ensure_web_account_id(contact: str) -> Dict[str, Any]:
             "fix": "Add accounts.account_id (uuid) and use it as the canonical identity everywhere.",
         }
 
-    # 1) lookup
     try:
         q = (
             _sb()
@@ -204,7 +163,6 @@ def ensure_web_account_id(contact: str) -> Dict[str, Any]:
         row_id = str(row.get("id") or "").strip()
         account_id = str(row.get("account_id") or "").strip()
 
-        # repair if missing
         if not account_id and row_id:
             try:
                 _sb().table(ACCOUNTS_TABLE).update({"account_id": row_id}).eq("id", row_id).execute()
@@ -231,9 +189,7 @@ def ensure_web_account_id(contact: str) -> Dict[str, Any]:
 
         return {"ok": True, "account_id": account_id, "created": False}
 
-    # 2) insert
     payload: Dict[str, Any] = {"provider": "web", "provider_user_id": contact}
-
     if _has_column(ACCOUNTS_TABLE, "display_name"):
         payload["display_name"] = contact
 
@@ -254,7 +210,6 @@ def ensure_web_account_id(contact: str) -> Dict[str, Any]:
     row_id = str(row.get("id") or "").strip()
     account_id = str(row.get("account_id") or "").strip()
 
-    # repair missing account_id
     if not account_id and row_id:
         try:
             _sb().table(ACCOUNTS_TABLE).update({"account_id": row_id}).eq("id", row_id).execute()
@@ -282,9 +237,6 @@ def ensure_web_account_id(contact: str) -> Dict[str, Any]:
     return {"ok": True, "account_id": account_id, "created": True}
 
 
-# ============================================================
-# OTP: request + verify (issue token)
-# ============================================================
 def request_web_otp(
     contact: str,
     purpose: str = "web_login",
@@ -292,9 +244,6 @@ def request_web_otp(
     ip: Optional[str] = None,
     user_agent: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Store OTP in WEB_OTPS_TABLE. Email sending is handled by your routes.
-    """
     if not WEB_AUTH_ENABLED:
         return {"ok": False, "error": "web_auth_disabled"}
 
@@ -323,7 +272,6 @@ def request_web_otp(
     if user_agent and _has_column(WEB_OTPS_TABLE, "user_agent"):
         row["user_agent"] = user_agent
 
-    # revoke previous unused OTPs (best-effort)
     try:
         if _has_column(WEB_OTPS_TABLE, "revoked_at") and _has_column(WEB_OTPS_TABLE, "used_at"):
             (
@@ -363,22 +311,17 @@ def _create_web_token_row(
     user_agent: Optional[str] = None,
     device_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Insert web_tokens row.
-    IMPORTANT: web_tokens.account_id must store accounts.account_id.
-    """
     raw_token = secrets.token_hex(32)
     th = token_hash(raw_token)
     now = _now_utc()
     expires_at = now + timedelta(days=WEB_AUTH_TOKEN_TTL_DAYS)
 
     payload: Dict[str, Any] = {
-        "account_id": account_id,      # ✅ CANONICAL accounts.account_id
+        "account_id": account_id,
         "token_hash": th,
         "expires_at": _iso(expires_at),
     }
 
-    # optional columns
     if _has_column(WEB_TOKENS_TABLE, "revoked"):
         payload["revoked"] = False
     if _has_column(WEB_TOKENS_TABLE, "revoked_at"):
@@ -418,9 +361,6 @@ def verify_web_otp_and_issue_token(
     ip: Optional[str] = None,
     user_agent: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Verify OTP, then issue web token and return {token, account_id}.
-    """
     if not WEB_AUTH_ENABLED:
         return {"ok": False, "error": "web_auth_disabled"}
 
@@ -434,7 +374,6 @@ def verify_web_otp_and_issue_token(
     oh = otp_hash(contact, purpose, otp)
     now = _now_utc()
 
-    # lookup OTP row
     try:
         q = (
             _sb()
@@ -478,14 +417,12 @@ def verify_web_otp_and_issue_token(
     if now > exp:
         return {"ok": False, "error": "otp_expired"}
 
-    # mark used (best-effort)
     try:
         if _has_column(WEB_OTPS_TABLE, "used_at") and row.get("id"):
             _sb().table(WEB_OTPS_TABLE).update({"used_at": _iso(now)}).eq("id", row.get("id")).execute()
     except Exception:
         pass
 
-    # resolve canonical account_id
     acct = ensure_web_account_id(contact)
     if not acct.get("ok"):
         return {
@@ -499,7 +436,6 @@ def verify_web_otp_and_issue_token(
 
     account_id = str(acct["account_id"]).strip()
 
-    # issue token
     tok = _create_web_token_row(account_id=account_id, ip=ip, user_agent=user_agent, device_id=device_id)
     if not tok.get("ok"):
         return {
@@ -514,13 +450,7 @@ def verify_web_otp_and_issue_token(
     return {"ok": True, "account_id": account_id, "token": tok["token"], "expires_at": tok["expires_at"]}
 
 
-# ============================================================
-# SESSION VALIDATION (bearer/cookie) -> canonical account_id
-# ============================================================
 def require_web_session(auth_header: str) -> Dict[str, Any]:
-    """
-    Validate Bearer token and return canonical account_id if valid.
-    """
     token = _normalize_bearer(auth_header)
     if not token:
         return {"ok": False, "error": "missing_token"}
@@ -552,7 +482,6 @@ def require_web_session(auth_header: str) -> Dict[str, Any]:
     if not exp:
         return {"ok": False, "error": "token_invalid_expiry", "root_cause": "web_tokens.expires_at missing/bad", "fix": "Ensure web_tokens.expires_at is timestamptz.", "debug": _safe_debug_meta()}
     if now > exp:
-        # best-effort revoke
         try:
             if _has_column(WEB_TOKENS_TABLE, "revoked"):
                 _sb().table(WEB_TOKENS_TABLE).update({"revoked": True}).eq("token_hash", th).execute()
@@ -572,7 +501,6 @@ def require_web_session(auth_header: str) -> Dict[str, Any]:
             "debug": _safe_debug_meta(),
         }
 
-    # touch last_seen_at (best effort)
     try:
         if _has_column(WEB_TOKENS_TABLE, "last_seen_at"):
             _sb().table(WEB_TOKENS_TABLE).update({"last_seen_at": _iso(now)}).eq("token_hash", th).execute()
@@ -583,22 +511,12 @@ def require_web_session(auth_header: str) -> Dict[str, Any]:
 
 
 def get_account_id_from_request(flask_request) -> Tuple[Optional[str], str]:
-    """
-    Resolve account_id from:
-      1) Authorization: Bearer <token>
-      2) Cookie WEB_AUTH_COOKIE_NAME
-
-    Returns (account_id, source)
-      source: "bearer" | "cookie" | "none"
-    """
-    # 1) Bearer
     auth = (flask_request.headers.get("Authorization") or "").strip()
     if auth:
         out = require_web_session(auth)
         if out.get("ok"):
             return str(out.get("account_id")), "bearer"
 
-    # 2) Cookie
     raw_cookie = (flask_request.cookies.get(WEB_AUTH_COOKIE_NAME) or "").strip()
     if raw_cookie:
         th = token_hash(raw_cookie)
@@ -616,7 +534,6 @@ def get_account_id_from_request(flask_request) -> Tuple[Optional[str], str]:
 
             exp = _parse_iso_dt(row.get("expires_at"))
             if exp and now <= exp:
-                # touch last_seen_at
                 try:
                     if _has_column(WEB_TOKENS_TABLE, "last_seen_at"):
                         _sb().table(WEB_TOKENS_TABLE).update({"last_seen_at": _iso(now)}).eq("token_hash", th).execute()
@@ -629,9 +546,6 @@ def get_account_id_from_request(flask_request) -> Tuple[Optional[str], str]:
 
 
 def logout_web_session(auth_header: str) -> Dict[str, Any]:
-    """
-    Revoke the token in Authorization: Bearer ...
-    """
     token = _normalize_bearer(auth_header)
     if not token:
         return {"ok": False, "error": "missing_token"}
