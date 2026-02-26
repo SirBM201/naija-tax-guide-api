@@ -20,7 +20,6 @@ WEB_AUTH_OTP_TABLE = os.getenv("WEB_OTP_TABLE", "web_otps")
 WEB_AUTH_TOKEN_TABLE = os.getenv("WEB_TOKEN_TABLE", "web_tokens")
 WEB_AUTH_ACCOUNTS_TABLE = os.getenv("ACCOUNTS_TABLE", "accounts")
 
-# Internal aliases
 OTP_TABLE = WEB_AUTH_OTP_TABLE
 TOKEN_TABLE = WEB_AUTH_TOKEN_TABLE
 ACCOUNTS_TABLE = WEB_AUTH_ACCOUNTS_TABLE
@@ -32,11 +31,9 @@ MAX_ATTEMPTS = int(os.getenv("WEB_OTP_MAX_ATTEMPTS", "5"))
 
 SESSION_COOKIE_NAME = WEB_AUTH_COOKIE_NAME
 
-# Token settings
 TOKEN_TTL_SECONDS = int(os.getenv("WEB_TOKEN_TTL_SECONDS", "2592000"))  # 30 days
 TOKEN_LENGTH_BYTES = int(os.getenv("WEB_TOKEN_BYTES", "32"))
 
-# Dev bypass (optional)
 BYPASS_TOKEN = (os.getenv("BYPASS_TOKEN") or "").strip()
 
 
@@ -74,11 +71,6 @@ def _extract_bearer(req: Request) -> Optional[str]:
 
 
 def _extract_dev_bypass(req: Request) -> bool:
-    """
-    Matches prior behavior:
-      - Authorization: Bearer <BYPASS_TOKEN>
-      - X-Auth-Token: <BYPASS_TOKEN>
-    """
     if not BYPASS_TOKEN:
         return False
     bearer = _extract_bearer(req)
@@ -107,10 +99,6 @@ def _revoke_token(sb, token: str) -> Tuple[bool, Optional[str]]:
 
 
 def _safe_insert_otp_row(sb, row: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
-    """
-    Insert row into OTP table.
-    We intentionally keep row minimal to avoid schema mismatch.
-    """
     try:
         res = sb.table(OTP_TABLE).insert(row).execute()
         if getattr(res, "error", None):
@@ -131,8 +119,8 @@ def request_email_otp(
     user_agent: str | None = None,
 ) -> Dict[str, Any]:
     """
-    Creates an OTP record. We accept device_id/user_agent for compatibility,
-    but we do NOT write them unless your table has those columns (to avoid 500s).
+    Generates OTP, stores hash in DB, returns a server-only _otp_plain so the route can email it.
+    The route decides whether to expose OTP in response (dev only).
     """
     sb = get_supabase_client(admin=True)
 
@@ -146,7 +134,6 @@ def request_email_otp(
     code_hash = _sha256_hex(otp_plain)
     expires_at = _ts_plus(OTP_TTL_SECONDS)
 
-    # Keep this minimal and safe across schemas
     row: Dict[str, Any] = {
         "contact": contact,
         "purpose": purpose,
@@ -165,15 +152,13 @@ def request_email_otp(
     if not ok:
         return {"ok": False, "error": "otp_insert_failed", "root_cause": err}
 
-    dev_return_plain = _truthy(os.getenv("WEB_OTP_RETURN_PLAIN"))
-
-    out: Dict[str, Any] = {
+    return {
         "ok": True,
         "contact": contact,
         "purpose": purpose,
         "expires_at": expires_at,
+        "_otp_plain": otp_plain,  # SERVER-ONLY (route uses it to send email)
         "debug": {
-            "cookie": {"name": SESSION_COOKIE_NAME},
             "tables": {"otp_table": OTP_TABLE, "token_table": TOKEN_TABLE},
             "received": {
                 "ip": request_ip,
@@ -182,9 +167,6 @@ def request_email_otp(
             },
         },
     }
-    if dev_return_plain:
-        out["otp"] = otp_plain  # DEV ONLY
-    return out
 
 
 def verify_email_otp(email: str, otp_code: str, purpose: str | None = None) -> Dict[str, Any]:
@@ -281,7 +263,6 @@ def _ensure_web_account(contact_email: str) -> Tuple[Optional[str], Optional[str
         if row and row.get("id"):
             return row["id"], None
 
-        # Minimal insert to avoid schema mismatch
         ins = {
             "provider": provider,
             "provider_user_id": provider_user_id,
@@ -295,21 +276,6 @@ def _ensure_web_account(contact_email: str) -> Tuple[Optional[str], Optional[str
         row2 = (res2.data or [None])[0]
         if row2 and row2.get("id"):
             return row2["id"], None
-
-        # fallback lookup
-        res3 = (
-            sb.table(ACCOUNTS_TABLE)
-            .select("id")
-            .eq("provider", provider)
-            .eq("provider_user_id", provider_user_id)
-            .limit(1)
-            .execute()
-        )
-        if getattr(res3, "error", None):
-            return None, str(res3.error)
-        row3 = (res3.data or [None])[0]
-        if row3 and row3.get("id"):
-            return row3["id"], None
 
         return None, "account_create_failed"
     except Exception as e:
@@ -365,9 +331,6 @@ def verify_web_otp_and_issue_token(contact: str, otp: str, purpose: str | None =
     }
 
 
-# -----------------------------
-# REQUIRED by routes: logout
-# -----------------------------
 def logout_web_session(req: Request) -> Dict[str, Any]:
     sb = get_supabase_client(admin=True)
 
@@ -388,10 +351,7 @@ def logout_web_session(req: Request) -> Dict[str, Any]:
     return {"ok": True, "logged_out": True, "source": "none"}
 
 
-# -----------------------------
 # Backwards-compatible exports expected by routes
-# (NOW accepts the keywords your route passes)
-# -----------------------------
 def request_web_otp(
     contact: str,
     purpose: str | None = None,
@@ -400,7 +360,6 @@ def request_web_otp(
     user_agent: str | None = None,
     **_: Any,
 ) -> Dict[str, Any]:
-    # We accept the parameters for compatibility; safe minimal write.
     return request_email_otp(contact, purpose=purpose, request_ip=ip, device_id=device_id, user_agent=user_agent)
 
 
@@ -413,21 +372,8 @@ def verify_web_otp(
     return verify_email_otp(contact, otp_code=otp, purpose=purpose)
 
 
-# -----------------------------
-# Auth resolver used by /ask
-# -----------------------------
 def get_account_id_from_request(req: Request) -> Tuple[Optional[str], Dict[str, Any]]:
     debug: Dict[str, Any] = {"cookie": {"name": SESSION_COOKIE_NAME}}
-
-    try:
-        body = req.get_json(silent=True) or {}
-    except Exception:
-        body = {}
-    if isinstance(body, dict):
-        aid = (body.get("account_id") or "").strip()
-        if aid:
-            debug["source"] = "body.account_id"
-            return aid, debug
 
     if _extract_dev_bypass(req):
         debug["source"] = "bypass"
@@ -439,7 +385,6 @@ def get_account_id_from_request(req: Request) -> Tuple[Optional[str], Dict[str, 
     bearer = _extract_bearer(req)
     if bearer:
         debug["source"] = "bearer"
-        debug["token_prefix"] = bearer[:8]
         try:
             res = (
                 sb.table(TOKEN_TABLE)
@@ -448,19 +393,15 @@ def get_account_id_from_request(req: Request) -> Tuple[Optional[str], Dict[str, 
                 .limit(1)
                 .execute()
             )
-            if getattr(res, "error", None):
-                debug["token_error"] = str(res.error)
-            else:
-                row = (res.data or [None])[0]
-                if row and row.get("account_id"):
-                    return row["account_id"], debug
+            row = (res.data or [None])[0]
+            if row and row.get("account_id"):
+                return row["account_id"], debug
         except Exception as e:
             debug["token_error"] = repr(e)
 
     cookie_token = (req.cookies.get(SESSION_COOKIE_NAME) or "").strip()
     if cookie_token:
         debug["source"] = "cookie"
-        debug["cookie_present"] = True
         try:
             res = (
                 sb.table(TOKEN_TABLE)
@@ -469,19 +410,11 @@ def get_account_id_from_request(req: Request) -> Tuple[Optional[str], Dict[str, 
                 .limit(1)
                 .execute()
             )
-            if getattr(res, "error", None):
-                debug["cookie_error"] = str(res.error)
-            else:
-                row = (res.data or [None])[0]
-                if row and row.get("account_id"):
-                    return row["account_id"], debug
+            row = (res.data or [None])[0]
+            if row and row.get("account_id"):
+                return row["account_id"], debug
         except Exception as e:
             debug["cookie_error"] = repr(e)
-
-    xaid = (req.headers.get("X-Account-Id") or "").strip()
-    if xaid:
-        debug["source"] = "header:X-Account-Id"
-        return xaid, debug
 
     debug["source"] = "none"
     return None, debug
