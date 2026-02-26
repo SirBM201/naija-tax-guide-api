@@ -26,14 +26,11 @@ Schema assumed:
 """
 
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict
 
 from app.core.supabase_client import supabase
 
 
-# ----------------------------
-# Helpers
-# ----------------------------
 def _sb():
     return supabase() if callable(supabase) else supabase
 
@@ -58,9 +55,6 @@ def _as_int(v: Any, default: int = 0) -> int:
         return default
 
 
-# ----------------------------
-# Tables / columns
-# ----------------------------
 BAL_TABLE = "ai_credit_balances"
 BAL_COL_ACCOUNT = "account_id"
 BAL_COL_BALANCE = "balance"
@@ -69,14 +63,8 @@ BAL_COL_UPDATED = "updated_at"
 PLANS_TABLE = "plans"
 
 
-# ----------------------------
-# Public APIs
-# ----------------------------
 def get_credit_balance(account_id: str) -> int:
-    """
-    Return current AI credit balance (int).
-    Never throws: returns 0 on any failure.
-    """
+    """Return current AI credit balance (int). Never throws: returns 0 on any failure."""
     account_id = (account_id or "").strip()
     if not account_id:
         return 0
@@ -99,15 +87,7 @@ def get_credit_balance(account_id: str) -> int:
 
 
 def check_credit_balance(account_id: str, cost: int = 1) -> Dict[str, Any]:
-    """
-    Boot-safe, debuggable credit pre-check.
-
-    Returns:
-      { ok: True,  balance: <int>, remaining: <int>, cost: <int> }
-      { ok: False, error: "insufficient_credits", balance: <int>, cost: <int>,
-        root_cause: "...", fix: "..." }
-      { ok: False, error: "credits_lookup_failed", root_cause: "...", fix: "..." }
-    """
+    """Boot-safe, debuggable credit pre-check."""
     account_id = (account_id or "").strip()
     cost = _as_int(cost, 1)
     if cost < 1:
@@ -157,9 +137,7 @@ def check_credit_balance(account_id: str, cost: int = 1) -> Dict[str, Any]:
 
 
 def _set_credit_balance(account_id: str, new_balance: int) -> None:
-    """
-    Internal helper: set/overwrite balance (upsert).
-    """
+    """Internal helper: set/overwrite balance (upsert)."""
     _sb().table(BAL_TABLE).upsert(
         {
             BAL_COL_ACCOUNT: account_id,
@@ -171,13 +149,7 @@ def _set_credit_balance(account_id: str, new_balance: int) -> None:
 
 
 def init_credits_for_plan(account_id: str, plan_code: str) -> Dict[str, Any]:
-    """
-    Called after a subscription is activated/changed.
-
-    Behavior:
-    - Looks up plans.ai_credits_total
-    - Sets ai_credit_balances.balance = ai_credits_total (overwrite)
-    """
+    """Called after a subscription is activated/changed. Overwrites balance to plan's ai_credits_total."""
     account_id = (account_id or "").strip()
     plan_code = (plan_code or "").strip().lower()
 
@@ -226,3 +198,8 @@ def init_credits_for_plan(account_id: str, plan_code: str) -> Dict[str, Any]:
         }
 
     return {"ok": True, "account_id": account_id, "plan_code": plan_code, "balance": total}
+
+
+# Backward-compat aliases (to prevent boot crashes)
+def credits_balance(account_id: str) -> int:
+    return get_credit_balance(account_id)
