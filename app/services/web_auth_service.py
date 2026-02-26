@@ -13,18 +13,24 @@ from app.core.supabase_client import get_supabase_client
 
 
 # -----------------------------
-# Config
+# Exported constants (routes import these)
 # -----------------------------
-OTP_TABLE = os.getenv("WEB_OTP_TABLE", "web_otps")          # your existing table
-TOKEN_TABLE = os.getenv("WEB_TOKEN_TABLE", "web_tokens")    # must exist
-ACCOUNTS_TABLE = os.getenv("ACCOUNTS_TABLE", "accounts")    # must exist
+WEB_AUTH_COOKIE_NAME = os.getenv("WEB_SESSION_COOKIE_NAME", "ntg_session")
+WEB_AUTH_OTP_TABLE = os.getenv("WEB_OTP_TABLE", "web_otps")
+WEB_AUTH_TOKEN_TABLE = os.getenv("WEB_TOKEN_TABLE", "web_tokens")
+WEB_AUTH_ACCOUNTS_TABLE = os.getenv("ACCOUNTS_TABLE", "accounts")
+
+# For internal use (keep names stable)
+OTP_TABLE = WEB_AUTH_OTP_TABLE
+TOKEN_TABLE = WEB_AUTH_TOKEN_TABLE
+ACCOUNTS_TABLE = WEB_AUTH_ACCOUNTS_TABLE
 
 OTP_PURPOSE_DEFAULT = os.getenv("WEB_OTP_PURPOSE", "web_login")
 OTP_TTL_SECONDS = int(os.getenv("WEB_OTP_TTL_SECONDS", "600"))  # 10 mins
 OTP_LENGTH = int(os.getenv("WEB_OTP_LENGTH", "6"))
 MAX_ATTEMPTS = int(os.getenv("WEB_OTP_MAX_ATTEMPTS", "5"))
 
-SESSION_COOKIE_NAME = os.getenv("WEB_SESSION_COOKIE_NAME", "ntg_session")
+SESSION_COOKIE_NAME = WEB_AUTH_COOKIE_NAME
 
 # Dev bypass (optional)
 BYPASS_TOKEN = (os.getenv("BYPASS_TOKEN") or "").strip()
@@ -109,7 +115,7 @@ def request_email_otp(email: str, purpose: str | None = None, request_ip: str | 
         "channel": "email",
         "email_sent": None,
         "email_error": None,
-        "otp_code": None,     # keep null (legacy)
+        "otp_code": None,     # legacy (keep null)
     }
 
     try:
@@ -119,14 +125,20 @@ def request_email_otp(email: str, purpose: str | None = None, request_ip: str | 
                 "ok": False,
                 "error": "otp_insert_failed",
                 "root_cause": str(res.error),
-                "debug": {"otp_table": OTP_TABLE, "purpose": purpose, "contact": contact},
+                "debug": {
+                    "cookie": {"name": SESSION_COOKIE_NAME},
+                    "tables": {"otp_table": OTP_TABLE, "token_table": TOKEN_TABLE},
+                },
             }
     except Exception as e:
         return {
             "ok": False,
             "error": "otp_insert_failed",
             "root_cause": repr(e),
-            "debug": {"otp_table": OTP_TABLE, "purpose": purpose, "contact": contact},
+            "debug": {
+                "cookie": {"name": SESSION_COOKIE_NAME},
+                "tables": {"otp_table": OTP_TABLE, "token_table": TOKEN_TABLE},
+            },
         }
 
     dev_return_plain = _truthy(os.getenv("WEB_OTP_RETURN_PLAIN"))
@@ -136,7 +148,10 @@ def request_email_otp(email: str, purpose: str | None = None, request_ip: str | 
         "contact": contact,
         "purpose": purpose,
         "expires_at": expires_at,
-        "debug": {"otp_table": OTP_TABLE, "token_table": TOKEN_TABLE},
+        "debug": {
+            "cookie": {"name": SESSION_COOKIE_NAME},
+            "tables": {"otp_table": OTP_TABLE, "token_table": TOKEN_TABLE},
+        },
     }
     if dev_return_plain:
         out["otp"] = otp_plain  # DEV ONLY
@@ -213,7 +228,6 @@ def verify_email_otp(email: str, otp_code: str, purpose: str | None = None) -> D
 # -----------------------------
 def get_account_id_from_request(req: Request) -> Tuple[Optional[str], Dict[str, Any]]:
     """
-    Canonical resolver expected by ask route.
     Returns: (account_id, debug)
 
     Resolution order:
@@ -225,7 +239,7 @@ def get_account_id_from_request(req: Request) -> Tuple[Optional[str], Dict[str, 
     """
     debug: Dict[str, Any] = {"cookie": {"name": SESSION_COOKIE_NAME}}
 
-    # JSON body account_id (if the route already parsed it)
+    # JSON body account_id
     try:
         body = req.get_json(silent=True) or {}
     except Exception:
@@ -244,7 +258,7 @@ def get_account_id_from_request(req: Request) -> Tuple[Optional[str], Dict[str, 
 
     sb = get_supabase_client(admin=True)
 
-    # Bearer token -> web_tokens (or whatever you named it)
+    # Bearer token -> web_tokens
     bearer = _extract_bearer(req)
     if bearer:
         debug["source"] = "bearer"
@@ -288,7 +302,7 @@ def get_account_id_from_request(req: Request) -> Tuple[Optional[str], Dict[str, 
         except Exception as e:
             debug["cookie_error"] = repr(e)
 
-    # Optional header fallback
+    # Header fallback
     xaid = (req.headers.get("X-Account-Id") or "").strip()
     if xaid:
         debug["source"] = "header:X-Account-Id"
