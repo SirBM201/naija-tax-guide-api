@@ -2,372 +2,295 @@
 from __future__ import annotations
 
 """
-ASK SERVICE (HARDENED)
+ASK SERVICE (CANONICAL)
 
-Changes vs old version:
-✅ account identity is STRICT:
-    - account_id MUST be the canonical accounts.account_id
-    - NO silent fallback to accounts.id anywhere
+Goal:
+- Use ONLY canonical identity: accounts.account_id
+- Never silently treat accounts.id as the app identity
+- If older clients send accounts.id, we TRANSLATE it to accounts.account_id (and expose it)
+- Provide strong failure exposers: error + root_cause + fix (+ optional debug)
 
-✅ Failure exposers:
-    - If account resolution fails, response includes root_cause + fix + debug keys (when ASK_DEBUG enabled)
+This service is called by:
+- routes/ask.py (web + legacy channels)
 
-✅ Dev bypass:
-    - Same behavior: routes/ask.py sets __bypass=True after validating BYPASS_TOKEN.
+Key invariants:
+- Any downstream service that touches subscriptions/credits/tokens must receive canonical account_id.
+
 """
 
 import os
-from typing import Any, Dict, Optional, Tuple, Union
+import uuid
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional, Tuple
 
-from ..core.supabase_client import supabase
-
-from .ai_service import ask_ai, ask_ai_chat, last_ai_error
-from .subscriptions_service import get_subscription_status
-from .qa_cache_service import (
-    find_cached_answer,
-    touch_cache_best_effort,
-    upsert_ai_answer_to_cache_best_effort,
-)
-from .question_canonicalizer import basic_normalize, canonical_key
-from .response_refiner import refine_answer
-from .qa_usage_service import try_consume_cache_slot, get_cache_used_today
-
-
-# -----------------------------
-# Constants / knobs
-# -----------------------------
-MAX_QUESTION_CHARS = 2000
-
-PAID_CACHE_DAILY_LIMIT = int((os.getenv("PAID_CACHE_DAILY_LIMIT", "1000") or "1000").strip())
-FREE_CACHE_DAILY_LIMIT = int((os.getenv("FREE_CACHE_DAILY_LIMIT", "20") or "20").strip())
-
-HARD_DAILY_MAX = int((os.getenv("HARD_DAILY_MAX", "1500") or "1500").strip())
-
-
-# -----------------------------
-# Debug
-# -----------------------------
-def _truthy(v: str | None) -> bool:
-    return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
-def _debug_enabled() -> bool:
-    return _truthy(os.getenv("ASK_DEBUG")) or _truthy(os.getenv("WEB_AUTH_DEBUG")) or _truthy(os.getenv("AUTH_DEBUG"))
-
-
-def _dbg_pack(**kv: Any) -> Dict[str, Any]:
-    if not _debug_enabled():
-        return {}
-    return dict(kv)
+from app.core.supabase_client import supabase
+from app.services.credits_service import check_credit_balance
+from app.services.qa_cache_service import answer_from_cache, increment_cache_use
+from app.services.ai_service import call_ai
 
 
 # -----------------------------
 # Helpers
 # -----------------------------
-def _safe_str(v: Any) -> str:
-    return (v or "").strip()
-
-
-def _truncate(s: str, n: int) -> str:
-    s = s or ""
-    return s if len(s) <= n else s[:n]
-
 
 def _sb():
     return supabase() if callable(supabase) else supabase
 
 
-def _dev_bypass_enabled(payload: Dict[str, Any]) -> bool:
-    # Enabled only when routes/ask.py sets __bypass=True after validating token
-    return bool(payload.get("__bypass") is True)
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
-def _resolve_account_id_strict(payload: Dict[str, Any]) -> Tuple[Optional[str], Dict[str, Any]]:
-    """
-    STRICT resolver:
-      - if payload.account_id present => return it
-      - else if (provider, provider_user_id) => lookup accounts.account_id ONLY
-      - NEVER returns accounts.id.
+def _truthy(v: str | None) -> bool:
+    return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
-    Returns (account_id, debug_info)
-    """
-    dbg: Dict[str, Any] = {}
-    account_id = _safe_str(payload.get("account_id"))
-    if account_id:
-        dbg["source"] = "payload.account_id"
-        return account_id, dbg
 
-    provider = _safe_str(payload.get("provider")).lower()
-    provider_user_id = _safe_str(payload.get("provider_user_id"))
-    if not provider or not provider_user_id:
-        dbg["source"] = "missing_provider_or_provider_user_id"
-        return None, dbg
+def _clip(s: str, n: int = 240) -> str:
+    s = str(s or "")
+    return s if len(s) <= n else s[:n] + "…"
 
+
+def _is_uuid(v: str) -> bool:
     try:
-        res = (
-            _sb()
-            .table("accounts")
-            .select("account_id")
-            .eq("provider", provider)
-            .eq("provider_user_id", provider_user_id)
-            .limit(1)
-            .execute()
-        )
-        rows = getattr(res, "data", None) or []
-        if not rows:
-            dbg["source"] = "accounts_lookup_no_rows"
-            return None, dbg
-
-        row = rows[0] or {}
-        aid = _safe_str(row.get("account_id"))
-        if not aid:
-            dbg["source"] = "accounts_account_id_empty"
-            return None, dbg
-
-        dbg["source"] = "accounts.account_id"
-        return aid, dbg
-
-    except Exception as e:
-        dbg["source"] = "accounts_lookup_exception"
-        dbg["error_type"] = type(e).__name__
-        dbg["error"] = str(e)[:220]
-        return None, dbg
-
-
-# -----------------------------
-# Subscription status (best effort)
-# -----------------------------
-def _get_subscription_status_best_effort(account_id: str, provider: str, provider_user_id: Optional[str]) -> Dict[str, Any]:
-    try:
-        return get_subscription_status(account_id, provider, provider_user_id)
+        uuid.UUID(str(v))
+        return True
     except Exception:
-        return {
-            "active": False,
-            "state": "none",
-            "reason": "subscription_check_failed",
-            "plan_code": None,
-            "expires_at": None,
-            "grace_until": None,
-        }
+        return False
 
 
-# -----------------------------
-# Credits / Limits (RPC: consume_ai_credits)
-# -----------------------------
-def _consume_ai_credits(account_id: str, cost: int = 1) -> Tuple[bool, str, Dict[str, Any]]:
-    cost = int(cost or 1)
-    if cost < 1:
-        cost = 1
-
-    dbg: Dict[str, Any] = {"rpc": "consume_ai_credits", "cost": cost}
-
+def _has_column(table: str, col: str) -> bool:
     try:
-        res = _sb().rpc("consume_ai_credits", {"p_account_id": account_id, "p_cost": cost}).execute()
-        data = getattr(res, "data", None)
-
-        if isinstance(data, dict):
-            ok = bool(data.get("ok"))
-            reason = _safe_str(data.get("reason")) or ("ok" if ok else "no_credits")
-            dbg.update({"rpc_ok": ok, "rpc_reason": reason})
-            return ok, reason, dbg
-
-        if isinstance(data, bool):
-            dbg.update({"rpc_ok": bool(data)})
-            return (data is True), ("ok" if data else "no_credits"), dbg
-
-        dbg.update({"rpc_ok": False, "rpc_reason": "unexpected_response"})
-        return False, "credits_rpc_unexpected_response", dbg
-
-    except Exception as e:
-        dbg.update({"rpc_ok": False, "rpc_reason": "rpc_failed"})
-        if _debug_enabled():
-            dbg.update({"error_type": type(e).__name__, "error": str(e)[:220]})
-        return False, "credits_rpc_failed", dbg
+        _sb().table(table).select(col).limit(1).execute()
+        return True
+    except Exception:
+        return False
 
 
 # -----------------------------
-# AI call
+# Canonical account id resolution
 # -----------------------------
-def _call_ai_model(question: str, lang: str = "en") -> str:
-    ans = ask_ai(question, lang=lang)
-    if not ans:
-        raise RuntimeError(last_ai_error() or "ai_failed")
-    return ans
 
+def resolve_canonical_account_id(raw_account_id: str) -> Dict[str, Any]:
+    """Resolve incoming identifier to canonical accounts.account_id.
 
-def _cache_limit_message(used: int, limit: int) -> str:
-    return (
-        f"You’ve reached today’s fast-answer limit ({used}/{limit}).\n\n"
-        "To continue now:\n"
-        "• Try again tomorrow (limit resets daily), or\n"
-        "• Use AI credits if available by asking a new question."
-    )
+    Accepts:
+      - canonical accounts.account_id
+      - legacy accounts.id (translated)
 
-
-# -----------------------------
-# Public: unified ask (dict payload)
-# -----------------------------
-def ask_guarded(payload: Union[Dict[str, Any], str], *args, **kwargs) -> Dict[str, Any]:
+    Returns:
+      { ok: True, account_id: <canonical>, translated_from_id?: <legacy-id> }
+      { ok: False, error, root_cause, fix }
     """
-    Supports dict payloads used by routes.
-    Backwards compatible if called with (question, account_id,...).
-    """
-    if isinstance(payload, str):
-        question = payload
-        account_id = kwargs.get("account_id") or (args[0] if args else None)
-        if not account_id:
-            return {"ok": False, "error": "account_required", "answer": "", "root_cause": "missing_account_id", "fix": "Provide canonical accounts.account_id."}
-        return _ask_guarded_dict(
-            {
-                "question": question,
-                "account_id": account_id,
-                "provider": kwargs.get("provider") or "web",
-                "provider_user_id": kwargs.get("provider_user_id"),
-                "lang": kwargs.get("lang") or "en",
-                "channel": kwargs.get("channel") or "ask",
-            }
-        )
-
-    if not isinstance(payload, dict):
-        return {"ok": False, "error": "invalid_request", "answer": ""}
-
-    return _ask_guarded_dict(payload)
-
-
-def _ask_guarded_dict(payload: Dict[str, Any]) -> Dict[str, Any]:
-    question = _truncate(_safe_str(payload.get("question")), MAX_QUESTION_CHARS)
-    provider = (_safe_str(payload.get("provider")) or "web").lower()
-    provider_user_id = _safe_str(payload.get("provider_user_id")) or None
-    lang = _safe_str(payload.get("lang")) or "en"
-    channel = _safe_str(payload.get("channel")) or ("web_ask" if provider == "web" else "ask")
-
-    if not question:
-        return {"ok": False, "error": "question_required", "answer": ""}
-
-    account_id, ridbg = _resolve_account_id_strict(payload)
-    if not account_id:
-        out = {
+    v = (raw_account_id or "").strip()
+    if not v:
+        return {
             "ok": False,
             "error": "account_required",
-            "answer": "",
-            "root_cause": "account_id_missing_or_not_resolvable",
-            "fix": (
-                "Pass canonical accounts.account_id, OR pass provider+provider_user_id that maps to a row with a non-null accounts.account_id. "
-                "DO NOT pass accounts.id."
-            ),
+            "root_cause": "missing_account_id",
+            "fix": "Provide account_id or authenticate via web cookie/bearer so the server can derive it.",
         }
-        out.update(_dbg_pack(account_resolution=ridbg))
-        return out
 
-    # Hard daily max gate (fast fail)
-    try:
-        used_today = int(get_cache_used_today(account_id) or 0)
-        if used_today >= HARD_DAILY_MAX:
+    if not _is_uuid(v):
+        return {
+            "ok": False,
+            "error": "account_invalid",
+            "root_cause": "account_id_not_uuid",
+            "fix": "Send a valid UUID for account_id.",
+            "details": {"account_id": v},
+        }
+
+    # 1) Try canonical: accounts.account_id = v
+    if _has_column("accounts", "account_id"):
+        try:
+            q = _sb().table("accounts").select("id,account_id").eq("account_id", v).limit(1).execute()
+            rows = getattr(q, "data", None) or []
+            if rows:
+                return {"ok": True, "account_id": str(rows[0].get("account_id") or v)}
+        except Exception as e:
             return {
                 "ok": False,
-                "error": "hard_daily_limit_reached",
-                "answer": "",
-                "message": f"Daily limit reached ({used_today}/{HARD_DAILY_MAX}). Try again tomorrow.",
+                "error": "account_lookup_failed",
+                "root_cause": f"accounts lookup by account_id failed: {type(e).__name__}: {_clip(str(e))}",
+                "fix": "Check Supabase connectivity/RLS for accounts table.",
             }
-    except Exception:
-        pass
 
-    # subscription status best effort
-    sub = _get_subscription_status_best_effort(account_id, provider, provider_user_id)
-    is_paid = bool(sub.get("active"))
+    # 2) Try legacy: accounts.id = v, translate to account_id
+    try:
+        q = _sb().table("accounts").select("id,account_id").eq("id", v).limit(1).execute()
+        rows = getattr(q, "data", None) or []
+        if not rows:
+            return {
+                "ok": False,
+                "error": "account_not_found",
+                "root_cause": "no accounts row matches account_id nor id",
+                "fix": "Ensure the account exists. If using web auth, verify OTP first to create/resolve account.",
+                "details": {"provided": v},
+            }
 
-    # Cache limit selection
-    cache_limit = PAID_CACHE_DAILY_LIMIT if is_paid else FREE_CACHE_DAILY_LIMIT
+        row = rows[0] or {}
+        canonical = str(row.get("account_id") or "").strip()
+        row_id = str(row.get("id") or "").strip()
 
-    # Canonicalize question for cache key
-    norm_q = basic_normalize(question)
-    ckey = canonical_key(norm_q, lang=lang)
+        # auto-repair missing account_id
+        if not canonical and row_id:
+            try:
+                _sb().table("accounts").update({"account_id": row_id}).eq("id", row_id).execute()
+                canonical = row_id
+            except Exception as e:
+                return {
+                    "ok": False,
+                    "error": "account_id_repair_failed",
+                    "root_cause": f"accounts.account_id was NULL and repair failed: {type(e).__name__}: {_clip(str(e))}",
+                    "fix": "Run SQL: update accounts set account_id=id where account_id is null; then UNIQUE index on account_id.",
+                    "details": {"row_id": row_id},
+                }
 
-    # Try cache
-    cached = find_cached_answer(ckey)
-    if cached and cached.get("answer"):
-        # touch + consume slot best effort
+        if not canonical:
+            return {
+                "ok": False,
+                "error": "account_id_missing",
+                "root_cause": "accounts row exists but account_id is empty",
+                "fix": "Ensure accounts.account_id exists and is populated.",
+                "details": {"row_id": row_id},
+            }
+
+        return {"ok": True, "account_id": canonical, "translated_from_id": v}
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": "account_lookup_failed",
+            "root_cause": f"accounts lookup by id failed: {type(e).__name__}: {_clip(str(e))}",
+            "fix": "Check Supabase connectivity/RLS for accounts table.",
+        }
+
+
+# -----------------------------
+# Main guarded ask
+# -----------------------------
+
+def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
+    """Guarded ask endpoint.
+
+    Expected inputs:
+      - question (required)
+      - account_id (preferred) OR web cookie/bearer sets body['account_id'] in route
+      - __bypass optional (dev)
+
+    Output:
+      { ok: True, answer, from_cache, ... }
+      { ok: False, error, root_cause, fix, ... }
+    """
+
+    question = (body.get("question") or "").strip()
+    if not question:
+        return {
+            "ok": False,
+            "error": "question_required",
+            "root_cause": "missing_question",
+            "fix": "Provide a non-empty question string.",
+        }
+
+    raw_account_id = (body.get("account_id") or "").strip()
+    resolved = resolve_canonical_account_id(raw_account_id)
+    if not resolved.get("ok"):
+        return resolved
+
+    account_id = str(resolved["account_id"]).strip()
+
+    # Expose translation if legacy id was supplied
+    translation_debug = {}
+    if resolved.get("translated_from_id"):
+        translation_debug = {
+            "note": "legacy accounts.id was supplied; translated to canonical accounts.account_id",
+            "translated_from_id": resolved.get("translated_from_id"),
+        }
+
+    # DEV bypass: allows asking even without subscription/credits
+    bypass = bool(body.get("__bypass"))
+    if bypass and not _truthy(os.getenv("ALLOW_DEV_BYPASS", "1")):
+        return {
+            "ok": False,
+            "error": "bypass_disabled",
+            "root_cause": "__bypass provided but ALLOW_DEV_BYPASS=0",
+            "fix": "Remove bypass headers or set ALLOW_DEV_BYPASS=1 in backend env.",
+        }
+
+    # 1) Try cache
+    try:
+        cached = answer_from_cache(question)
+    except Exception as e:
+        cached = None
+        cache_err = {
+            "cache_error": f"{type(e).__name__}: {_clip(str(e))}",
+            "fix": "Check qa_cache table/RPC and indexes.",
+        }
+
+    if cached:
         try:
-            touch_cache_best_effort(ckey)
+            increment_cache_use(cached.get("id"))
         except Exception:
             pass
-        try:
-            try_consume_cache_slot(account_id, provider, channel)
-        except Exception:
-            pass
 
-        ans = refine_answer(cached.get("answer") or "", lang=lang)
         return {
             "ok": True,
-            "answer": ans,
-            "source": "cache",
+            "answer": cached.get("answer"),
+            "from_cache": True,
             "account_id": account_id,
-            "subscription": sub,
-            **_dbg_pack(cache_key=ckey),
+            "debug": {**translation_debug},
         }
 
-    # Cache slot check (best effort)
-    try:
-        used = int(get_cache_used_today(account_id) or 0)
-        if used >= cache_limit:
+    # 2) Credits check (unless bypass)
+    if not bypass:
+        bal = check_credit_balance(account_id)
+        if not bal.get("ok"):
+            # make sure credit service errors are visible
             return {
                 "ok": False,
-                "error": "cache_limit_reached",
-                "answer": "",
-                "message": _cache_limit_message(used, cache_limit),
-                "account_id": account_id,
-                "subscription": sub,
-                **_dbg_pack(cache_used=used, cache_limit=cache_limit),
+                "error": "credit_check_failed",
+                "root_cause": bal.get("root_cause") or bal.get("error"),
+                "fix": bal.get("fix") or "Fix credits table/RPC or RLS.",
+                "details": bal.get("details") or {"account_id": account_id},
+                "debug": {**translation_debug},
             }
-    except Exception:
-        pass
 
-    # AI credits gate (unless dev bypass)
-    if not _dev_bypass_enabled(payload):
-        ok_credits, reason, cdbg = _consume_ai_credits(account_id, cost=1)
-        if not ok_credits:
+        if bal.get("credits", 0) <= 0:
             return {
                 "ok": False,
-                "error": "no_credits",
-                "answer": "",
-                "message": "You do not have enough AI credits to answer new questions right now.",
-                "reason": reason,
-                "account_id": account_id,
-                "subscription": sub,
-                **_dbg_pack(credits=cdbg),
+                "error": "insufficient_credits",
+                "root_cause": "ai_credits_balance_zero",
+                "fix": "Top up credits or subscribe to a plan that includes AI credits.",
+                "details": {"account_id": account_id, "credits": bal.get("credits")},
+                "debug": {**translation_debug},
             }
 
-    # AI call
+    # 3) Call AI
     try:
-        ans = _call_ai_model(question, lang=lang)
+        ai = call_ai(question=question, lang=(body.get("lang") or "en"), channel=(body.get("channel") or "web"))
     except Exception as e:
+        return {
+            "ok": False,
+            "error": "ai_call_failed",
+            "root_cause": f"{type(e).__name__}: {_clip(str(e))}",
+            "fix": "Check AI provider keys, network access, and ai_service configuration.",
+            "details": {"account_id": account_id},
+            "debug": {**translation_debug},
+        }
+
+    if not isinstance(ai, dict) or not ai.get("ok"):
         return {
             "ok": False,
             "error": "ai_failed",
-            "answer": "",
-            "root_cause": f"{type(e).__name__}: {str(e)[:220]}",
-            "fix": "Check OpenAI key/config, model settings, or upstream AI provider availability.",
+            "root_cause": (ai or {}).get("root_cause") or (ai or {}).get("error") or "unknown_ai_failure",
+            "fix": (ai or {}).get("fix") or "Inspect ai_service logs.",
+            "details": {"account_id": account_id},
+            "debug": {**translation_debug},
         }
-
-    ans = refine_answer(ans, lang=lang)
-
-    # Cache write best effort
-    try:
-        upsert_ai_answer_to_cache_best_effort(ckey, question=question, answer=ans, lang=lang)
-    except Exception:
-        pass
-
-    # Consume cache slot best effort
-    try:
-        try_consume_cache_slot(account_id, provider, channel)
-    except Exception:
-        pass
 
     return {
         "ok": True,
-        "answer": ans,
-        "source": "ai",
+        "answer": ai.get("answer"),
+        "from_cache": False,
         "account_id": account_id,
-        "subscription": sub,
-        **_dbg_pack(cache_key=ckey),
+        "debug": {**translation_debug},
     }
