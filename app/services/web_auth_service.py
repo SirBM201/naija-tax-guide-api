@@ -8,7 +8,6 @@ import hashlib
 from typing import Any, Dict, Optional, Tuple
 
 from flask import Request
-
 from app.core.supabase_client import get_supabase_client
 
 
@@ -34,7 +33,11 @@ SESSION_COOKIE_NAME = WEB_AUTH_COOKIE_NAME
 TOKEN_TTL_SECONDS = int(os.getenv("WEB_TOKEN_TTL_SECONDS", "2592000"))  # 30 days
 TOKEN_LENGTH_BYTES = int(os.getenv("WEB_TOKEN_BYTES", "32"))
 
-BYPASS_TOKEN = (os.getenv("BYPASS_TOKEN") or "").strip()
+# Optional pepper for hashing tokens (recommended)
+TOKEN_HASH_PEPPER = (os.getenv("WEB_TOKEN_PEPPER") or os.getenv("TOKEN_HASH_PEPPER") or "").strip()
+
+# Dev bypass (optional)
+BYPASS_TOKEN = (os.getenv("BYPASS_TOKEN") or os.getenv("DEV_BYPASS_TOKEN") or "").strip()
 
 
 # -----------------------------
@@ -83,13 +86,32 @@ def _extract_dev_bypass(req: Request) -> bool:
 
 
 def _random_token() -> str:
-    # return raw token to client; only store hash in db
+    # token returned to client; only hash is stored in DB
     return secrets.token_urlsafe(TOKEN_LENGTH_BYTES)
 
 
-def _safe_supabase_err(res) -> Optional[str]:
+def _token_hash(token_plain: str) -> str:
+    # Use pepper if provided (recommended)
+    material = f"{TOKEN_HASH_PEPPER}:{token_plain}" if TOKEN_HASH_PEPPER else token_plain
+    return _sha256_hex(material)
+
+
+def _sb_error_str(res: Any) -> Optional[str]:
     err = getattr(res, "error", None)
-    return str(err) if err else None
+    if not err:
+        return None
+    return str(err)
+
+
+def _safe_insert_otp_row(sb, row: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+    try:
+        res = sb.table(OTP_TABLE).insert(row).execute()
+        err = _sb_error_str(res)
+        if err:
+            return False, err
+        return True, None
+    except Exception as e:
+        return False, repr(e)
 
 
 # -----------------------------
@@ -131,13 +153,9 @@ def request_email_otp(
         "channel": "email",
     }
 
-    try:
-        res = sb.table(OTP_TABLE).insert(row).execute()
-        err = _safe_supabase_err(res)
-        if err:
-            return {"ok": False, "error": "otp_insert_failed", "root_cause": err}
-    except Exception as e:
-        return {"ok": False, "error": "otp_insert_failed", "root_cause": repr(e)}
+    ok, err = _safe_insert_otp_row(sb, row)
+    if not ok:
+        return {"ok": False, "error": "otp_insert_failed", "root_cause": err}
 
     return {
         "ok": True,
@@ -180,7 +198,7 @@ def verify_email_otp(email: str, otp_code: str, purpose: str | None = None) -> D
             .limit(10)
             .execute()
         )
-        err = _safe_supabase_err(res)
+        err = _sb_error_str(res)
         if err:
             return {"ok": False, "error": "otp_lookup_failed", "root_cause": err}
         rows = res.data or []
@@ -216,7 +234,7 @@ def verify_email_otp(email: str, otp_code: str, purpose: str | None = None) -> D
         except Exception:
             pass
 
-        return {"ok": False, "error": "otp_invalid"}
+        return {"ok": False, "error": "otp_invalid", "attempts": attempts, "max_attempts": MAX_ATTEMPTS}
 
     try:
         sb.table(OTP_TABLE).update({"used": True, "used_at": _now_ts()}).eq("id", chosen["id"]).execute()
@@ -227,8 +245,7 @@ def verify_email_otp(email: str, otp_code: str, purpose: str | None = None) -> D
 
 
 # -----------------------------
-# Account + token issuance (MATCHES your schema)
-# web_tokens columns: token_hash, account_id, expires_at, revoked, last_seen_at, created_at
+# Account + token issuance
 # -----------------------------
 def _ensure_web_account(contact_email: str) -> Tuple[Optional[str], Optional[str]]:
     sb = get_supabase_client(admin=True)
@@ -245,7 +262,7 @@ def _ensure_web_account(contact_email: str) -> Tuple[Optional[str], Optional[str
             .limit(1)
             .execute()
         )
-        err = _safe_supabase_err(res)
+        err = _sb_error_str(res)
         if err:
             return None, err
 
@@ -260,7 +277,7 @@ def _ensure_web_account(contact_email: str) -> Tuple[Optional[str], Optional[str
             "updated_at": _now_ts(),
         }
         res2 = sb.table(ACCOUNTS_TABLE).insert(ins).execute()
-        err2 = _safe_supabase_err(res2)
+        err2 = _sb_error_str(res2)
         if err2:
             return None, err2
 
@@ -274,10 +291,14 @@ def _ensure_web_account(contact_email: str) -> Tuple[Optional[str], Optional[str
 
 
 def _issue_web_token(account_id: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    IMPORTANT: Your Supabase table stores token_hash (NOT token).
+    So we return token_plain to client, and store only token_hash in DB.
+    """
     sb = get_supabase_client(admin=True)
 
     token_plain = _random_token()
-    token_hash = _sha256_hex(token_plain)
+    token_hash = _token_hash(token_plain)
     expires_at = _ts_plus(TOKEN_TTL_SECONDS)
 
     row = {
@@ -291,12 +312,26 @@ def _issue_web_token(account_id: str) -> Tuple[Optional[str], Optional[str], Opt
 
     try:
         res = sb.table(TOKEN_TABLE).insert(row).execute()
-        err = _safe_supabase_err(res)
+        err = _sb_error_str(res)
         if err:
             return None, None, err
         return token_plain, expires_at, None
     except Exception as e:
         return None, None, repr(e)
+
+
+def _revoke_token_by_plain(sb, token_plain: str) -> Tuple[bool, Optional[str]]:
+    if not token_plain:
+        return False, "token_required"
+    try:
+        th = _token_hash(token_plain)
+        res = sb.table(TOKEN_TABLE).update({"revoked": True}).eq("token_hash", th).execute()
+        err = _sb_error_str(res)
+        if err:
+            return False, err
+        return True, None
+    except Exception as e:
+        return False, repr(e)
 
 
 def verify_web_otp_and_issue_token(contact: str, otp: str, purpose: str | None = None) -> Dict[str, Any]:
@@ -312,93 +347,17 @@ def verify_web_otp_and_issue_token(contact: str, otp: str, purpose: str | None =
     if err or not account_id:
         return {"ok": False, "error": "account_error", "root_cause": err}
 
-    token, expires_at, err2 = _issue_web_token(account_id)
-    if err2 or not token:
+    token_plain, expires_at, err2 = _issue_web_token(account_id)
+    if err2 or not token_plain:
         return {"ok": False, "error": "token_issue_failed", "root_cause": err2}
 
     return {
         "ok": True,
         "account_id": account_id,
-        "token": token,  # plaintext to client
+        "token": token_plain,
         "expires_at": expires_at,
         "cookie_name": SESSION_COOKIE_NAME,
     }
-
-
-def _revoke_token_by_plain(sb, token_plain: str) -> Tuple[bool, Optional[str]]:
-    if not token_plain:
-        return False, "token_required"
-    token_hash = _sha256_hex(token_plain)
-    try:
-        res = sb.table(TOKEN_TABLE).update({"revoked": True}).eq("token_hash", token_hash).execute()
-        err = _safe_supabase_err(res)
-        if err:
-            return False, err
-        return True, None
-    except Exception as e:
-        return False, repr(e)
-
-
-def get_account_id_from_request(req: Request) -> Tuple[Optional[str], Dict[str, Any]]:
-    debug: Dict[str, Any] = {"cookie": {"name": SESSION_COOKIE_NAME}}
-
-    if _extract_dev_bypass(req):
-        debug["source"] = "bypass"
-        debug["bypass"] = True
-        return None, debug
-
-    sb = get_supabase_client(admin=True)
-
-    def _lookup(token_plain: str, source: str) -> Tuple[Optional[str], Dict[str, Any]]:
-        token_hash = _sha256_hex(token_plain)
-        debug["source"] = source
-        try:
-            res = (
-                sb.table(TOKEN_TABLE)
-                .select("account_id, expires_at, revoked")
-                .eq("token_hash", token_hash)
-                .limit(1)
-                .execute()
-            )
-            err = _safe_supabase_err(res)
-            if err:
-                debug["token_error"] = err
-                return None, debug
-
-            row = (res.data or [None])[0]
-            if not row or not row.get("account_id"):
-                return None, debug
-
-            if row.get("revoked") is True:
-                debug["revoked"] = True
-                return None, debug
-
-            expires_at = (row.get("expires_at") or "").strip()
-            if expires_at and expires_at < _now_ts():
-                debug["expired"] = True
-                return None, debug
-
-            # best-effort update last_seen_at
-            try:
-                sb.table(TOKEN_TABLE).update({"last_seen_at": _now_ts()}).eq("token_hash", token_hash).execute()
-            except Exception:
-                pass
-
-            return row["account_id"], debug
-        except Exception as e:
-            debug["token_error"] = repr(e)
-            return None, debug
-
-    bearer = _extract_bearer(req)
-    if bearer:
-        return _lookup(bearer, "bearer")
-
-    cookie_token = (req.cookies.get(SESSION_COOKIE_NAME) or "").strip()
-    if cookie_token:
-        return _lookup(cookie_token, "cookie")
-
-    debug["source"] = "none"
-    return None, debug
 
 
 def logout_web_session(req: Request) -> Dict[str, Any]:
@@ -431,3 +390,98 @@ def request_web_otp(
     **_: Any,
 ) -> Dict[str, Any]:
     return request_email_otp(contact, purpose=purpose, request_ip=ip, device_id=device_id, user_agent=user_agent)
+
+
+def verify_web_otp(
+    contact: str,
+    otp: str,
+    purpose: str | None = None,
+    **_: Any,
+) -> Dict[str, Any]:
+    return verify_email_otp(contact, otp_code=otp, purpose=purpose)
+
+
+def get_account_id_from_request(req: Request) -> Tuple[Optional[str], Dict[str, Any]]:
+    """
+    Reads either:
+      - Bearer token (Authorization: Bearer <token_plain>)
+      - Cookie token (ntg_session=<token_plain>)
+    Then hashes it and matches against web_tokens.token_hash.
+
+    Also checks:
+      - revoked must be false
+      - expires_at must be in the future
+    """
+    debug: Dict[str, Any] = {"cookie": {"name": SESSION_COOKIE_NAME}}
+
+    if _extract_dev_bypass(req):
+        debug["source"] = "bypass"
+        debug["bypass"] = True
+        return None, debug
+
+    sb = get_supabase_client(admin=True)
+
+    bearer = _extract_bearer(req)
+    if bearer:
+        debug["source"] = "bearer"
+        try:
+            th = _token_hash(bearer)
+            res = (
+                sb.table(TOKEN_TABLE)
+                .select("account_id, expires_at, revoked")
+                .eq("token_hash", th)
+                .limit(1)
+                .execute()
+            )
+            err = _sb_error_str(res)
+            if err:
+                debug["token_error"] = err
+                return None, debug
+
+            row = (res.data or [None])[0]
+            if row and row.get("account_id"):
+                if row.get("revoked") is True:
+                    debug["auth_state"] = "revoked"
+                    return None, debug
+                expires_at = (row.get("expires_at") or "").strip()
+                if expires_at and expires_at < _now_ts():
+                    debug["auth_state"] = "expired"
+                    return None, debug
+                return row["account_id"], debug
+        except Exception as e:
+            debug["token_error"] = repr(e)
+            return None, debug
+
+    cookie_token = (req.cookies.get(SESSION_COOKIE_NAME) or "").strip()
+    if cookie_token:
+        debug["source"] = "cookie"
+        try:
+            th = _token_hash(cookie_token)
+            res = (
+                sb.table(TOKEN_TABLE)
+                .select("account_id, expires_at, revoked")
+                .eq("token_hash", th)
+                .limit(1)
+                .execute()
+            )
+            err = _sb_error_str(res)
+            if err:
+                debug["cookie_error"] = err
+                return None, debug
+
+            row = (res.data or [None])[0]
+            if row and row.get("account_id"):
+                if row.get("revoked") is True:
+                    debug["auth_state"] = "revoked"
+                    return None, debug
+                expires_at = (row.get("expires_at") or "").strip()
+                if expires_at and expires_at < _now_ts():
+                    debug["auth_state"] = "expired"
+                    return None, debug
+                return row["account_id"], debug
+        except Exception as e:
+            debug["cookie_error"] = repr(e)
+            return None, debug
+
+    debug["source"] = "none"
+    return None, debug
