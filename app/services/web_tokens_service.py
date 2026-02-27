@@ -1,186 +1,209 @@
 # app/services/web_tokens_service.py
 from __future__ import annotations
 
+import hashlib
 import os
-from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple
+import secrets
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
-from flask import Request
-
-from app.core.supabase_client import supabase
-from app.core.auth import token_hash
-from app.core.config import WEB_TOKEN_TABLE
-
-DEFAULT_TABLE = WEB_TOKEN_TABLE or "web_tokens"
+import httpx
 
 
-def _env(name: str, default: str = "") -> str:
-    return (os.getenv(name, default) or default).strip()
-
-
-def _table_name(default: str = DEFAULT_TABLE) -> str:
-    return (_env("WEB_TOKEN_TABLE") or default).strip() or default
-
-
-def _cookie_name() -> str:
-    return (_env("WEB_AUTH_COOKIE_NAME") or _env("WEB_COOKIE_NAME") or "ntg_session").strip()
-
-
-def _sb():
-    return supabase() if callable(supabase) else supabase
-
-
-def _now_utc() -> datetime:
+def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _parse_iso(value: Any) -> Optional[datetime]:
-    if not value:
-        return None
-    try:
-        v = str(value).replace("Z", "+00:00")
-        dt = datetime.fromisoformat(v)
-        return dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-    except Exception:
-        return None
+def _truthy(v: str | None) -> bool:
+    return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-def _iso(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+def _split_peppers(v: str) -> List[str]:
+    # Allow "pep1,pep2,pep3" for rotation / rollback
+    out: List[str] = []
+    for part in (v or "").split(","):
+        p = part.strip()
+        if p:
+            out.append(p)
+    return out
 
 
-def _has_column(table: str, col: str) -> bool:
-    try:
-        _sb().table(table).select(col).limit(1).execute()
-        return True
-    except Exception:
-        return False
-
-
-def extract_bearer_token(req: Request) -> Optional[str]:
-    auth = (req.headers.get("Authorization") or "").strip()
-    if auth.lower().startswith("bearer "):
-        t = auth[7:].strip()
-        return t or None
-    t2 = (req.headers.get("X-Auth-Token") or "").strip()
-    return t2 or None
-
-
-def extract_cookie_token(req: Request, cookie_name: Optional[str] = None) -> Optional[str]:
-    name = (cookie_name or _cookie_name()).strip() or _cookie_name()
-    try:
-        t = (req.cookies.get(name) or "").strip()
-        return t or None
-    except Exception:
-        return None
-
-
-def extract_any_token(req: Request) -> Tuple[Optional[str], Optional[str]]:
+def _get_web_token_peppers() -> List[str]:
     """
-    Returns (token, source) where source is:
-      - "cookie"
-      - "bearer"
-      - None
-    Cookie-first (matches require_auth_plus).
+    Pepper list for verifying tokens.
+    First pepper is used to MINT new tokens.
+    Others are accepted to VERIFY existing tokens (rotation support).
     """
-    t = extract_cookie_token(req)
-    if t:
-        return t, "cookie"
-    t = extract_bearer_token(req)
-    if t:
-        return t, "bearer"
+    # Prefer explicit WEB_TOKEN_PEPPERS for rotation
+    peppers = _split_peppers(os.getenv("WEB_TOKEN_PEPPERS", ""))
+
+    # Backwards compat / simple setup:
+    if not peppers:
+        p = (os.getenv("WEB_TOKEN_PEPPER") or "").strip()
+        if p:
+            peppers = [p]
+
+    # If still empty, try legacy names (avoid lockout)
+    if not peppers:
+        legacy = (os.getenv("TOKEN_HASH_PEPPER") or os.getenv("AUTH_TOKEN_PEPPER") or "").strip()
+        if legacy:
+            peppers = [legacy]
+
+    return peppers
+
+
+def _hash_token_plain(token_plain: str, pepper: str) -> str:
+    # Deterministic, stable: sha256(f"{pepper}:{token_plain}")
+    s = f"{pepper}:{token_plain}".encode("utf-8")
+    return hashlib.sha256(s).hexdigest()
+
+
+@dataclass(frozen=True)
+class WebTokenRow:
+    id: str
+    account_id: str
+    token_hash: str
+    created_at: Optional[str]
+    expires_at: Optional[str]
+    revoked: bool
+
+
+class WebTokensStore:
+    """
+    Minimal Supabase REST wrapper for table web_tokens.
+    Uses service role key.
+    """
+
+    def __init__(self) -> None:
+        self.supabase_url = (os.getenv("SUPABASE_URL") or "").strip()
+        self.service_key = (os.getenv("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
+
+        self.table = (os.getenv("WEB_TOKEN_TABLE") or "web_tokens").strip()
+        self.col_token_hash = (os.getenv("WEB_TOKEN_COL_TOKEN") or "token_hash").strip()
+        self.col_account_id = (os.getenv("WEB_TOKEN_COL_ACCOUNT_ID") or "account_id").strip()
+        self.col_expires_at = (os.getenv("WEB_TOKEN_COL_EXPIRES_AT") or "expires_at").strip()
+        # your DB currently uses boolean 'revoked' (per screenshot)
+        self.col_revoked = (os.getenv("WEB_TOKEN_COL_REVOKED") or "revoked").strip()
+
+        if not self.supabase_url or not self.service_key:
+            raise RuntimeError("SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY is missing")
+
+    def _headers(self) -> Dict[str, str]:
+        return {
+            "apikey": self.service_key,
+            "Authorization": f"Bearer {self.service_key}",
+            "Content-Type": "application/json",
+        }
+
+    def find_by_hash(self, token_hash: str) -> Optional[WebTokenRow]:
+        url = f"{self.supabase_url}/rest/v1/{self.table}"
+        params = {
+            "select": "*",
+            self.col_token_hash: f"eq.{token_hash}",
+            "limit": "1",
+        }
+        r = httpx.get(url, headers=self._headers(), params=params, timeout=15)
+        r.raise_for_status()
+        rows = r.json() or []
+        if not rows:
+            return None
+        row = rows[0]
+        return WebTokenRow(
+            id=str(row.get("id")),
+            account_id=str(row.get(self.col_account_id)),
+            token_hash=str(row.get(self.col_token_hash)),
+            created_at=row.get("created_at"),
+            expires_at=row.get(self.col_expires_at),
+            revoked=bool(row.get(self.col_revoked, False)),
+        )
+
+    def insert_token(self, account_id: str, token_hash: str, expires_at_iso: str) -> Dict[str, Any]:
+        url = f"{self.supabase_url}/rest/v1/{self.table}"
+        payload = {
+            self.col_account_id: account_id,
+            self.col_token_hash: token_hash,
+            self.col_expires_at: expires_at_iso,
+            self.col_revoked: False,
+        }
+        r = httpx.post(url, headers={**self._headers(), "Prefer": "return=representation"}, json=payload, timeout=15)
+        r.raise_for_status()
+        rows = r.json() or []
+        return rows[0] if rows else {}
+
+    def revoke_token(self, token_hash: str) -> None:
+        url = f"{self.supabase_url}/rest/v1/{self.table}"
+        params = {self.col_token_hash: f"eq.{token_hash}"}
+        payload = {self.col_revoked: True}
+        r = httpx.patch(url, headers=self._headers(), params=params, json=payload, timeout=15)
+        r.raise_for_status()
+
+
+def mint_web_token(account_id: str) -> Tuple[str, str]:
+    """
+    Returns (token_plain, token_hash).
+    IMPORTANT:
+      - token_plain is what you store in cookie / send to frontend
+      - token_hash is what you store in DB (web_tokens.token_hash)
+    """
+    peppers = _get_web_token_peppers()
+    if not peppers:
+        raise RuntimeError("WEB_TOKEN_PEPPER is missing (or WEB_TOKEN_PEPPERS empty).")
+
+    token_plain = secrets.token_urlsafe(32)  # 43-ish chars
+    token_hash = _hash_token_plain(token_plain, peppers[0])
+    return token_plain, token_hash
+
+
+def get_web_session_ttl_days() -> int:
+    v = (os.getenv("WEB_SESSION_TTL_DAYS") or "").strip()
+    if v.isdigit():
+        d = int(v)
+        return max(1, min(d, 365))
+    # default 30 days
+    return 30
+
+
+def verify_web_token_plain(token_plain: str) -> Tuple[Optional[WebTokenRow], Optional[str]]:
+    """
+    Verify cookie/bearer plaintext token.
+    Returns (row, matched_pepper).
+    """
+    token_plain = (token_plain or "").strip()
+    if not token_plain:
+        return None, None
+
+    peppers = _get_web_token_peppers()
+    if not peppers:
+        return None, None
+
+    store = WebTokensStore()
+    for pepper in peppers:
+        token_hash = _hash_token_plain(token_plain, pepper)
+        row = store.find_by_hash(token_hash)
+        if row:
+            return row, pepper
+
     return None, None
 
 
-def _get_session_row_by_token(table: str, raw_token: str) -> Optional[Dict[str, Any]]:
-    raw_token = (raw_token or "").strip()
-    if not raw_token:
+def parse_iso_dt(v: Any) -> Optional[datetime]:
+    if not v:
         return None
-    th = token_hash(raw_token)
     try:
-        res = (
-            _sb()
-            .table(table)
-            .select("*")
-            .eq("token_hash", th)
-            .limit(1)
-            .execute()
-        )
-        rows = (res.data or []) if hasattr(res, "data") else []
-        return rows[0] if rows else None
+        # expects something like "2026-03-29 08:45:01.727909+00" or ISO
+        s = str(v).replace(" ", "T")
+        # Ensure timezone
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
     except Exception:
         return None
 
 
-def touch_last_seen(raw_token: str, table: str = DEFAULT_TABLE) -> None:
-    raw_token = (raw_token or "").strip()
-    table = _table_name(table)
-    if not raw_token:
-        return
-    if not _has_column(table, "last_seen_at"):
-        return
-    try:
-        th = token_hash(raw_token)
-        _sb().table(table).update({"last_seen_at": _iso(_now_utc())}).eq("token_hash", th).execute()
-    except Exception:
-        return
-
-
-def validate_token(
-    raw_token: str,
-    table: str = DEFAULT_TABLE,
-    touch: bool = True,
-) -> Tuple[bool, Dict[str, Any], Optional[str]]:
-    raw_token = (raw_token or "").strip()
-    table = _table_name(table)
-
-    if not raw_token:
-        return False, {}, "missing_token"
-
-    row = _get_session_row_by_token(table, raw_token)
-    if not row:
-        return False, {}, "invalid_token"
-
-    if row.get("revoked") is True or row.get("revoked_at"):
-        return False, {}, "token_revoked"
-
-    exp = _parse_iso(row.get("expires_at"))
-    if not exp or exp <= _now_utc():
-        return False, {}, "token_expired"
-
-    account_id = (row.get("account_id") or "").strip()
-    if not account_id:
-        return False, {}, "invalid_token"
-
-    if touch:
-        touch_last_seen(raw_token, table=table)
-
-    return True, {"account_id": account_id, "token_row": row}, None
-
-
-def revoke_token(raw_token: str, table: str = DEFAULT_TABLE) -> Tuple[bool, Optional[str]]:
-    raw_token = (raw_token or "").strip()
-    table = _table_name(table)
-
-    if not raw_token:
-        return False, "missing_token"
-
-    row = _get_session_row_by_token(table, raw_token)
-    if not row:
-        return True, None
-
-    th = token_hash(raw_token)
-    updates: Dict[str, Any] = {}
-    if _has_column(table, "revoked"):
-        updates["revoked"] = True
-    if _has_column(table, "revoked_at"):
-        updates["revoked_at"] = _iso(_now_utc())
-
-    if not updates:
-        return False, "revoke_not_supported"
-
-    try:
-        _sb().table(table).update(updates).eq("token_hash", th).execute()
-        return True, None
-    except Exception:
-        return False, "logout_failed"
+def token_is_expired(row: WebTokenRow) -> bool:
+    exp = parse_iso_dt(row.expires_at)
+    if not exp:
+        return False
+    return exp <= _utcnow()
