@@ -15,7 +15,6 @@ from app.services.web_auth_service import (
 )
 from app.services.mail_service import send_otp_email
 
-
 bp = Blueprint("web_auth", __name__)
 
 
@@ -70,8 +69,9 @@ def request_otp():
         "debug": r.get("debug", {}),
     }
 
+    # DEV ONLY (never enable in prod)
     if dev_return_plain and otp_plain:
-        out["otp"] = otp_plain  # DEV ONLY
+        out["otp"] = otp_plain
 
     return jsonify(out), 200
 
@@ -96,8 +96,8 @@ def verify_otp():
 
     if _truthy(os.getenv("COOKIE_AUTH_ENABLED", "1")):
         secure = _truthy(os.getenv("COOKIE_SECURE", "1"))
-        samesite = os.getenv("COOKIE_SAMESITE", "None")
-        max_age = int(os.getenv("COOKIE_MAX_AGE", "2592000"))
+        samesite = (os.getenv("COOKIE_SAMESITE", "None") or "None").strip()
+        max_age = int(os.getenv("COOKIE_MAX_AGE", "2592000") or "2592000")
 
         resp.set_cookie(
             WEB_AUTH_COOKIE_NAME,
