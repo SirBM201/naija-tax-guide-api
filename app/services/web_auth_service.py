@@ -15,6 +15,7 @@ WEB_AUTH_COOKIE_NAME = (os.getenv("WEB_AUTH_COOKIE_NAME", "ntg_web_token").strip
 
 TOKEN_INSERT_MAX_RETRIES = int(os.getenv("WEB_TOKEN_INSERT_MAX_RETRIES", "5") or "5")
 TOKEN_INSERT_RETRY_SLEEP_MS = int(os.getenv("WEB_TOKEN_INSERT_RETRY_SLEEP_MS", "50") or "50")
+
 REVOKE_OLD_TOKENS_ON_LOGIN = str(os.getenv("WEB_REVOKE_OLD_TOKENS_ON_LOGIN", "1")).strip().lower() in {
     "1", "true", "yes", "y", "on"
 }
@@ -28,12 +29,27 @@ def _sha256_hex(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
-def _pepper() -> str:
-    # MUST be stable. If this changes, every cookie becomes invalid instantly.
-    p = (os.getenv("AUTH_PEPPER") or "").strip()
-    if not p:
-        raise RuntimeError("AUTH_PEPPER is required and must be stable (do not leave empty)")
-    return p
+def _require_env(*names: str) -> str:
+    """
+    Return first non-empty env value from names.
+    Raise if none present.
+    """
+    for n in names:
+        v = (os.getenv(n) or "").strip()
+        if v:
+            return v
+    raise RuntimeError(f"Missing required env var. Provide one of: {', '.join(names)}")
+
+
+def _otp_pepper() -> str:
+    # Prefer specific peppers you showed in screenshots
+    # (OTP_HASH_PEPPER is commonly used name; WEB_OTP_PEPPER is also ok)
+    return _require_env("WEB_OTP_PEPPER", "OTP_HASH_PEPPER")
+
+
+def _token_pepper() -> str:
+    # Prefer specific token pepper you showed
+    return _require_env("WEB_TOKEN_PEPPER")
 
 
 def _otp_ttl_minutes() -> int:
@@ -111,11 +127,13 @@ def _sb_request(
 
 
 def _hash_otp(otp: str) -> str:
-    return _sha256_hex(f"otp:{otp}:{_pepper()}")
+    # IMPORTANT: uses OTP pepper
+    return _sha256_hex(f"otp:{otp}:{_otp_pepper()}")
 
 
 def _hash_token(token: str) -> str:
-    return _sha256_hex(f"tok:{token}:{_pepper()}")
+    # IMPORTANT: uses TOKEN pepper
+    return _sha256_hex(f"tok:{token}:{_token_pepper()}")
 
 
 def _looks_like_fk_violation(dbg: Dict[str, Any]) -> bool:
@@ -228,23 +246,16 @@ def _get_or_create_web_account(contact: str) -> Tuple[Optional[Dict[str, Any]], 
 
 
 def _revoke_all_tokens_for_account(accounts_id: str) -> None:
-    # Best-effort: do not fail login if this fails.
-    _sb_request(
-        "PATCH",
-        f"/web_tokens?account_id=eq.{accounts_id}",
-        json={"revoked": True},
-    )
+    _sb_request("PATCH", f"/web_tokens?account_id=eq.{accounts_id}", json={"revoked": True})
 
 
 def _insert_web_token(account_row: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """
-    IMPORTANT:
-    Your DB constraint is:
+    DB constraint:
       web_tokens.account_id REFERENCES accounts(id)
-
-    So we must ALWAYS insert accounts.id into web_tokens.account_id.
+    So ALWAYS insert accounts.id into web_tokens.account_id.
     """
-    accounts_id = str(account_row["id"])  # REQUIRED
+    accounts_id = str(account_row["id"])
     expires_at = (_now_utc() + timedelta(days=_token_ttl_days())).isoformat()
 
     attempts: List[Dict[str, Any]] = []
@@ -255,7 +266,7 @@ def _insert_web_token(account_row: Dict[str, Any]) -> Tuple[Optional[Dict[str, A
 
         payload = {
             "token_hash": token_hash,
-            "account_id": accounts_id,  # FK expects accounts.id
+            "account_id": accounts_id,
             "expires_at": expires_at,
             "revoked": False,
         }
@@ -272,9 +283,7 @@ def _insert_web_token(account_row: Dict[str, Any]) -> Tuple[Optional[Dict[str, A
                 "accounts_id": accounts_id,
             }, None
 
-        attempts.append(
-            {"try": n, "status": dbg.get("status"), "root_cause": dbg.get("error_body") or data, "supabase": dbg}
-        )
+        attempts.append({"try": n, "status": dbg.get("status"), "root_cause": dbg.get("error_body") or data, "supabase": dbg})
 
         if _looks_like_fk_violation(dbg):
             break
@@ -323,7 +332,6 @@ def verify_web_otp_and_issue_token(*, contact: str, otp: str, purpose: str) -> D
     if acct_err:
         return {"ok": False, **acct_err}
 
-    # Optional: revoke existing tokens for deterministic auth
     if REVOKE_OLD_TOKENS_ON_LOGIN:
         try:
             _revoke_all_tokens_for_account(str(acct["id"]))
@@ -334,7 +342,6 @@ def verify_web_otp_and_issue_token(*, contact: str, otp: str, purpose: str) -> D
     if token_err:
         return {"ok": False, "error": "token_issue_failed", **token_err}
 
-    # Public-facing account id: prefer accounts.account_id if your app uses it, else accounts.id
     public_account_id = acct.get("account_id") or acct.get("id")
 
     return {
@@ -345,10 +352,7 @@ def verify_web_otp_and_issue_token(*, contact: str, otp: str, purpose: str) -> D
         "debug": {
             "otp_id": otp_row.get("id"),
             "account_row": {"id": acct.get("id"), "account_id": acct.get("account_id")},
-            "token_insert": {
-                "token_row_id": token_res.get("token_row_id"),
-                "accounts_id": token_res.get("accounts_id"),
-            },
+            "token_insert": {"token_row_id": token_res.get("token_row_id"), "accounts_id": token_res.get("accounts_id")},
         },
     }
 
@@ -376,7 +380,6 @@ def get_account_id_from_request(req: Request) -> Tuple[Optional[str], Dict[str, 
 
     token_hash = _hash_token(token)
 
-    # Embed accounts via FK: web_tokens.account_id -> accounts.id
     params = {
         "select": "id,account_id,expires_at,revoked,last_seen_at,accounts(id,account_id)",
         "token_hash": f"eq.{token_hash}",
@@ -401,7 +404,6 @@ def get_account_id_from_request(req: Request) -> Tuple[Optional[str], Dict[str, 
     except Exception as e:
         return None, {"ok": False, "error": "token_expiry_parse_failed", "root_cause": repr(e), "token_row": row, **src_dbg}
 
-    # Resolve the PUBLIC account id
     public_account_id: Optional[str] = None
     embedded = row.get("accounts")
     if isinstance(embedded, list) and embedded:
@@ -414,10 +416,8 @@ def get_account_id_from_request(req: Request) -> Tuple[Optional[str], Dict[str, 
             public_account_id = str(embedded.get("id"))
 
     if not public_account_id:
-        # Fallback (should not be needed if embed works)
         public_account_id = str(row.get("account_id")) if row.get("account_id") else None
 
-    # Best-effort last_seen update
     try:
         _sb_request("PATCH", f"/web_tokens?id=eq.{row.get('id')}", json={"last_seen_at": _now_utc().isoformat()})
     except Exception:
