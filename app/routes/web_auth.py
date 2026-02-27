@@ -2,9 +2,6 @@
 from __future__ import annotations
 
 import os
-import smtplib
-import ssl
-from email.message import EmailMessage
 from typing import Any, Dict
 
 from flask import Blueprint, jsonify, request, make_response
@@ -17,6 +14,8 @@ from app.services.web_auth_service import (
     WEB_AUTH_COOKIE_NAME,
 )
 
+from app.services.mail_service import send_otp_email
+
 bp = Blueprint("web_auth", __name__)
 
 
@@ -24,33 +23,25 @@ def _truthy(v: str | None) -> bool:
     return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-def _smtp_enabled() -> bool:
-    return all(
-        (os.getenv("SMTP_HOST"), os.getenv("SMTP_PORT"), os.getenv("SMTP_USER"), os.getenv("SMTP_PASS"), os.getenv("SMTP_FROM"))
-    )
+def _mail_config_present() -> bool:
+    """
+    Mail sending is controlled by mail_service.py.
+    Here we only do a light check so we can give a helpful response.
+    """
+    enabled = _truthy(os.getenv("MAIL_ENABLED")) or _truthy(os.getenv("SMTP_ENABLED"))
+    if not enabled:
+        return False
 
+    # Prefer MAIL_* but also accept SMTP_* to avoid mismatch confusion.
+    host = (os.getenv("MAIL_HOST") or os.getenv("SMTP_HOST") or "").strip()
+    port = (os.getenv("MAIL_PORT") or os.getenv("SMTP_PORT") or "").strip()
+    user = (os.getenv("MAIL_USER") or os.getenv("SMTP_USER") or "").strip()
+    pw = (os.getenv("MAIL_PASS") or os.getenv("SMTP_PASS") or "").strip()
 
-def _send_otp_email(to_email: str, otp: str) -> None:
-    host = os.getenv("SMTP_HOST", "")
-    port = int(os.getenv("SMTP_PORT", "587"))
-    user = os.getenv("SMTP_USER", "")
-    pw = os.getenv("SMTP_PASS", "")
-    from_email = os.getenv("SMTP_FROM", user)
+    # From can be MAIL_FROM_EMAIL or SMTP_FROM or fallback to user
+    from_email = (os.getenv("MAIL_FROM_EMAIL") or os.getenv("SMTP_FROM") or user).strip()
 
-    subject = os.getenv("WEB_OTP_EMAIL_SUBJECT", "Your Naija Tax Guide OTP")
-    body = f"Your OTP code is: {otp}\n\nIt expires in a few minutes. If you did not request this, ignore this email."
-
-    msg = EmailMessage()
-    msg["From"] = from_email
-    msg["To"] = to_email
-    msg["Subject"] = subject
-    msg.set_content(body)
-
-    ctx = ssl.create_default_context()
-    with smtplib.SMTP(host, port, timeout=20) as server:
-        server.starttls(context=ctx)
-        server.login(user, pw)
-        server.send_message(msg)
+    return bool(host and port and user and pw and from_email)
 
 
 @bp.post("/web/auth/request-otp")
@@ -80,23 +71,29 @@ def request_otp():
 
     delivery: Dict[str, Any] = {"mode": "email", "sent": False}
 
-    # If SMTP configured, email it
-    if otp_plain and _smtp_enabled():
+    # Try to email OTP using the centralized mail_service
+    if otp_plain and _mail_config_present():
         try:
-            _send_otp_email(contact, otp_plain)
-            delivery["sent"] = True
-            delivery["provider"] = "smtp"
+            sent = bool(send_otp_email(to_email=contact, otp_code=otp_plain))
+            delivery["sent"] = sent
+            delivery["provider"] = "mail_service"
+            if not sent:
+                delivery["error"] = "email_send_failed"
+                delivery["fix"] = "Check backend logs for [mail] ERROR and confirm MAIL_* or SMTP_* env vars."
         except Exception as e:
-            # Do NOT 500; return ok but show delivery error
             delivery["sent"] = False
             delivery["error"] = "email_send_failed"
             delivery["root_cause"] = repr(e)
+            delivery["fix"] = "Check backend logs and SMTP credentials (Mailtrap username/password/host/port)."
 
-    # If SMTP not configured, do NOT 500. Optionally return OTP in dev.
-    if not delivery.get("sent") and not _smtp_enabled():
+    # If mail config not present, do NOT 500. Optionally return OTP in dev.
+    if not delivery.get("sent") and not _mail_config_present():
         delivery["sent"] = False
         delivery["error"] = "email_not_configured"
-        delivery["fix"] = "Set SMTP_* env vars on backend OR set WEB_OTP_RETURN_PLAIN=1 for dev testing."
+        delivery["fix"] = (
+            "Set MAIL_ENABLED=true and MAIL_HOST/MAIL_PORT/MAIL_USER/MAIL_PASS/MAIL_FROM_EMAIL "
+            "(or SMTP_* equivalents), OR set WEB_OTP_RETURN_PLAIN=1 for dev testing."
+        )
 
     out = {
         "ok": True,
@@ -105,6 +102,13 @@ def request_otp():
         "expires_at": r.get("expires_at"),
         "delivery": delivery,
         "debug": r.get("debug", {}),
+        "debug_mail": {
+            "mail_enabled": _truthy(os.getenv("MAIL_ENABLED")),
+            "smtp_enabled": _truthy(os.getenv("SMTP_ENABLED")),
+            "mail_config_present": _mail_config_present(),
+            "has_MAIL_HOST": bool((os.getenv("MAIL_HOST") or "").strip()),
+            "has_SMTP_HOST": bool((os.getenv("SMTP_HOST") or "").strip()),
+        },
     }
 
     if dev_return_plain and otp_plain:
@@ -129,7 +133,6 @@ def verify_otp():
         return jsonify(r), 400
 
     token = r["token"]
-
     resp = make_response(jsonify(r), 200)
 
     # cookie is optional: only enable if you want cookie auth
