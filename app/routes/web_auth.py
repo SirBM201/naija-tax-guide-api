@@ -13,35 +13,13 @@ from app.services.web_auth_service import (
     get_account_id_from_request,
     WEB_AUTH_COOKIE_NAME,
 )
-
-from app.services.mail_service import send_otp_email
+from app.services.mail_service import send_otp_email, smtp_status
 
 bp = Blueprint("web_auth", __name__)
 
 
 def _truthy(v: str | None) -> bool:
     return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
-def _mail_config_present() -> bool:
-    """
-    Mail sending is controlled by mail_service.py.
-    Here we only do a light check so we can give a helpful response.
-    """
-    enabled = _truthy(os.getenv("MAIL_ENABLED")) or _truthy(os.getenv("SMTP_ENABLED"))
-    if not enabled:
-        return False
-
-    # Prefer MAIL_* but also accept SMTP_* to avoid mismatch confusion.
-    host = (os.getenv("MAIL_HOST") or os.getenv("SMTP_HOST") or "").strip()
-    port = (os.getenv("MAIL_PORT") or os.getenv("SMTP_PORT") or "").strip()
-    user = (os.getenv("MAIL_USER") or os.getenv("SMTP_USER") or "").strip()
-    pw = (os.getenv("MAIL_PASS") or os.getenv("SMTP_PASS") or "").strip()
-
-    # From can be MAIL_FROM_EMAIL or SMTP_FROM or fallback to user
-    from_email = (os.getenv("MAIL_FROM_EMAIL") or os.getenv("SMTP_FROM") or user).strip()
-
-    return bool(host and port and user and pw and from_email)
 
 
 @bp.post("/web/auth/request-otp")
@@ -67,33 +45,23 @@ def request_otp():
         return jsonify(r), 400
 
     otp_plain = r.get("_otp_plain")  # server-only
-    dev_return_plain = _truthy(os.getenv("WEB_OTP_RETURN_PLAIN"))
+    dev_return_plain = _truthy(os.getenv("WEB_OTP_RETURN_PLAIN", "0"))
 
     delivery: Dict[str, Any] = {"mode": "email", "sent": False}
 
-    # Try to email OTP using the centralized mail_service
-    if otp_plain and _mail_config_present():
-        try:
-            sent = bool(send_otp_email(to_email=contact, otp_code=otp_plain))
-            delivery["sent"] = sent
-            delivery["provider"] = "mail_service"
-            if not sent:
-                delivery["error"] = "email_send_failed"
-                delivery["fix"] = "Check backend logs for [mail] ERROR and confirm MAIL_* or SMTP_* env vars."
-        except Exception as e:
+    if otp_plain:
+        email_res = send_otp_email(contact, otp_plain)
+        if email_res.get("ok"):
+            delivery["sent"] = True
+            delivery["provider"] = "smtp"
+        else:
             delivery["sent"] = False
-            delivery["error"] = "email_send_failed"
-            delivery["root_cause"] = repr(e)
-            delivery["fix"] = "Check backend logs and SMTP credentials (Mailtrap username/password/host/port)."
-
-    # If mail config not present, do NOT 500. Optionally return OTP in dev.
-    if not delivery.get("sent") and not _mail_config_present():
+            delivery["error"] = email_res.get("error", "email_send_failed")
+            delivery["root_cause"] = email_res.get("root_cause")
+            delivery["smtp_status"] = email_res.get("debug") or smtp_status()
+    else:
         delivery["sent"] = False
-        delivery["error"] = "email_not_configured"
-        delivery["fix"] = (
-            "Set MAIL_ENABLED=true and MAIL_HOST/MAIL_PORT/MAIL_USER/MAIL_PASS/MAIL_FROM_EMAIL "
-            "(or SMTP_* equivalents), OR set WEB_OTP_RETURN_PLAIN=1 for dev testing."
-        )
+        delivery["error"] = "otp_generation_failed"
 
     out = {
         "ok": True,
@@ -102,17 +70,11 @@ def request_otp():
         "expires_at": r.get("expires_at"),
         "delivery": delivery,
         "debug": r.get("debug", {}),
-        "debug_mail": {
-            "mail_enabled": _truthy(os.getenv("MAIL_ENABLED")),
-            "smtp_enabled": _truthy(os.getenv("SMTP_ENABLED")),
-            "mail_config_present": _mail_config_present(),
-            "has_MAIL_HOST": bool((os.getenv("MAIL_HOST") or "").strip()),
-            "has_SMTP_HOST": bool((os.getenv("SMTP_HOST") or "").strip()),
-        },
     }
 
+    # DEV ONLY: show otp
     if dev_return_plain and otp_plain:
-        out["otp"] = otp_plain  # DEV ONLY
+        out["otp"] = otp_plain
 
     return jsonify(out), 200
 
@@ -135,7 +97,7 @@ def verify_otp():
     token = r["token"]
     resp = make_response(jsonify(r), 200)
 
-    # cookie is optional: only enable if you want cookie auth
+    # cookie optional
     if _truthy(os.getenv("COOKIE_AUTH_ENABLED", "1")):
         secure = _truthy(os.getenv("COOKIE_SECURE", "1"))
         samesite = os.getenv("COOKIE_SAMESITE", "None")
