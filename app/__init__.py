@@ -186,10 +186,10 @@ def create_app() -> Flask:
         "app.routes.accounts",
         "app.routes.subscriptions",
         "app.routes.ask",
-        "app.routes.web",  # compat route
+        "app.routes.web",          # compat: /api/web/ask etc.
         "app.routes.webhooks",
         "app.routes.plans",
-        "app.routes.billing",  # ✅ billing is REQUIRED (Paystack lives here now)
+        "app.routes.billing",      # ✅ REQUIRED (your Paystack flow lives here)
         "app.routes.link_tokens",
         "app.routes.admin_link_tokens",
         "app.routes.accounts_admin",
@@ -202,6 +202,10 @@ def create_app() -> Flask:
         _register_bp(dotted, "bp", required=True, url_prefix=api_prefix)
 
     # ---------- OPTIONAL routes ----------
+    # ✅ Paystack module file was deleted, so DO NOT register it here.
+    # _register_bp("app.routes.paystack", "paystack_bp", alias_name="paystack", required=False, url_prefix=api_prefix)
+    # _register_bp("app.routes.paystack_webhook", "bp", alias_name="paystack_webhook", required=False, url_prefix=api_prefix)
+
     _register_bp("app.routes.cron", "bp", alias_name="cron", required=False, url_prefix=api_prefix)
 
     # ---------- DEBUG routes ----------
@@ -227,14 +231,6 @@ def create_app() -> Flask:
     def runtime_diag():
         hints: List[str] = []
 
-        # Focus diagnostics on what actually exists now
-        for f in boot.get("failed", []):
-            mod = (f.get("module") or "")
-            if mod == "app.routes.billing":
-                hints.append(
-                    "Billing blueprint failed. Ensure app/routes/billing.py exports: bp = Blueprint('billing', __name__)."
-                )
-
         cron_registered = any((r.get("alias_name") == "cron") for r in boot.get("registered", []))
         if not cron_registered:
             hints.append("Cron blueprint is NOT registered. Confirm app/routes/cron.py exists and exports bp = Blueprint(...).")
@@ -244,12 +240,11 @@ def create_app() -> Flask:
 
         if not (os.getenv("SUPABASE_URL") or "").strip():
             hints.append("SUPABASE_URL is missing -> Supabase RPC/table calls will fail.")
-        if not (os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_SERVICE_KEY") or "").strip():
+        if not (os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY") or "").strip():
             hints.append("SUPABASE service key is missing -> RPC/table calls may fail.")
 
-        # Paystack in this app now uses PAYSTACK_SECRET_KEY for BOTH API calls + webhook signature verification
-        if not (os.getenv("PAYSTACK_SECRET_KEY") or "").strip():
-            hints.append("PAYSTACK_SECRET_KEY is missing. Paystack init/verify and webhook signature verification will fail.")
+        if not (os.getenv("PAYSTACK_WEBHOOK_SECRET") or "").strip():
+            hints.append("PAYSTACK_WEBHOOK_SECRET is missing. Paystack signature verification will fail for /api/billing/webhook.")
 
         env_view = {
             "ADMIN_KEY_SET": bool((os.getenv("ADMIN_KEY") or "").strip()),
@@ -260,7 +255,6 @@ def create_app() -> Flask:
             "STRICT_BLUEPRINTS": strict,
             "SUPPORTS_CREDENTIALS": supports_credentials,
             "WEB_AUTH_ENABLED": _safe_get_env_bool("WEB_AUTH_ENABLED"),
-            "PAYSTACK_SECRET_KEY_SET": bool((os.getenv("PAYSTACK_SECRET_KEY") or "").strip()),
         }
 
         return jsonify({"ok": True, "request_id": _rid(), "env": env_view, "hints": hints}), 200
