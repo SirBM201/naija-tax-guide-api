@@ -38,7 +38,9 @@ def initialize_transaction(
 ) -> Dict[str, Any]:
     """
     Paystack expects amount in KOBO.
+    Returns Paystack JSON response: { status: bool, message: str, data: {...} }
     """
+    email = (email or "").strip().lower()
     if not email:
         raise ValueError("missing_email")
 
@@ -46,11 +48,15 @@ def initialize_transaction(
     if kobo <= 0:
         raise ValueError("invalid_amount_kobo")
 
+    ref = (reference or "").strip()
+    if not ref:
+        raise ValueError("missing_reference")
+
     payload: Dict[str, Any] = {
         "email": email,
         "amount": kobo,
         "currency": (currency or PAYSTACK_CURRENCY or "NGN"),
-        "reference": reference,
+        "reference": ref,
         "metadata": metadata or {},
     }
 
@@ -90,11 +96,17 @@ def verify_transaction(reference: str) -> Dict[str, Any]:
 
 
 def verify_webhook_signature(raw_body: bytes, signature_header: str) -> bool:
-    if not PAYSTACK_SECRET_KEY or not signature_header:
+    """
+    Paystack sends: x-paystack-signature = HMAC_SHA512(raw_body, secret_key)
+    """
+    sig = (signature_header or "").strip()
+    if not PAYSTACK_SECRET_KEY or not sig:
         return False
+
     mac = hmac.new(
         PAYSTACK_SECRET_KEY.encode("utf-8"),
         msg=raw_body,
         digestmod=hashlib.sha512,
     ).hexdigest()
-    return hmac.compare_digest(mac, signature_header)
+
+    return hmac.compare_digest(mac, sig)
