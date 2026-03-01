@@ -20,7 +20,6 @@ REVOKE_OLD_TOKENS_ON_LOGIN = str(os.getenv("WEB_REVOKE_OLD_TOKENS_ON_LOGIN", "1"
     "1", "true", "yes", "y", "on"
 }
 
-# If enabled, bearer failures will fall back to cookie (recommended ON for now)
 BEARER_FALLBACK_TO_COOKIE = str(os.getenv("WEB_BEARER_FALLBACK_TO_COOKIE", "1")).strip().lower() in {
     "1", "true", "yes", "y", "on"
 }
@@ -257,7 +256,7 @@ def _insert_web_token(account_row: Dict[str, Any]) -> Tuple[Optional[Dict[str, A
 
         payload = {
             "token_hash": token_hash,
-            "account_id": accounts_id,
+            "account_id": accounts_id,   # IMPORTANT: this is accounts.id
             "expires_at": expires_at,
             "revoked": False,
         }
@@ -333,11 +332,10 @@ def verify_web_otp_and_issue_token(*, contact: str, otp: str, purpose: str) -> D
     if token_err:
         return {"ok": False, "error": "token_issue_failed", **token_err}
 
-    public_account_id = acct.get("account_id") or acct.get("id")
-
+    # IMPORTANT: return accounts.id as account_id (canonical join key)
     return {
         "ok": True,
-        "account_id": str(public_account_id),
+        "account_id": str(acct.get("id")),
         "token": str(token_res["token"]),
         "expires_at": str(token_res["expires_at"]),
         "debug": {
@@ -349,9 +347,6 @@ def verify_web_otp_and_issue_token(*, contact: str, otp: str, purpose: str) -> D
 
 
 def _extract_token_candidates(req: Request) -> Tuple[str, str, Dict[str, Any]]:
-    """
-    Return (bearer_token, cookie_token, debug)
-    """
     debug: Dict[str, Any] = {"token_source": None, "has_bearer": False, "has_cookie": False}
 
     h = (req.headers.get("Authorization") or "").strip()
@@ -369,7 +364,7 @@ def _extract_token_candidates(req: Request) -> Tuple[str, str, Dict[str, Any]]:
 def _lookup_token_plain(token_plain: str) -> Tuple[Optional[str], Dict[str, Any]]:
     """
     Lookup token_plain in web_tokens by hashing it and selecting row.
-    Returns (public_account_id, debug)
+    Returns (accounts.id, debug)  <-- canonical
     """
     token_hash = _hash_token(token_plain)
 
@@ -397,26 +392,27 @@ def _lookup_token_plain(token_plain: str) -> Tuple[Optional[str], Dict[str, Any]
     except Exception as e:
         return None, {"ok": False, "error": "token_expiry_parse_failed", "root_cause": repr(e), "token_row": row, "debug": {"supabase": sb_dbg}}
 
-    public_account_id: Optional[str] = None
+    # IMPORTANT: prefer accounts.id (internal canonical id)
+    canonical_account_id: Optional[str] = None
     embedded = row.get("accounts")
     if isinstance(embedded, list) and embedded:
         embedded = embedded[0]
 
     if isinstance(embedded, dict):
-        if embedded.get("account_id"):
-            public_account_id = str(embedded.get("account_id"))
-        elif embedded.get("id"):
-            public_account_id = str(embedded.get("id"))
+        if embedded.get("id"):
+            canonical_account_id = str(embedded.get("id"))
+        elif embedded.get("account_id"):
+            canonical_account_id = str(embedded.get("account_id"))
 
-    if not public_account_id:
-        public_account_id = str(row.get("account_id")) if row.get("account_id") else None
+    if not canonical_account_id:
+        canonical_account_id = str(row.get("account_id")) if row.get("account_id") else None
 
     try:
         _sb_request("PATCH", f"/web_tokens?id=eq.{row.get('id')}", json={"last_seen_at": _now_utc().isoformat()})
     except Exception:
         pass
 
-    return public_account_id, {"ok": True, "debug": {"supabase": sb_dbg}}
+    return canonical_account_id, {"ok": True, "debug": {"supabase": sb_dbg}}
 
 
 def get_account_id_from_request(req: Request) -> Tuple[Optional[str], Dict[str, Any]]:
@@ -425,13 +421,11 @@ def get_account_id_from_request(req: Request) -> Tuple[Optional[str], Dict[str, 
     if not bearer and not cookie:
         return None, {"ok": False, "error": "missing_token", **src_dbg}
 
-    # 1) Prefer bearer if present
     if bearer:
         acc, dbg = _lookup_token_plain(bearer)
         if acc:
             return acc, {"ok": True, "token_source": "bearer", **src_dbg, "debug": dbg.get("debug")}
 
-        # 2) Fallback to cookie if enabled and cookie exists
         if BEARER_FALLBACK_TO_COOKIE and cookie:
             acc2, dbg2 = _lookup_token_plain(cookie)
             if acc2:
@@ -439,7 +433,6 @@ def get_account_id_from_request(req: Request) -> Tuple[Optional[str], Dict[str, 
 
         return None, {"ok": False, "error": "invalid_token", "token_source": "bearer", **src_dbg}
 
-    # cookie only
     acc3, dbg3 = _lookup_token_plain(cookie)
     if acc3:
         return acc3, {"ok": True, "token_source": "cookie", **src_dbg, "debug": dbg3.get("debug")}
