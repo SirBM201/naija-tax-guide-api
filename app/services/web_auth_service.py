@@ -11,7 +11,14 @@ from typing import Any, Dict, Optional, Tuple, List
 import requests
 from flask import Request
 
+# -------------------- ENV / TABLE NAMES --------------------
+
 WEB_AUTH_COOKIE_NAME = (os.getenv("WEB_AUTH_COOKIE_NAME", "ntg_web_token").strip() or "ntg_web_token")
+
+# Table names (overrideable)
+ACCOUNTS_TABLE = (os.getenv("ACCOUNTS_TABLE", "accounts").strip() or "accounts")
+WEB_OTP_TABLE = (os.getenv("WEB_OTP_TABLE", "web_otps").strip() or "web_otps")
+WEB_TOKEN_TABLE = (os.getenv("WEB_TOKEN_TABLE", "web_tokens").strip() or "web_tokens")
 
 TOKEN_INSERT_MAX_RETRIES = int(os.getenv("WEB_TOKEN_INSERT_MAX_RETRIES", "5") or "5")
 TOKEN_INSERT_RETRY_SLEEP_MS = int(os.getenv("WEB_TOKEN_INSERT_RETRY_SLEEP_MS", "50") or "50")
@@ -160,6 +167,11 @@ def _looks_like_unique_violation(dbg: Dict[str, Any]) -> bool:
     return ("23505" in body) or (dbg.get("status") == 409) or ("duplicate key" in body.lower()) or ("unique" in body.lower())
 
 
+def _looks_like_email(v: str) -> bool:
+    v = (v or "").strip().lower()
+    return ("@" in v) and ("." in v.split("@")[-1])
+
+
 # -------------------- OTP Request --------------------
 
 def request_web_otp(
@@ -193,7 +205,7 @@ def request_web_otp(
         "sent_to": contact,
     }
 
-    ok, data, dbg = _sb_request("POST", "/web_otps", json=row)
+    ok, data, dbg = _sb_request("POST", f"/{WEB_OTP_TABLE}", json=row)
     if not ok:
         return _fail(
             stage="otp_insert",
@@ -211,7 +223,7 @@ def request_web_otp(
         "_otp_plain": otp_plain,
         "debug": {
             "received": {"device_id": device_id, "ip": ip, "user_agent_present": bool(user_agent)},
-            "tables": {"otp_table": "web_otps", "token_table": "web_tokens", "accounts_table": "accounts"},
+            "tables": {"otp_table": WEB_OTP_TABLE, "token_table": WEB_TOKEN_TABLE, "accounts_table": ACCOUNTS_TABLE},
             "supabase": dbg,
             "otp_row_id": (created or {}).get("id"),
         },
@@ -226,7 +238,7 @@ def _find_latest_otp(contact: str, purpose: str) -> Tuple[Optional[Dict[str, Any
         "order": "created_at.desc",
         "limit": "10",
     }
-    ok, data, dbg = _sb_request("GET", "/web_otps", params=params)
+    ok, data, dbg = _sb_request("GET", f"/{WEB_OTP_TABLE}", params=params)
     if not ok:
         return None, _fail(stage="otp_lookup", error="otp_lookup_failed", root_cause=dbg.get("error_body") or data, debug=dbg)
 
@@ -237,7 +249,7 @@ def _find_latest_otp(contact: str, purpose: str) -> Tuple[Optional[Dict[str, Any
 def _mark_otp_used(otp_id: str) -> Dict[str, Any]:
     ok, data, dbg = _sb_request(
         "PATCH",
-        f"/web_otps?id=eq.{otp_id}",
+        f"/{WEB_OTP_TABLE}?id=eq.{otp_id}",
         json={"used": True, "used_at": _now_utc().isoformat()},
     )
     if ok:
@@ -245,7 +257,7 @@ def _mark_otp_used(otp_id: str) -> Dict[str, Any]:
     return _fail(stage="otp_mark_used", error="otp_mark_used_failed", root_cause=dbg.get("error_body") or data, debug=dbg)
 
 
-# -------------------- Accounts (email persistence) --------------------
+# -------------------- Accounts (email persistence + canonical account_id) --------------------
 
 def _ensure_account_email(accounts_id: str, contact_email: str) -> Tuple[bool, Dict[str, Any]]:
     """
@@ -255,9 +267,8 @@ def _ensure_account_email(accounts_id: str, contact_email: str) -> Tuple[bool, D
 
     Returns (ok, debug/err dict)
     """
-    # Read current email
-    params = {"select": "id,email", "id": f"eq.{accounts_id}", "limit": "1"}
-    ok, data, dbg = _sb_request("GET", "/accounts", params=params)
+    params = {"select": "id,email,provider_user_id", "id": f"eq.{accounts_id}", "limit": "1"}
+    ok, data, dbg = _sb_request("GET", f"/{ACCOUNTS_TABLE}", params=params)
     if not ok:
         return False, _fail(stage="accounts_email_read", error="accounts_email_read_failed", root_cause=dbg.get("error_body") or data, debug=dbg)
 
@@ -268,13 +279,37 @@ def _ensure_account_email(accounts_id: str, contact_email: str) -> Tuple[bool, D
     if existing_email:
         return True, {"ok": True, "already_set": True, "email": existing_email}
 
-    # Patch email
     patch = {"email": contact_email, "updated_at": _now_utc().isoformat()}
-    ok2, data2, dbg2 = _sb_request("PATCH", f"/accounts?id=eq.{accounts_id}", json=patch)
+    ok2, data2, dbg2 = _sb_request("PATCH", f"/{ACCOUNTS_TABLE}?id=eq.{accounts_id}", json=patch)
     if not ok2:
         return False, _fail(stage="accounts_email_patch", error="accounts_email_patch_failed", root_cause=dbg2.get("error_body") or data2, debug=dbg2)
 
     return True, {"ok": True, "updated": True, "email": contact_email, "supabase": dbg2}
+
+
+def _ensure_account_account_id(accounts_id: str) -> Tuple[bool, Dict[str, Any]]:
+    """
+    Ensures accounts.account_id is populated (canonical identity).
+    If account_id is NULL/blank, set it to id.
+    """
+    params = {"select": "id,account_id", "id": f"eq.{accounts_id}", "limit": "1"}
+    ok, data, dbg = _sb_request("GET", f"/{ACCOUNTS_TABLE}", params=params)
+    if not ok:
+        return False, _fail(stage="accounts_account_id_read", error="accounts_account_id_read_failed", root_cause=dbg.get("error_body") or data, debug=dbg)
+
+    rows = data if isinstance(data, list) else []
+    row = rows[0] if rows else {}
+    current = (row.get("account_id") or "").strip()
+
+    if current:
+        return True, {"ok": True, "already_set": True, "account_id": current}
+
+    patch = {"account_id": accounts_id, "updated_at": _now_utc().isoformat()}
+    ok2, data2, dbg2 = _sb_request("PATCH", f"/{ACCOUNTS_TABLE}?id=eq.{accounts_id}", json=patch)
+    if not ok2:
+        return False, _fail(stage="accounts_account_id_patch", error="accounts_account_id_patch_failed", root_cause=dbg2.get("error_body") or data2, debug=dbg2)
+
+    return True, {"ok": True, "updated": True, "account_id": accounts_id, "supabase": dbg2}
 
 
 def _get_or_create_web_account(contact: str) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
@@ -282,50 +317,73 @@ def _get_or_create_web_account(contact: str) -> Tuple[Optional[Dict[str, Any]], 
     Accounts table expected:
       - provider = 'web'
       - provider_user_id = contact (email)
-      - email column now exists and will be stored/backfilled
+      - email column exists and will be stored/backfilled
+      - account_id column (canonical) is ensured to be populated (set to id if NULL)
     """
     params = {
-        "select": "id,account_id,provider,provider_user_id,email,created_at,updated_at",
+        "select": "id,account_id,provider,provider_user_id,email,created_at,updated_at,display_name",
         "provider": "eq.web",
         "provider_user_id": f"eq.{contact}",
         "limit": "1",
     }
-    ok, data, dbg = _sb_request("GET", "/accounts", params=params)
+    ok, data, dbg = _sb_request("GET", f"/{ACCOUNTS_TABLE}", params=params)
     if not ok:
         return None, _fail(stage="account_lookup", error="account_lookup_failed", root_cause=dbg.get("error_body") or data, debug=dbg)
 
     rows = data if isinstance(data, list) else []
     if rows:
-        acct = rows[0]
-        # Backfill email if missing
-        accounts_id = str(acct.get("id") or "")
+        acct = rows[0] or {}
+        accounts_id = str(acct.get("id") or "").strip()
+
+        warnings: Dict[str, Any] = {}
         if accounts_id:
-            ok2, info = _ensure_account_email(accounts_id, contact)
-            if not ok2:
-                # Not fatal for login, but expose it clearly
-                acct["_email_warning"] = info
+            ok_e, info_e = _ensure_account_email(accounts_id, contact)
+            if not ok_e:
+                warnings["email"] = info_e
+
+            ok_a, info_a = _ensure_account_account_id(accounts_id)
+            if not ok_a:
+                warnings["account_id"] = info_a
+
+        if warnings:
+            acct["_persist_warnings"] = warnings
+
         return acct, None
 
-    # Create new account row with email
+    # Create new account row WITH email.
+    # account_id may be NULL depending on DB defaults, so we patch it after insert.
     row = {
         "provider": "web",
         "provider_user_id": contact,
         "email": contact,
+        "display_name": contact,
         "created_at": _now_utc().isoformat(),
         "updated_at": _now_utc().isoformat(),
     }
-    ok, data, dbg = _sb_request("POST", "/accounts", json=row)
+    ok, data, dbg = _sb_request("POST", f"/{ACCOUNTS_TABLE}", json=row)
     if not ok:
         return None, _fail(stage="account_create", error="account_create_failed", root_cause=dbg.get("error_body") or data, debug=dbg)
 
-    created = data[0] if isinstance(data, list) and data else data
+    created = data[0] if isinstance(data, list) and data else (data or {})
+    accounts_id = str((created or {}).get("id") or "").strip()
+
+    warnings: Dict[str, Any] = {}
+    if accounts_id:
+        ok_a, info_a = _ensure_account_account_id(accounts_id)
+        if not ok_a:
+            warnings["account_id"] = info_a
+
+    if warnings:
+        created["_persist_warnings"] = warnings
+
     return created, None
 
 
 # -------------------- Tokens --------------------
 
 def _revoke_all_tokens_for_account(accounts_id: str) -> None:
-    _sb_request("PATCH", f"/web_tokens?account_id=eq.{accounts_id}", json={"revoked": True})
+    # Best-effort
+    _sb_request("PATCH", f"/{WEB_TOKEN_TABLE}?account_id=eq.{accounts_id}", json={"revoked": True})
 
 
 def _insert_web_token(account_row: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
@@ -340,12 +398,12 @@ def _insert_web_token(account_row: Dict[str, Any]) -> Tuple[Optional[Dict[str, A
 
         payload = {
             "token_hash": token_hash,
-            "account_id": accounts_id,  # accounts.id
+            "account_id": accounts_id,  # FK -> accounts.id
             "expires_at": expires_at,
             "revoked": False,
         }
 
-        ok, data, dbg = _sb_request("POST", "/web_tokens", json=payload)
+        ok, data, dbg = _sb_request("POST", f"/{WEB_TOKEN_TABLE}", json=payload)
         if ok:
             created = data[0] if isinstance(data, list) and data else data
             return {
@@ -423,26 +481,32 @@ def verify_web_otp_and_issue_token(*, contact: str, otp: str, purpose: str) -> D
     if token_err:
         return {"ok": False, **token_err}
 
-    # email persistence info (non-fatal but exposed)
-    email_warning = acct.get("_email_warning")
+    warnings = acct.get("_persist_warnings") or {}
+
+    # IMPORTANT:
+    # - return account_id as CANONICAL accounts.account_id if present, else fallback to accounts.id
+    canonical_account_id = str((acct.get("account_id") or acct.get("id") or "")).strip()
 
     return {
         "ok": True,
-        "account_id": str(acct.get("id")),  # canonical accounts.id
+        "account_id": canonical_account_id,
         "token": str(token_res["token"]),
         "expires_at": str(token_res["expires_at"]),
         "debug": {
             "otp_id": otp_row.get("id"),
+            "tables": {"otp_table": WEB_OTP_TABLE, "token_table": WEB_TOKEN_TABLE, "accounts_table": ACCOUNTS_TABLE},
             "account_row": {
                 "id": acct.get("id"),
                 "account_id": acct.get("account_id"),
+                "provider": acct.get("provider"),
+                "provider_user_id": acct.get("provider_user_id"),
                 "email": acct.get("email") or contact,
             },
             "token_insert": {
                 "token_row_id": token_res.get("token_row_id"),
                 "accounts_id": token_res.get("accounts_id"),
             },
-            "email_persist": email_warning or {"ok": True},
+            "persist_warnings": warnings or {"ok": True},
         },
     }
 
@@ -473,12 +537,14 @@ def _extract_token_candidates(req: Request) -> Tuple[str, str, Dict[str, Any]]:
 def _lookup_token_plain(token_plain: str) -> Tuple[Optional[str], Dict[str, Any]]:
     token_hash = _hash_token(token_plain)
 
+    # Some projects have no foreign-table embed relationship configured.
+    # We still try embed, but we also work without it.
     params = {
-        "select": "id,account_id,expires_at,revoked,last_seen_at,accounts(id,account_id)",
+        "select": "id,account_id,expires_at,revoked,last_seen_at,accounts(id,account_id,email,provider,provider_user_id)",
         "token_hash": f"eq.{token_hash}",
         "limit": "1",
     }
-    ok, data, sb_dbg = _sb_request("GET", "/web_tokens", params=params)
+    ok, data, sb_dbg = _sb_request("GET", f"/{WEB_TOKEN_TABLE}", params=params)
     if not ok:
         return None, _fail(stage="token_lookup", error="token_lookup_failed", root_cause=sb_dbg.get("error_body") or data, debug=sb_dbg)
 
@@ -497,22 +563,24 @@ def _lookup_token_plain(token_plain: str) -> Tuple[Optional[str], Dict[str, Any]
     except Exception as e:
         return None, _fail(stage="token_expiry_parse", error="token_expiry_parse_failed", root_cause=repr(e), extra={"token_row": row}, debug={"supabase": sb_dbg})
 
+    # Canonical: accounts.account_id if present, else accounts.id, else token row account_id
     canonical_account_id: Optional[str] = None
     embedded = row.get("accounts")
     if isinstance(embedded, list) and embedded:
         embedded = embedded[0]
 
     if isinstance(embedded, dict):
-        if embedded.get("id"):
-            canonical_account_id = str(embedded.get("id"))
-        elif embedded.get("account_id"):
+        if embedded.get("account_id"):
             canonical_account_id = str(embedded.get("account_id"))
+        elif embedded.get("id"):
+            canonical_account_id = str(embedded.get("id"))
 
     if not canonical_account_id:
+        # token row account_id points to accounts.id, but we accept it as fallback
         canonical_account_id = str(row.get("account_id")) if row.get("account_id") else None
 
     try:
-        _sb_request("PATCH", f"/web_tokens?id=eq.{row.get('id')}", json={"last_seen_at": _now_utc().isoformat()})
+        _sb_request("PATCH", f"/{WEB_TOKEN_TABLE}?id=eq.{row.get('id')}", json={"last_seen_at": _now_utc().isoformat()})
     except Exception:
         pass
 
@@ -552,7 +620,7 @@ def logout_web_session(req: Request) -> Dict[str, Any]:
 
     token_hash = _hash_token(token)
 
-    ok, data, sb_dbg = _sb_request("PATCH", f"/web_tokens?token_hash=eq.{token_hash}", json={"revoked": True})
+    ok, data, sb_dbg = _sb_request("PATCH", f"/{WEB_TOKEN_TABLE}?token_hash=eq.{token_hash}", json={"revoked": True})
     if not ok:
         return _fail(stage="logout", error="logout_failed", root_cause=sb_dbg.get("error_body") or data, debug=sb_dbg, extra=src_dbg)
 
