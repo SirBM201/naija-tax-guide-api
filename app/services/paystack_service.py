@@ -23,6 +23,14 @@ def _headers() -> Dict[str, str]:
     }
 
 
+def _safe_excerpt(obj: Any, limit: int = 1200) -> str:
+    try:
+        s = json.dumps(obj, ensure_ascii=False, default=str)
+    except Exception:
+        s = str(obj)
+    return s if len(s) <= limit else (s[:limit] + "...<truncated>")
+
+
 def create_reference(prefix: str = "NTG") -> str:
     return f"{prefix}-{uuid4().hex}"
 
@@ -69,7 +77,10 @@ def initialize_transaction(
 
     data = r.json() if r.content else {}
     if not r.ok or not data.get("status"):
-        raise RuntimeError(data.get("message") or "paystack_init_failed")
+        # Safe expose: status + paystack message + excerpt
+        msg = data.get("message") or "paystack_init_failed"
+        raise RuntimeError(f"{msg} | http={r.status_code} | body={_safe_excerpt(data)}")
+
     return data
 
 
@@ -86,7 +97,9 @@ def verify_transaction(reference: str) -> Dict[str, Any]:
 
     data = r.json() if r.content else {}
     if not r.ok or not data.get("status"):
-        raise RuntimeError(data.get("message") or "paystack_verify_failed")
+        msg = data.get("message") or "paystack_verify_failed"
+        raise RuntimeError(f"{msg} | http={r.status_code} | body={_safe_excerpt(data)}")
+
     return data
 
 
