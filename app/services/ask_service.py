@@ -10,12 +10,11 @@ ASK SERVICE (CANONICAL)
 This service is called by routes/ask.py (web + legacy channels).
 """
 
-import os
 import uuid
-from datetime import datetime, timezone
 from typing import Any, Dict
 
 from app.core.supabase_client import supabase
+from app.core import config as CFG
 from app.services.credits_service import check_credit_balance
 from app.services.qa_cache_service import answer_from_cache, increment_cache_use
 from app.services.ai_service import call_ai
@@ -23,10 +22,6 @@ from app.services.ai_service import call_ai
 
 def _sb():
     return supabase() if callable(supabase) else supabase
-
-
-def _truthy(v: str | None) -> bool:
-    return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def _clip(s: str, n: int = 240) -> str:
@@ -69,6 +64,7 @@ def resolve_canonical_account_id(raw_account_id: str) -> Dict[str, Any]:
             "details": {"account_id": v},
         }
 
+    # Preferred path: client already sent canonical accounts.account_id
     if _has_column("accounts", "account_id"):
         try:
             q = _sb().table("accounts").select("id,account_id").eq("account_id", v).limit(1).execute()
@@ -83,6 +79,7 @@ def resolve_canonical_account_id(raw_account_id: str) -> Dict[str, Any]:
                 "fix": "Check Supabase connectivity/RLS for accounts table.",
             }
 
+    # Legacy path: client sent accounts.id
     try:
         q = _sb().table("accounts").select("id,account_id").eq("id", v).limit(1).execute()
         rows = getattr(q, "data", None) or []
@@ -99,6 +96,7 @@ def resolve_canonical_account_id(raw_account_id: str) -> Dict[str, Any]:
         canonical = str(row.get("account_id") or "").strip()
         row_id = str(row.get("id") or "").strip()
 
+        # Repair: if account_id is missing, set account_id = id
         if not canonical and row_id:
             try:
                 _sb().table("accounts").update({"account_id": row_id}).eq("id", row_id).execute()
@@ -156,15 +154,27 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
             "translated_from_id": resolved.get("translated_from_id"),
         }
 
-    bypass = bool(body.get("__bypass"))
-    if bypass and not _truthy(os.getenv("ALLOW_DEV_BYPASS", "1")):
+    # --------------------------
+    # Bypass enforcement (single authority)
+    # --------------------------
+    bypass_requested = bool(body.get("__bypass"))
+    if bypass_requested and not CFG.ALLOW_SUBSCRIPTION_BYPASS:
         return {
             "ok": False,
             "error": "bypass_disabled",
-            "root_cause": "__bypass provided but ALLOW_DEV_BYPASS=0",
-            "fix": "Remove bypass headers or set ALLOW_DEV_BYPASS=1 in backend env.",
+            "root_cause": "__bypass was requested but ALLOW_SUBSCRIPTION_BYPASS is False",
+            "fix": "Disable bypass request (remove BYPASS token headers) or explicitly enable DEV_BYPASS_SUBSCRIPTION=1 (dev only).",
+            "debug": {
+                **translation_debug,
+                "bypass_requested": True,
+                "ALLOW_SUBSCRIPTION_BYPASS": CFG.ALLOW_SUBSCRIPTION_BYPASS,
+                "DEV_BYPASS_SUBSCRIPTION": getattr(CFG, "DEV_BYPASS_SUBSCRIPTION", None),
+                "BYPASS_TOKEN_present": bool(getattr(CFG, "BYPASS_TOKEN", "")),
+                "DEV_BYPASS_TOKEN_present": bool(getattr(CFG, "DEV_BYPASS_TOKEN", "")),
+            },
         }
 
+    # Cache shortcut
     cached = answer_from_cache(question, lang=(body.get("lang") or "en"))
     if cached:
         try:
@@ -176,10 +186,11 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
             "answer": cached.get("answer"),
             "from_cache": True,
             "account_id": account_id,
-            "debug": {**translation_debug},
+            "debug": {**translation_debug, "bypass": bypass_requested},
         }
 
-    if not bypass:
+    # Credits / subscription gating (skip only if bypass is allowed AND requested)
+    if not bypass_requested:
         bal = check_credit_balance(account_id)
         if not bal.get("ok"):
             return {
@@ -202,6 +213,7 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
                 "debug": {**translation_debug},
             }
 
+    # AI call
     try:
         ai = call_ai(question=question, lang=(body.get("lang") or "en"), channel=(body.get("channel") or "web"))
     except Exception as e:
@@ -211,7 +223,7 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
             "root_cause": f"{type(e).__name__}: {_clip(str(e))}",
             "fix": "Check AI provider keys, network access, and ai_service configuration.",
             "details": {"account_id": account_id},
-            "debug": {**translation_debug},
+            "debug": {**translation_debug, "bypass": bypass_requested},
         }
 
     if not isinstance(ai, dict) or not ai.get("ok"):
@@ -221,7 +233,7 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
             "root_cause": (ai or {}).get("root_cause") or (ai or {}).get("error") or "unknown_ai_failure",
             "fix": (ai or {}).get("fix") or "Inspect ai_service logs.",
             "details": {"account_id": account_id},
-            "debug": {**translation_debug},
+            "debug": {**translation_debug, "bypass": bypass_requested},
         }
 
     return {
@@ -229,5 +241,5 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
         "answer": ai.get("answer"),
         "from_cache": False,
         "account_id": account_id,
-        "debug": {**translation_debug},
+        "debug": {**translation_debug, "bypass": bypass_requested},
     }
