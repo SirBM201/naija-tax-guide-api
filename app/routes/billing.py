@@ -1,7 +1,6 @@
 # app/routes/billing.py
 from __future__ import annotations
 
-import os
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, Optional, Tuple
 
@@ -20,8 +19,6 @@ from app.services.paystack_service import (
 bp = Blueprint("billing", __name__)
 
 
-# -------------------- Helpers --------------------
-
 def _sb():
     return supabase() if callable(supabase) else supabase
 
@@ -34,51 +31,29 @@ def _now_iso() -> str:
     return _now().isoformat()
 
 
-def _safe_json() -> Dict[str, Any]:
-    return request.get_json(silent=True) or {}
-
-
 def _truthy(v: str | None) -> bool:
     return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-def _env_bool(name: str, default: bool = False) -> bool:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    return _truthy(v)
+def _debug_enabled() -> bool:
+    return _truthy(request.args.get("debug") or "") or _truthy(request.headers.get("X-Debug") or "")
 
 
-def _fail(
-    *,
-    status_code: int,
-    error: str,
-    stage: str,
-    hint: str = "",
-    root_cause: str = "",
-    debug: Any = None,
-    extra: Optional[Dict[str, Any]] = None,
-):
-    """
-    Standard error response with failure exposure.
-    - stage: where it failed
-    - hint: what to check
-    - root_cause: repr(exception) when safe
-    """
-    payload: Dict[str, Any] = {
-        "ok": False,
-        "error": error,
-        "stage": stage,
-    }
+def _safe_json() -> Dict[str, Any]:
+    return request.get_json(silent=True) or {}
+
+
+def _fail(status: int, *, error: str, stage: str, hint: str = "", root_cause: str = "", debug: Any = None, extra=None):
+    out: Dict[str, Any] = {"ok": False, "error": error, "stage": stage}
     if hint:
-        payload["hint"] = hint
+        out["hint"] = hint
     if root_cause:
-        payload["root_cause"] = root_cause
+        out["root_cause"] = root_cause
     if debug is not None:
-        payload["debug"] = debug
+        out["debug"] = debug
     if extra:
-        payload.update(extra)
-    return jsonify(payload), status_code
+        out.update(extra)
+    return jsonify(out), status
 
 
 def _store_paystack_event(
@@ -89,8 +64,7 @@ def _store_paystack_event(
     payload: Dict[str, Any],
 ) -> None:
     """
-    Best-effort audit logging.
-    Recommended table:
+    Table expected (recommended):
       paystack_events:
         id bigint pk
         event_id text unique nullable
@@ -98,6 +72,8 @@ def _store_paystack_event(
         reference text nullable
         payload jsonb not null
         created_at timestamptz not null
+
+    Best-effort. If table doesn't exist, it won't break payments.
     """
     row = {
         "event_id": event_id,
@@ -109,35 +85,39 @@ def _store_paystack_event(
     try:
         _sb().table("paystack_events").insert(row).execute()
     except Exception:
-        # idempotency / table missing must not break payments
         pass
 
 
-def _get_account_email(account_id: str) -> Tuple[Optional[str], Optional[str]]:
+def _fetch_account_email(accounts_id: str) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
     """
-    Returns (email, warning).
-    warning is used for failure exposure without crashing.
-
-    Note: If accounts.email column doesn't exist yet, Supabase will throw.
-    We capture that and return warning to guide the fix.
+    Fetch email from public.accounts using accounts.id (canonical).
+    Returns (email, err_debug).
     """
     try:
         q = (
             _sb()
             .table("accounts")
-            .select("email")
-            .eq("id", account_id)
+            .select("id,email,provider,provider_user_id")
+            .eq("id", accounts_id)
             .limit(1)
             .execute()
         )
         rows = getattr(q, "data", None) or []
         if not rows:
-            return None, "accounts_row_not_found"
-        email = (rows[0].get("email") or "").strip().lower()
-        return (email or None), None
+            return None, {"error": "account_not_found", "accounts_id": accounts_id}
+        row = rows[0]
+        email = (row.get("email") or "").strip().lower()
+        if not email:
+            # fallback: for web accounts, provider_user_id is the email
+            if (row.get("provider") or "").strip().lower() == "web":
+                email = (row.get("provider_user_id") or "").strip().lower()
+
+        if "@" not in email:
+            return None, {"error": "account_email_missing", "accounts_id": accounts_id, "row": row}
+
+        return email, None
     except Exception as e:
-        # likely: column "email" does not exist
-        return None, f"accounts_email_fetch_failed: {repr(e)}"
+        return None, {"error": "account_email_lookup_failed", "accounts_id": accounts_id, "exception": repr(e)}
 
 
 def _upsert_user_subscription(
@@ -150,7 +130,9 @@ def _upsert_user_subscription(
 ) -> Dict[str, Any]:
     """
     user_subscriptions unique by account_id (one current subscription per account).
-    This function will update existing row if found else insert new row.
+    This function will:
+      - update existing row if found
+      - else insert a new row
     """
     now = _now()
     expires = now + timedelta(days=int(duration_days))
@@ -244,100 +226,58 @@ def billing_me():
     except Exception as e:
         err = repr(e)
 
-    return jsonify(
-        {
-            "ok": True,
-            "account_id": account_id,
-            "subscription": sub,
-            "db_warning": err,
-            "debug": debug,
-        }
-    ), 200
+    return jsonify({"ok": True, "account_id": account_id, "subscription": sub, "db_warning": err, "debug": debug}), 200
 
 
 @bp.post("/billing/checkout")
 def billing_checkout():
     """
-    Start Paystack transaction (secure, standard).
+    Start Paystack transaction (requires auth session).
     Body: { "plan_code": "monthly|quarterly|yearly" }
 
-    Email handling (standard):
-      - Fetch email from accounts.email (canonical)
-      - If you haven't added accounts.email yet, this will return a clear error
-      - Optional fallback: allow client email ONLY if env flag enabled
-        ALLOW_CHECKOUT_EMAIL_OVERRIDE=true
+    Backend fetches payer email from public.accounts.
     """
-    account_id, debug = get_account_id_from_request(request)
+    account_id, auth_debug = get_account_id_from_request(request)
     if not account_id:
         return _fail(
-            status_code=401,
+            401,
             error="unauthorized",
             stage="auth",
-            hint="Missing or invalid bearer token",
-            debug=debug,
+            hint="Login first. Missing/invalid token or cookie.",
+            debug=auth_debug if _debug_enabled() else None,
         )
 
     body = _safe_json()
     plan_code = (body.get("plan_code") or "").strip().lower()
     if not plan_code:
-        return _fail(
-            status_code=400,
-            error="missing_plan_code",
-            stage="validate_input",
-            hint='Send JSON: {"plan_code":"monthly"}',
-            debug=debug,
-        )
+        return _fail(400, error="plan_code_required", stage="validate_input", hint="Send JSON: {\"plan_code\":\"monthly\"}")
 
     plan = get_plan(plan_code)
     if not plan or not plan.get("active", True):
-        return _fail(
-            status_code=404,
-            error="plan_not_found",
-            stage="validate_plan",
-            hint="Check /billing/plans and ensure plan_code exists and active",
-            extra={"plan_code": plan_code},
-            debug=debug,
-        )
+        return _fail(404, error="plan_not_found", stage="plan_lookup", extra={"plan_code": plan_code})
 
     price_ngn = int(plan.get("price") or 0)
     if price_ngn <= 0:
+        return _fail(400, error="plan_price_missing", stage="plan_validate", extra={"plan": plan})
+
+    # Fetch email from accounts
+    email, email_err = _fetch_account_email(account_id)
+    if email_err:
         return _fail(
-            status_code=400,
-            error="plan_price_missing",
-            stage="validate_plan",
-            hint="Plan price must be > 0 in plans_service",
-            extra={"plan_code": plan_code},
-            debug=debug,
-        )
-
-    # ---- Canonical email fetch ----
-    email, warn = _get_account_email(account_id)
-
-    # Optional controlled fallback (use ONLY while migrating schema)
-    allow_override = _env_bool("ALLOW_CHECKOUT_EMAIL_OVERRIDE", False)
-    if (not email) and allow_override:
-        override = (body.get("email") or "").strip().lower()
-        if "@" in override:
-            email = override
-
-    if not email or "@" not in email:
-        return _fail(
-            status_code=400,
-            error="account_email_missing",
-            stage="payer_email",
-            hint=(
-                "Add accounts.email column and store user's email during login/signup. "
-                "OR temporarily set ALLOW_CHECKOUT_EMAIL_OVERRIDE=true and send {email} from frontend."
-            ),
-            extra={"account_id": account_id, "db_warning": warn},
-            debug=debug,
+            400,
+            error="payer_email_missing",
+            stage="account_email",
+            hint="Account exists but email is missing. Ensure accounts.email is populated for this user.",
+            debug=email_err if _debug_enabled() else None,
+            extra={"account_id": account_id},
         )
 
     reference = create_reference("NTG")
+
     metadata = {
         "product": "naija_tax_guide",
         "plan_code": plan_code,
-        "account_id": account_id,  # binds this payment to this user
+        "account_id": account_id,  # IMPORTANT
         "email": email,
     }
 
@@ -350,25 +290,22 @@ def billing_checkout():
         )
     except Exception as e:
         return _fail(
-            status_code=400,
+            400,
             error="paystack_init_failed",
             stage="paystack_initialize",
-            hint="Check PAYSTACK_SECRET_KEY and Paystack dashboard logs",
-            root_cause=repr(e),
-            extra={"reference": reference, "plan_code": plan_code},
-            debug=debug,
+            root_cause=f"{type(e).__name__}: {str(e)}",
+            debug={"account_id": account_id, "plan_code": plan_code, "email": email} if _debug_enabled() else None,
         )
 
     data = (ps or {}).get("data") or {}
     auth_url = data.get("authorization_url")
     if not auth_url:
         return _fail(
-            status_code=400,
-            error="paystack_missing_authorization_url",
-            stage="paystack_response",
-            hint="Paystack init succeeded but did not return authorization_url",
-            extra={"reference": reference, "paystack_data": data},
-            debug=debug,
+            400,
+            error="paystack_init_missing_url",
+            stage="paystack_initialize",
+            root_cause="authorization_url not returned by paystack",
+            debug=ps if _debug_enabled() else None,
         )
 
     return jsonify(
@@ -379,9 +316,7 @@ def billing_checkout():
             "access_code": data.get("access_code"),
             "plan": plan,
             "account_id": account_id,
-            "email": email,  # safe to expose, helpful for UI/debug
-            "db_warning": warn,
-            "debug": debug,
+            "payer_email": email,
         }
     ), 200
 
@@ -390,42 +325,20 @@ def billing_checkout():
 def billing_verify():
     """
     Verify a reference (after Paystack redirect).
-    SECURE:
-      - requires auth
-      - ensures tx metadata account_id matches requester account_id
     GET /billing/verify?reference=...
     """
-    requester_account_id, debug = get_account_id_from_request(request)
-    if not requester_account_id:
-        return _fail(
-            status_code=401,
-            error="unauthorized",
-            stage="auth",
-            hint="Missing or invalid bearer token",
-            debug=debug,
-        )
-
     reference = (request.args.get("reference") or "").strip()
     if not reference:
-        return _fail(
-            status_code=400,
-            error="missing_reference",
-            stage="validate_input",
-            hint="Pass ?reference=... from Paystack redirect",
-            debug=debug,
-        )
+        return _fail(400, error="missing_reference", stage="validate_input")
 
     try:
         ps = verify_transaction(reference)
     except Exception as e:
         return _fail(
-            status_code=400,
+            400,
             error="paystack_verify_failed",
             stage="paystack_verify",
-            hint="Check Paystack reference and PAYSTACK_SECRET_KEY",
-            root_cause=repr(e),
-            extra={"reference": reference},
-            debug=debug,
+            root_cause=f"{type(e).__name__}: {str(e)}",
         )
 
     tx = (ps or {}).get("data") or {}
@@ -434,84 +347,35 @@ def billing_verify():
     metadata = tx.get("metadata") or {}
 
     plan_code = (metadata.get("plan_code") or "").strip().lower()
-    tx_account_id = (metadata.get("account_id") or "").strip()
+    account_id = (metadata.get("account_id") or "").strip()
 
     _store_paystack_event(event_id=tx_id, event_type="verify", reference=reference, payload=ps)
 
     if status != "success":
-        return jsonify(
-            {
-                "ok": True,
-                "paid": False,
-                "status": status,
-                "reference": reference,
-                "account_id": requester_account_id,
-                "data": tx,
-                "debug": debug,
-            }
-        ), 200
+        return jsonify({"ok": True, "paid": False, "status": status, "reference": reference, "data": tx}), 200
 
-    if not plan_code or not tx_account_id:
+    if not plan_code or not account_id:
         return _fail(
-            status_code=400,
+            400,
             error="missing_metadata",
-            stage="paystack_metadata",
-            hint="Ensure /billing/checkout sets metadata.account_id and metadata.plan_code",
-            extra={"reference": reference, "metadata": metadata},
-            debug=debug,
-        )
-
-    if tx_account_id != requester_account_id:
-        return _fail(
-            status_code=403,
-            error="forbidden_reference_owner_mismatch",
-            stage="security_owner_check",
-            hint="This reference belongs to a different account_id",
-            extra={"reference": reference, "account_id": requester_account_id},
-            debug=debug,
+            stage="verify_metadata",
+            hint="Paystack transaction metadata missing plan_code/account_id.",
+            debug={"metadata": metadata, "reference": reference} if _debug_enabled() else None,
         )
 
     plan = get_plan(plan_code)
     if not plan:
-        return _fail(
-            status_code=404,
-            error="plan_not_found",
-            stage="validate_plan",
-            hint="Plan code in metadata not found in plans_service",
-            extra={"plan_code": plan_code, "reference": reference},
-            debug=debug,
-        )
+        return _fail(404, error="plan_not_found", stage="plan_lookup", extra={"plan_code": plan_code})
 
-    try:
-        sub = _upsert_user_subscription(
-            account_id=requester_account_id,
-            plan_code=plan_code,
-            duration_days=int(plan["duration_days"]),
-            provider="paystack",
-            provider_ref=reference,
-        )
-    except Exception as e:
-        return _fail(
-            status_code=500,
-            error="subscription_upsert_failed",
-            stage="db_user_subscriptions",
-            hint="Check user_subscriptions table schema and RLS/service role access",
-            root_cause=repr(e),
-            extra={"account_id": requester_account_id, "plan_code": plan_code, "reference": reference},
-            debug=debug,
-        )
+    sub = _upsert_user_subscription(
+        account_id=account_id,
+        plan_code=plan_code,
+        duration_days=int(plan["duration_days"]),
+        provider="paystack",
+        provider_ref=reference,
+    )
 
-    return jsonify(
-        {
-            "ok": True,
-            "paid": True,
-            "reference": reference,
-            "subscription": sub,
-            "plan": plan,
-            "account_id": requester_account_id,
-            "debug": debug,
-        }
-    ), 200
+    return jsonify({"ok": True, "paid": True, "reference": reference, "subscription": sub, "plan": plan}), 200
 
 
 @bp.post("/billing/webhook")
@@ -526,17 +390,11 @@ def billing_webhook():
     sig = (request.headers.get("x-paystack-signature") or "").strip()
 
     if not verify_webhook_signature(raw_body, sig):
-        return _fail(
-            status_code=401,
-            error="invalid_signature",
-            stage="webhook_signature",
-            hint="Check PAYSTACK_WEBHOOK_SECRET and Paystack webhook config",
-        )
+        return jsonify({"ok": False, "error": "invalid_signature"}), 401
 
     payload = request.get_json(silent=True) or {}
     event_type = (payload.get("event") or "").strip().lower()
     data = payload.get("data") or {}
-
     reference = (data.get("reference") or "").strip() or None
     tx_id = str(data.get("id") or "") or None
 
@@ -550,16 +408,12 @@ def billing_webhook():
         if plan_code and account_id and reference:
             plan = get_plan(plan_code)
             if plan:
-                try:
-                    _upsert_user_subscription(
-                        account_id=account_id,
-                        plan_code=plan_code,
-                        duration_days=int(plan["duration_days"]),
-                        provider="paystack",
-                        provider_ref=reference,
-                    )
-                except Exception:
-                    # webhook must not fail hard; we already stored event
-                    pass
+                _upsert_user_subscription(
+                    account_id=account_id,
+                    plan_code=plan_code,
+                    duration_days=int(plan["duration_days"]),
+                    provider="paystack",
+                    provider_ref=reference,
+                )
 
     return jsonify({"ok": True}), 200
