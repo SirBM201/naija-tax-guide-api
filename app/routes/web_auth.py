@@ -6,12 +6,12 @@ from typing import Any, Dict, Optional
 
 from flask import Blueprint, jsonify, request, make_response
 
+from app.core.config import WEB_AUTH_COOKIE_NAME
 from app.services.web_auth_service import (
     request_web_otp,
     verify_web_otp_and_issue_token,
     logout_web_session,
     get_account_id_from_request,
-    WEB_AUTH_COOKIE_NAME,
 )
 from app.services.mail_service import send_otp_email
 
@@ -27,21 +27,17 @@ def _env(name: str, default: str = "") -> str:
 
 
 def _cookie_mode_enabled() -> bool:
-    # New standard env var name (preferred)
+    # Preferred env var
     v = _env("COOKIE_AUTH_ENABLED", "")
     if v:
         return _truthy(v)
-    # Fallback: allow disabling cookie mode via WEB_AUTH_RETURN_BEARER=1
-    # If bearer return is forced, cookie mode can still be on, but most setups want cookie.
     return True
 
 
 def _cookie_secure() -> bool:
-    # Preferred (matches config.py naming)
     v = _env("WEB_AUTH_COOKIE_SECURE", "")
     if v:
         return _truthy(v)
-    # Backwards compatibility
     return _truthy(_env("COOKIE_SECURE", "1"))
 
 
@@ -61,7 +57,6 @@ def _cookie_domain() -> Optional[str]:
 
 
 def _cookie_max_age() -> int:
-    # Preferred (matches config naming idea)
     v = _env("WEB_AUTH_COOKIE_MAX_AGE", "")
     if v:
         return int(v or "2592000")
@@ -142,13 +137,21 @@ def verify_otp():
     if not contact or not otp:
         return jsonify({"ok": False, "error": "contact_and_otp_required"}), 400
 
-    r = verify_web_otp_and_issue_token(contact=contact, otp=otp, purpose=purpose)
+    # ✅ Pass ip/user_agent into session creation
+    r = verify_web_otp_and_issue_token(
+        contact=contact,
+        otp=otp,
+        purpose=purpose,
+        ip=request.remote_addr,
+        user_agent=request.headers.get("User-Agent"),
+    )
+
     if not r.get("ok"):
         return jsonify(r), 400
 
     token = (r.get("token") or "").strip()
 
-    # cookie-only mode: remove token from JSON response unless explicitly requested
+    # cookie-only mode: remove token from JSON unless explicitly requested
     if _cookie_mode_enabled() and not _return_bearer_in_json():
         r = {**r}
         r.pop("token", None)
@@ -156,7 +159,8 @@ def verify_otp():
     resp = make_response(jsonify(r), 200)
     resp.headers["Cache-Control"] = "no-store"
 
-    if _cookie_mode_enabled():
+    # ✅ set cookie only if cookie mode enabled AND token exists
+    if _cookie_mode_enabled() and token:
         secure = _cookie_secure()
         samesite = _cookie_samesite()
 
