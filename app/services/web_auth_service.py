@@ -36,12 +36,8 @@ BEARER_FALLBACK_TO_COOKIE = str(__import__("os").getenv("WEB_BEARER_FALLBACK_TO_
 
 SESSION_ROTATE_AFTER_MINUTES = int((__import__("os").getenv("WEB_SESSION_ROTATE_AFTER_MINUTES", "30") or "30"))
 SESSION_FINGERPRINT_MODE = ((__import__("os").getenv("WEB_SESSION_FINGERPRINT_MODE", "soft") or "soft").strip().lower())
-# soft = never block, only log mismatch
-# strict = block on mismatch
-# off = ignore fingerprint entirely
+# off | soft | strict
 
-
-# -------------------- time / hashing --------------------
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
@@ -64,7 +60,6 @@ def _hash_otp(otp: str) -> str:
 
 
 def _hash_token(token: str) -> str:
-    # MUST match app/core/auth.py
     return _sha256_hex(f"tok:{token}:{_token_pepper()}")
 
 
@@ -84,13 +79,9 @@ def _safe_iso_to_dt(v: Any) -> Optional[datetime]:
         return None
 
 
-# -------------------- fingerprint helpers --------------------
-
 def _normalize_user_agent(user_agent: Optional[str]) -> str:
     ua = (user_agent or "").strip()
-    if not ua:
-        return ""
-    return ua[:500]
+    return ua[:500] if ua else ""
 
 
 def _normalize_ip(ip: Optional[str]) -> str:
@@ -98,17 +89,9 @@ def _normalize_ip(ip: Optional[str]) -> str:
 
 
 def _build_fingerprint(ip: Optional[str], user_agent: Optional[str]) -> str:
-    """
-    Privacy-conscious device/browser-ish fingerprint.
-    Stores only SHA-256 of a small normalized tuple, not raw secret material.
-    """
-    ip_n = _normalize_ip(ip)
-    ua_n = _normalize_user_agent(user_agent)
-    raw = f"fp:v1|ip:{ip_n}|ua:{ua_n}"
+    raw = f"fp:v1|ip:{_normalize_ip(ip)}|ua:{_normalize_user_agent(user_agent)}"
     return _sha256_hex(raw)
 
-
-# -------------------- supabase postgrest --------------------
 
 def _postgrest_base() -> str:
     url = (SUPABASE_URL or "").strip().rstrip("/")
@@ -165,8 +148,6 @@ def _sb_request(
         return False, None, {"url": url, "method": method, "status": 0, "exception": repr(e)}
 
 
-# -------------------- error helper --------------------
-
 def _fail(*, stage: str, error: str, root_cause: Any = None, debug: Any = None, extra: Dict[str, Any] | None = None):
     out: Dict[str, Any] = {"ok": False, "error": error, "stage": stage}
     if root_cause is not None:
@@ -183,8 +164,6 @@ def _looks_like_unique_violation(dbg: Dict[str, Any]) -> bool:
     return ("23505" in body) or (dbg.get("status") == 409) or ("duplicate key" in body.lower()) or ("unique" in body.lower())
 
 
-# -------------------- auth_events logging --------------------
-
 def _log_auth_event(contact: Optional[str], ip: Optional[str], event: str, success: bool, reason: Optional[str] = None) -> None:
     try:
         payload = {
@@ -198,8 +177,6 @@ def _log_auth_event(contact: Optional[str], ip: Optional[str], event: str, succe
     except Exception:
         pass
 
-
-# -------------------- OTP Request --------------------
 
 def request_web_otp(
     *,
@@ -282,8 +259,6 @@ def _mark_otp_used(otp_id: str) -> Dict[str, Any]:
     return _fail(stage="otp_mark_used", error="otp_mark_used_failed", root_cause=dbg.get("error_body") or data, debug=dbg)
 
 
-# -------------------- Accounts --------------------
-
 def _patch_account(accounts_row_id: str, patch: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
     ok, data, dbg = _sb_request("PATCH", f"/accounts?id=eq.{accounts_row_id}", json=patch)
     if not ok:
@@ -345,51 +320,39 @@ def _get_or_create_web_account(contact: str) -> Tuple[Optional[Dict[str, Any]], 
     return created, None
 
 
-# -------------------- Sessions --------------------
-
 def _revoke_all_sessions_for_account(account_row_id: str) -> None:
-    _sb_request("PATCH", f"/{WEB_TOKEN_TABLE}?account_id=eq.{account_row_id}", json={"revoked": True})
+    _sb_request("PATCH", f"/{WEB_TOKEN_TABLE}?account_id=eq.{account_row_id}", json={"revoked": True, "revoked_at": _now_utc().isoformat()})
 
 
 def _insert_web_session(*, account_row_id: str, ip: Optional[str], user_agent: Optional[str]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     expires_at = (_now_utc() + timedelta(days=int(WEB_SESSION_TTL_DAYS or 30))).isoformat()
     attempts: List[Dict[str, Any]] = []
-
     fingerprint = _build_fingerprint(ip, user_agent)
 
     for n in range(1, TOKEN_INSERT_MAX_RETRIES + 1):
         token_plain = secrets.token_urlsafe(48)
         token_hash = _hash_token(token_plain)
 
-        # Minimal guaranteed columns for current schema.
         payload = {
             "token_hash": token_hash,
-            "account_id": account_row_id,  # FK -> accounts.id
+            "account_id": account_row_id,
             "expires_at": expires_at,
             "revoked": False,
+            "fingerprint": fingerprint,
+            "ip": _normalize_ip(ip) or None,
+            "user_agent": _normalize_user_agent(user_agent) or None,
+            "last_seen_at": _now_utc().isoformat(),
         }
 
         ok, data, dbg = _sb_request("POST", f"/{WEB_TOKEN_TABLE}", json=payload)
         if ok:
             created = data[0] if isinstance(data, list) and data else data
-            session_row_id = (created or {}).get("id")
-
-            # Best-effort enrich session row with optional columns if they exist.
-            # These won't break login if columns are absent.
-            enrich_patch = {
-                "fingerprint": fingerprint,
-                "last_seen_at": _now_utc().isoformat(),
-                "ip": ip,
-                "user_agent": (user_agent or "")[:500] or None,
-            }
-            _sb_request("PATCH", f"/{WEB_TOKEN_TABLE}?id=eq.{session_row_id}", json=enrich_patch)
-
             return {
                 "ok": True,
                 "token": token_plain,
                 "token_hash": token_hash,
                 "expires_at": expires_at,
-                "session_row_id": session_row_id,
+                "session_row_id": (created or {}).get("id"),
                 "account_row_id": account_row_id,
                 "fingerprint": fingerprint,
             }, None
@@ -496,8 +459,6 @@ def verify_web_otp_and_issue_token(*, contact: str, otp: str, purpose: str, ip: 
     }
 
 
-# -------------------- token extraction / session checks --------------------
-
 def _extract_token_candidates(req: Request) -> Tuple[str, str, Dict[str, Any]]:
     debug: Dict[str, Any] = {
         "token_source": None,
@@ -520,18 +481,15 @@ def _extract_token_candidates(req: Request) -> Tuple[str, str, Dict[str, Any]]:
 
 
 def _rotate_existing_session(row: Dict[str, Any], ip: Optional[str], user_agent: Optional[str]) -> Tuple[Optional[str], Dict[str, Any]]:
-    """
-    Session rotation:
-    - revoke current token row
-    - insert new token row for same account_row_id
-    - keep user online by returning new raw token (caller may set new cookie if desired)
-    """
     account_row_id = str(row.get("account_id") or "").strip()
     if not account_row_id:
         return None, {"ok": False, "error": "rotate_missing_account_id"}
 
-    # revoke old
-    _sb_request("PATCH", f"/{WEB_TOKEN_TABLE}?id=eq.{row.get('id')}", json={"revoked": True})
+    _sb_request(
+        "PATCH",
+        f"/{WEB_TOKEN_TABLE}?id=eq.{row.get('id')}",
+        json={"revoked": True, "revoked_at": _now_utc().isoformat()},
+    )
 
     ins, err = _insert_web_session(account_row_id=account_row_id, ip=ip, user_agent=user_agent)
     if err:
@@ -549,7 +507,7 @@ def _lookup_token_plain(token_plain: str, *, ip: Optional[str] = None, user_agen
     token_hash = _hash_token(token_plain)
 
     params = {
-        "select": "id,account_id,expires_at,revoked,last_seen_at,created_at,accounts(id,account_id)",
+        "select": "id,account_id,expires_at,revoked,revoked_at,last_seen_at,created_at,fingerprint,accounts(id,account_id)",
         "token_hash": f"eq.{token_hash}",
         "limit": "1",
     }
@@ -562,7 +520,7 @@ def _lookup_token_plain(token_plain: str, *, ip: Optional[str] = None, user_agen
         return None, _fail(stage="token_lookup", error="invalid_token", debug={"supabase": sb_dbg})
 
     row = rows[0]
-    if row.get("revoked") is True:
+    if row.get("revoked") is True or row.get("revoked_at"):
         return None, _fail(stage="token_state", error="token_revoked", debug={"supabase": sb_dbg})
 
     try:
@@ -572,7 +530,6 @@ def _lookup_token_plain(token_plain: str, *, ip: Optional[str] = None, user_agen
     except Exception as e:
         return None, _fail(stage="token_expiry_parse", error="token_expiry_parse_failed", root_cause=repr(e), extra={"token_row": row}, debug={"supabase": sb_dbg})
 
-    # Resolve canonical account id from joined accounts row if available
     canonical_account_id: Optional[str] = None
     embedded = row.get("accounts")
     if isinstance(embedded, list) and embedded:
@@ -587,28 +544,22 @@ def _lookup_token_plain(token_plain: str, *, ip: Optional[str] = None, user_agen
     if not canonical_account_id:
         canonical_account_id = str(row.get("account_id") or "").strip() or None
 
-    # -------------------- fingerprint check --------------------
     req_fp = _build_fingerprint(ip, user_agent)
+    stored_fp = str((row.get("fingerprint") or "")).strip() or None
+
     fp_dbg = {
         "mode": SESSION_FINGERPRINT_MODE,
         "request_fingerprint": req_fp,
-        "stored_fingerprint": None,
+        "stored_fingerprint": stored_fp,
         "matched": None,
     }
 
-    # best-effort read stored fingerprint from optional column via raw row or patch attempt
-    stored_fp = str((row.get("fingerprint") or "")).strip() or None
-    fp_dbg["stored_fingerprint"] = stored_fp
-
     if SESSION_FINGERPRINT_MODE != "off":
         if stored_fp:
-            matched = (stored_fp == req_fp)
+            matched = stored_fp == req_fp
             fp_dbg["matched"] = matched
-
             if not matched:
-                reason = "fingerprint_mismatch"
-                _log_auth_event(None, ip, "fingerprint_mismatch", False, reason)
-
+                _log_auth_event(None, ip, "fingerprint_mismatch", False, "fingerprint_mismatch")
                 if SESSION_FINGERPRINT_MODE == "strict":
                     return None, _fail(
                         stage="fingerprint_check",
@@ -617,11 +568,9 @@ def _lookup_token_plain(token_plain: str, *, ip: Optional[str] = None, user_agen
                         debug={"supabase": sb_dbg},
                     )
         else:
-            # backfill if column exists; ignore failure if not
             _sb_request("PATCH", f"/{WEB_TOKEN_TABLE}?id=eq.{row.get('id')}", json={"fingerprint": req_fp})
             fp_dbg["matched"] = True
 
-    # -------------------- rotation check --------------------
     rotate_dbg: Dict[str, Any] = {"rotated": False}
     created_dt = _safe_iso_to_dt(row.get("created_at"))
     last_seen_dt = _safe_iso_to_dt(row.get("last_seen_at"))
@@ -636,11 +585,9 @@ def _lookup_token_plain(token_plain: str, *, ip: Optional[str] = None, user_agen
             new_token, rot = _rotate_existing_session(row, ip, user_agent)
             rotate_dbg.update(rot if isinstance(rot, dict) else {})
             if new_token:
-                rotate_dbg["new_token"] = new_token
                 row["__rotated_new_token"] = new_token
                 row["__rotated"] = True
 
-    # best-effort last_seen touch
     try:
         _sb_request("PATCH", f"/{WEB_TOKEN_TABLE}?id=eq.{row.get('id')}", json={"last_seen_at": _now_utc().isoformat()})
     except Exception:
@@ -687,16 +634,22 @@ def get_account_id_from_request(req: Request) -> Tuple[Optional[str], Dict[str, 
 def logout_web_session(req: Request) -> Dict[str, Any]:
     bearer, cookie, src_dbg = _extract_token_candidates(req)
     token = bearer or cookie
+    ip = _normalize_ip(req.remote_addr)
+
     if not token:
-        _log_auth_event(None, _normalize_ip(req.remote_addr), "logout", False, "no_token")
+        _log_auth_event(None, ip, "logout", False, "no_token")
         return {"ok": True, "logged_out": False, "reason": "no_token", **src_dbg}
 
     token_hash = _hash_token(token)
 
-    ok, data, sb_dbg = _sb_request("PATCH", f"/{WEB_TOKEN_TABLE}?token_hash=eq.{token_hash}", json={"revoked": True})
+    ok, data, sb_dbg = _sb_request(
+        "PATCH",
+        f"/{WEB_TOKEN_TABLE}?token_hash=eq.{token_hash}",
+        json={"revoked": True, "revoked_at": _now_utc().isoformat()},
+    )
     if not ok:
-        _log_auth_event(None, _normalize_ip(req.remote_addr), "logout", False, "logout_failed")
+        _log_auth_event(None, ip, "logout", False, "logout_failed")
         return _fail(stage="logout", error="logout_failed", root_cause=sb_dbg.get("error_body") or data, debug=sb_dbg, extra=src_dbg)
 
-    _log_auth_event(None, _normalize_ip(req.remote_addr), "logout", True)
+    _log_auth_event(None, ip, "logout", True)
     return {"ok": True, "logged_out": True, **src_dbg}
