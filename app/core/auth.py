@@ -11,7 +11,7 @@ from typing import Any, Callable, Dict, Optional
 from flask import g, jsonify, request
 
 from app.core.supabase_client import supabase
-from app.core.config import WEB_TOKEN_TABLE, WEB_TOKEN_PEPPER
+from app.core.config import WEB_TOKEN_TABLE, WEB_TOKEN_PEPPER, WEB_AUTH_COOKIE_NAME
 
 
 def _sb():
@@ -40,17 +40,17 @@ def _dbg(msg: str) -> None:
 
 
 def get_web_token_pepper() -> str:
-    # single source of truth for pepper, env overrides config default
     return (os.getenv("WEB_TOKEN_PEPPER", WEB_TOKEN_PEPPER) or WEB_TOKEN_PEPPER).strip()
 
 
 def token_hash(raw_token: str) -> str:
+    # IMPORTANT: must match app/services/web_auth_service.py
     pepper = get_web_token_pepper()
-    return _sha256_hex(f"{pepper}:{raw_token}")
+    return _sha256_hex(f"tok:{raw_token}:{pepper}")
 
 
 def _cookie_name() -> str:
-    return (os.getenv("WEB_AUTH_COOKIE_NAME", "ntg_session") or "ntg_session").strip()
+    return (os.getenv("WEB_AUTH_COOKIE_NAME", WEB_AUTH_COOKIE_NAME) or WEB_AUTH_COOKIE_NAME).strip()
 
 
 def _get_bearer_token() -> Optional[str]:
@@ -125,7 +125,6 @@ def require_auth_plus(fn: Callable[..., Any]) -> Callable[..., Any]:
 
             row = rows[0]
 
-            # support both revoke styles
             if row.get("revoked") is True or row.get("revoked_at"):
                 _dbg(f"[auth] token_revoked: token_hash_prefix={th_prefix}")
                 return jsonify({"ok": False, "error": "token_revoked"}), 401
@@ -138,7 +137,6 @@ def require_auth_plus(fn: Callable[..., Any]) -> Callable[..., Any]:
                     _dbg(f"[auth] token_expired: token_hash_prefix={th_prefix} exp={exp_dt.isoformat()}")
                     return jsonify({"ok": False, "error": "token_expired"}), 401
 
-            # touch last_seen_at best-effort
             try:
                 _sb().table(table).update({"last_seen_at": _now_utc().isoformat()}).eq("token_hash", th).execute()
             except Exception as e:
@@ -161,5 +159,4 @@ def require_auth_plus(fn: Callable[..., Any]) -> Callable[..., Any]:
     return wrapper
 
 
-# ✅ Backwards-compat alias for older modules (e.g., app.routes.web_chat)
 require_web_auth = require_auth_plus
