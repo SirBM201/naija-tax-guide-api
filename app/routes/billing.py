@@ -1,4 +1,3 @@
-# app/routes/billing.py
 from __future__ import annotations
 
 from datetime import datetime, timezone, timedelta
@@ -65,18 +64,6 @@ def _store_paystack_event(
     reference: Optional[str],
     payload: Dict[str, Any],
 ) -> None:
-    """
-    Best-effort audit log.
-    Expected table:
-      paystack_events(
-        id bigint pk,
-        event_id text unique null,
-        event_type text not null,
-        reference text null,
-        payload jsonb not null,
-        created_at timestamptz not null
-      )
-    """
     row = {
         "event_id": event_id,
         "event_type": event_type or "unknown",
@@ -138,12 +125,6 @@ def _get_account_row(account_id: str) -> Tuple[Optional[Dict[str, Any]], Optiona
 
 
 def _resolve_checkout_email(account_id: str) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
-    """
-    Resolve checkout email automatically from authenticated account.
-    Priority:
-      1. accounts.email
-      2. accounts.provider_user_id when provider=web and looks like email
-    """
     row, err = _get_account_row(account_id)
     if err:
         return None, err
@@ -193,13 +174,81 @@ def _get_subscription_row(account_id: str) -> Tuple[Optional[Dict[str, Any]], Op
         }
 
 
+def _subscription_is_active_now(sub: Optional[Dict[str, Any]]) -> bool:
+    if not sub:
+        return False
+
+    status = str(sub.get("status") or "").strip().lower()
+    is_active = bool(sub.get("is_active"))
+    expires_at = _safe_dt(sub.get("expires_at"))
+    grace_until = _safe_dt(sub.get("grace_until"))
+
+    now = _now()
+
+    if not is_active or status != "active":
+        return False
+
+    if expires_at and now < expires_at:
+        return True
+
+    if grace_until and now < grace_until:
+        return True
+
+    return expires_at is None
+
+
+def _plan_sort_tuple(plan: Dict[str, Any]) -> Tuple[int, int]:
+    """
+    Compare plans in a deterministic way:
+    1. higher price is considered higher tier
+    2. if price matches, longer duration is considered higher tier
+    """
+    price = int(plan.get("price") or 0)
+    duration = int(plan.get("duration_days") or 0)
+    return (price, duration)
+
+
+def _compare_plan_tier(current_plan: Dict[str, Any], target_plan: Dict[str, Any]) -> int:
+    """
+    Returns:
+      1  -> target is higher tier than current
+      0  -> same tier
+      -1 -> target is lower tier than current
+    """
+    a = _plan_sort_tuple(current_plan)
+    b = _plan_sort_tuple(target_plan)
+
+    if b > a:
+        return 1
+    if b < a:
+        return -1
+    return 0
+
+
+def _derive_change_mode(current_plan_code: Optional[str], target_plan_code: str) -> str:
+    current_plan_code = (current_plan_code or "").strip().lower()
+    target_plan_code = (target_plan_code or "").strip().lower()
+
+    if not current_plan_code:
+        return "new_purchase"
+
+    current_plan = get_plan(current_plan_code)
+    target_plan = get_plan(target_plan_code)
+
+    if not current_plan or not target_plan:
+        return "unknown"
+
+    cmp = _compare_plan_tier(current_plan, target_plan)
+    if cmp > 0:
+        return "upgrade_now"
+    if cmp < 0:
+        return "downgrade_at_period_end"
+    return "same_plan"
+
+
 def _same_active_plan_guard(account_id: str, requested_plan_code: str) -> Optional[Tuple[Any, int]]:
-    """
-    Block checkout if the user already has the same active plan and it hasn't expired.
-    """
     sub, err = _get_subscription_row(account_id)
     if err:
-        # Don't block checkout on lookup issues; expose warning elsewhere.
         return None
 
     if not sub:
@@ -207,14 +256,9 @@ def _same_active_plan_guard(account_id: str, requested_plan_code: str) -> Option
 
     current_plan_code = (sub.get("plan_code") or "").strip().lower()
     requested_plan_code = (requested_plan_code or "").strip().lower()
-    status = (sub.get("status") or "").strip().lower()
-    is_active = bool(sub.get("is_active"))
-    expires_at = _safe_dt(sub.get("expires_at"))
-
     same_plan = current_plan_code and current_plan_code == requested_plan_code
-    still_valid = expires_at is None or _now() < expires_at
 
-    if same_plan and is_active and status == "active" and still_valid:
+    if same_plan and _subscription_is_active_now(sub):
         return (
             jsonify(
                 {
@@ -232,6 +276,8 @@ def _same_active_plan_guard(account_id: str, requested_plan_code: str) -> Option
                             "expires_at": sub.get("expires_at"),
                             "provider": sub.get("provider"),
                             "provider_ref": sub.get("provider_ref"),
+                            "pending_plan_code": sub.get("pending_plan_code"),
+                            "pending_starts_at": sub.get("pending_starts_at"),
                         },
                     },
                 }
@@ -240,6 +286,34 @@ def _same_active_plan_guard(account_id: str, requested_plan_code: str) -> Option
         )
 
     return None
+
+
+def _build_subscription_summary(sub: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not sub:
+        return {
+            "has_subscription": False,
+            "is_active_now": False,
+            "has_pending_change": False,
+            "current_plan_code": None,
+            "pending_plan_code": None,
+            "pending_starts_at": None,
+        }
+
+    return {
+        "has_subscription": True,
+        "is_active_now": _subscription_is_active_now(sub),
+        "has_pending_change": bool(sub.get("pending_plan_code")),
+        "current_plan_code": sub.get("plan_code"),
+        "pending_plan_code": sub.get("pending_plan_code"),
+        "pending_starts_at": sub.get("pending_starts_at"),
+        "status": sub.get("status"),
+        "is_active": sub.get("is_active"),
+        "started_at": sub.get("started_at"),
+        "expires_at": sub.get("expires_at"),
+        "current_period_end": sub.get("current_period_end"),
+        "provider": sub.get("provider"),
+        "provider_ref": sub.get("provider_ref"),
+    }
 
 
 def _upsert_user_subscription(
@@ -252,6 +326,7 @@ def _upsert_user_subscription(
 ) -> Dict[str, Any]:
     """
     user_subscriptions uses canonical account_id (accounts.account_id).
+    This is used when a paid checkout succeeds and the new plan becomes active immediately.
     """
     now = _now()
     expires = now + timedelta(days=int(duration_days))
@@ -261,7 +336,7 @@ def _upsert_user_subscription(
     existing = (
         _sb()
         .table("user_subscriptions")
-        .select("id,account_id,plan_code,status,is_active,expires_at")
+        .select("id,account_id,plan_code,status,is_active,expires_at,pending_plan_code,pending_starts_at")
         .eq("account_id", account_id)
         .limit(1)
         .execute()
@@ -298,6 +373,8 @@ def _upsert_user_subscription(
         "current_period_end": exp_iso,
         "provider": provider,
         "provider_ref": provider_ref,
+        "pending_plan_code": None,
+        "pending_starts_at": None,
         "created_at": now_iso,
         "updated_at": now_iso,
     }
@@ -306,7 +383,149 @@ def _upsert_user_subscription(
     return out[0] if out else ins
 
 
+def _schedule_downgrade(
+    *,
+    account_id: str,
+    target_plan_code: str,
+    current_sub: Dict[str, Any],
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    sub_id = str(current_sub.get("id") or "").strip()
+    if not sub_id:
+        return None, {"error": "subscription_id_missing", "root_cause": "current_subscription_missing_id"}
+
+    target_plan_code = (target_plan_code or "").strip().lower()
+    existing_pending = (current_sub.get("pending_plan_code") or "").strip().lower()
+    pending_starts_at = current_sub.get("pending_starts_at")
+    current_period_end = current_sub.get("current_period_end") or current_sub.get("expires_at")
+
+    if existing_pending == target_plan_code and pending_starts_at:
+        return None, {
+            "error": "downgrade_already_scheduled",
+            "root_cause": "same_pending_plan_already_exists",
+            "details": {
+                "pending_plan_code": existing_pending,
+                "pending_starts_at": pending_starts_at,
+            },
+        }
+
+    if not current_period_end:
+        return None, {
+            "error": "current_period_end_missing",
+            "root_cause": "cannot_schedule_downgrade_without_current_period_end",
+        }
+
+    patch = {
+        "pending_plan_code": target_plan_code,
+        "pending_starts_at": current_period_end,
+        "updated_at": _now_iso(),
+    }
+
+    try:
+        upd = _sb().table("user_subscriptions").update(patch).eq("id", sub_id).execute()
+        out = getattr(upd, "data", None) or []
+        row = out[0] if out else {**current_sub, **patch}
+        return row, None
+    except Exception as e:
+        return None, {
+            "error": "downgrade_schedule_failed",
+            "root_cause": f"{type(e).__name__}: {_clip(e)}",
+        }
+
+
+def _clear_pending_change(
+    *,
+    sub_id: str,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    if not sub_id:
+        return None, {"error": "subscription_id_missing", "root_cause": "missing_sub_id"}
+
+    patch = {
+        "pending_plan_code": None,
+        "pending_starts_at": None,
+        "updated_at": _now_iso(),
+    }
+
+    try:
+        upd = _sb().table("user_subscriptions").update(patch).eq("id", sub_id).execute()
+        out = getattr(upd, "data", None) or []
+        row = out[0] if out else patch
+        return row, None
+    except Exception as e:
+        return None, {
+            "error": "pending_change_clear_failed",
+            "root_cause": f"{type(e).__name__}: {_clip(e)}",
+        }
+
+
+def _start_checkout_for_plan_change(
+    *,
+    account_id: str,
+    plan_code: str,
+    change_mode: str,
+    current_plan_code: Optional[str],
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    plan = get_plan(plan_code)
+    if not plan or not plan.get("active", True):
+        return None, {"error": "plan_not_found", "root_cause": f"unknown_or_inactive_plan:{plan_code}"}
+
+    price_ngn = int(plan.get("price") or 0)
+    if price_ngn <= 0:
+        return None, {"error": "plan_price_missing", "root_cause": f"invalid_price_for_plan:{plan_code}"}
+
+    email, email_err = _resolve_checkout_email(account_id)
+    if email_err or not email:
+        return None, {
+            "error": "checkout_email_missing",
+            "root_cause": (email_err or {}).get("root_cause"),
+            "details": (email_err or {}).get("details"),
+            "fix": (email_err or {}).get("fix"),
+        }
+
+    reference = create_reference("NTG")
+    metadata = {
+        "product": "naija_tax_guide",
+        "plan_code": plan_code,
+        "account_id": account_id,
+        "email": email,
+        "change_mode": change_mode,
+        "current_plan_code": (current_plan_code or "").strip().lower() or None,
+    }
+
+    try:
+        ps = initialize_transaction(
+            email=email,
+            amount_kobo=price_ngn * 100,
+            reference=reference,
+            metadata=metadata,
+        )
+    except Exception as e:
+        return None, {
+            "error": "paystack_init_failed",
+            "root_cause": repr(e),
+            "details": {
+                "account_id": account_id,
+                "email": email,
+                "plan_code": plan_code,
+                "change_mode": change_mode,
+            },
+        }
+
+    data = (ps or {}).get("data") or {}
+    return {
+        "ok": True,
+        "action": "checkout_started",
+        "reference": reference,
+        "authorization_url": data.get("authorization_url"),
+        "access_code": data.get("access_code"),
+        "plan": plan,
+        "account_id": account_id,
+        "email": email,
+        "change_mode": change_mode,
+    }, None
+
+
 # -------------------- ROUTES --------------------
+
 
 @bp.get("/billing/plans")
 def billing_plans():
@@ -324,6 +543,7 @@ def billing_plan(plan_code: str):
 
 
 @bp.get("/billing/me")
+@bp.get("/billing/subscription")
 def billing_me():
     account_id, debug = get_account_id_from_request(request)
     if not account_id:
@@ -346,12 +566,14 @@ def billing_me():
         db_warning = repr(e)
 
     checkout_email, email_err = _resolve_checkout_email(account_id)
+    summary = _build_subscription_summary(sub)
 
     return jsonify(
         {
             "ok": True,
             "account_id": account_id,
             "subscription": sub,
+            "subscription_summary": summary,
             "checkout_email": checkout_email,
             "checkout_email_error": email_err,
             "db_warning": db_warning,
@@ -386,56 +608,190 @@ def billing_checkout():
     if same_plan_block is not None:
         return same_plan_block
 
-    price_ngn = int(plan.get("price") or 0)
-    if price_ngn <= 0:
-        return _fail(error="plan_price_missing", status=400)
+    sub, _ = _get_subscription_row(account_id)
+    current_plan_code = (sub or {}).get("plan_code")
+    change_mode = _derive_change_mode(current_plan_code, plan_code)
 
-    email, email_err = _resolve_checkout_email(account_id)
-    if email_err or not email:
+    started, err = _start_checkout_for_plan_change(
+        account_id=account_id,
+        plan_code=plan_code,
+        change_mode=change_mode if change_mode != "same_plan" else "new_purchase",
+        current_plan_code=current_plan_code,
+    )
+    if err:
         return _fail(
-            error="checkout_email_missing",
-            root_cause=(email_err or {}).get("root_cause"),
+            error=err.get("error") or "checkout_failed",
+            root_cause=err.get("root_cause"),
             extra={
-                "details": (email_err or {}).get("details"),
-                "fix": (email_err or {}).get("fix"),
+                "details": err.get("details"),
+                "fix": err.get("fix"),
                 "account_id": account_id,
             },
             status=400,
         )
 
-    reference = create_reference("NTG")
-    metadata = {
-        "product": "naija_tax_guide",
-        "plan_code": plan_code,
-        "account_id": account_id,
-        "email": email,
-    }
+    return jsonify(started), 200
 
-    try:
-        ps = initialize_transaction(
-            email=email,
-            amount_kobo=price_ngn * 100,
-            reference=reference,
-            metadata=metadata,
-        )
-    except Exception as e:
+
+@bp.post("/billing/change-plan")
+def billing_change_plan():
+    """
+    Intelligent plan-change endpoint.
+
+    Behavior:
+    - same active plan -> blocked
+    - higher tier than current active plan -> Paystack checkout starts immediately
+    - lower tier than current active plan -> schedule pending downgrade at current_period_end
+    - no active subscription -> treated as fresh checkout
+    """
+    account_id, debug = get_account_id_from_request(request)
+    if not account_id:
+        return jsonify({"ok": False, "error": "unauthorized", "debug": debug}), 401
+
+    body = _safe_json()
+    target_plan_code = (body.get("plan_code") or "").strip().lower()
+    if not target_plan_code:
+        return _fail(error="plan_code_required", status=400)
+
+    target_plan = get_plan(target_plan_code)
+    if not target_plan or not target_plan.get("active", True):
+        return _fail(error="plan_not_found", status=404)
+
+    sub, sub_err = _get_subscription_row(account_id)
+    if sub_err:
         return _fail(
-            error="paystack_init_failed",
-            root_cause=repr(e),
-            extra={"account_id": account_id, "email": email, "plan_code": plan_code},
+            error=sub_err.get("error") or "subscription_lookup_failed",
+            root_cause=sub_err.get("root_cause"),
             status=400,
         )
 
-    data = (ps or {}).get("data") or {}
+    same_plan_block = _same_active_plan_guard(account_id, target_plan_code)
+    if same_plan_block is not None:
+        return same_plan_block
+
+    current_active = _subscription_is_active_now(sub)
+    current_plan_code = (sub or {}).get("plan_code")
+    change_mode = _derive_change_mode(current_plan_code, target_plan_code)
+
+    if not sub or not current_active or not current_plan_code:
+        started, err = _start_checkout_for_plan_change(
+            account_id=account_id,
+            plan_code=target_plan_code,
+            change_mode="new_purchase",
+            current_plan_code=current_plan_code,
+        )
+        if err:
+            return _fail(
+                error=err.get("error") or "checkout_failed",
+                root_cause=err.get("root_cause"),
+                extra={
+                    "details": err.get("details"),
+                    "fix": err.get("fix"),
+                    "account_id": account_id,
+                },
+                status=400,
+            )
+        return jsonify(started), 200
+
+    if change_mode == "upgrade_now":
+        started, err = _start_checkout_for_plan_change(
+            account_id=account_id,
+            plan_code=target_plan_code,
+            change_mode="upgrade_now",
+            current_plan_code=current_plan_code,
+        )
+        if err:
+            return _fail(
+                error=err.get("error") or "checkout_failed",
+                root_cause=err.get("root_cause"),
+                extra={
+                    "details": err.get("details"),
+                    "fix": err.get("fix"),
+                    "account_id": account_id,
+                },
+                status=400,
+            )
+        return jsonify(started), 200
+
+    if change_mode == "downgrade_at_period_end":
+        updated_sub, err = _schedule_downgrade(
+            account_id=account_id,
+            target_plan_code=target_plan_code,
+            current_sub=sub,
+        )
+        if err:
+            status_code = 409 if err.get("error") == "downgrade_already_scheduled" else 400
+            return _fail(
+                error=err.get("error") or "downgrade_schedule_failed",
+                root_cause=err.get("root_cause"),
+                extra={"details": err.get("details")},
+                status=status_code,
+            )
+
+        return jsonify(
+            {
+                "ok": True,
+                "action": "downgrade_scheduled",
+                "message": "Your lower-tier plan has been scheduled for the end of the current billing period.",
+                "subscription": updated_sub,
+                "subscription_summary": _build_subscription_summary(updated_sub),
+                "target_plan": target_plan,
+            }
+        ), 200
+
+    return _fail(
+        error="plan_change_mode_unknown",
+        root_cause=f"could_not_resolve_change_mode:{change_mode}",
+        extra={
+            "current_plan_code": current_plan_code,
+            "target_plan_code": target_plan_code,
+        },
+        status=400,
+    )
+
+
+@bp.post("/billing/clear-pending-change")
+def billing_clear_pending_change():
+    account_id, debug = get_account_id_from_request(request)
+    if not account_id:
+        return jsonify({"ok": False, "error": "unauthorized", "debug": debug}), 401
+
+    sub, sub_err = _get_subscription_row(account_id)
+    if sub_err:
+        return _fail(
+            error=sub_err.get("error") or "subscription_lookup_failed",
+            root_cause=sub_err.get("root_cause"),
+            status=400,
+        )
+
+    if not sub:
+        return _fail(error="subscription_not_found", status=404)
+
+    if not sub.get("pending_plan_code"):
+        return jsonify(
+            {
+                "ok": True,
+                "action": "no_pending_change",
+                "subscription": sub,
+                "subscription_summary": _build_subscription_summary(sub),
+            }
+        ), 200
+
+    updated, err = _clear_pending_change(sub_id=str(sub.get("id") or ""))
+    if err:
+        return _fail(
+            error=err.get("error") or "pending_change_clear_failed",
+            root_cause=err.get("root_cause"),
+            status=400,
+        )
+
+    merged = {**sub, **(updated or {})}
     return jsonify(
         {
             "ok": True,
-            "reference": reference,
-            "authorization_url": data.get("authorization_url"),
-            "access_code": data.get("access_code"),
-            "plan": plan,
-            "account_id": account_id,
-            "email": email,
+            "action": "pending_change_cleared",
+            "subscription": merged,
+            "subscription_summary": _build_subscription_summary(merged),
         }
     ), 200
 
@@ -462,6 +818,7 @@ def billing_verify():
 
     plan_code = (metadata.get("plan_code") or "").strip().lower()
     account_id = (metadata.get("account_id") or "").strip()
+    change_mode = (metadata.get("change_mode") or "").strip().lower() or "new_purchase"
 
     _store_paystack_event(event_id=tx_id, event_type="verify", reference=reference, payload=ps)
 
@@ -500,7 +857,9 @@ def billing_verify():
             "ok": True,
             "paid": True,
             "reference": reference,
+            "change_mode": change_mode,
             "subscription": sub,
+            "subscription_summary": _build_subscription_summary(sub),
             "plan": plan,
         }
     ), 200
