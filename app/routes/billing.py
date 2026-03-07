@@ -14,6 +14,7 @@ from app.services.paystack_service import (
     verify_transaction,
     verify_webhook_signature,
 )
+from app.services.credits_service import init_credits_for_plan
 
 bp = Blueprint("billing", __name__)
 
@@ -314,6 +315,23 @@ def _build_subscription_summary(sub: Optional[Dict[str, Any]]) -> Dict[str, Any]
         "provider": sub.get("provider"),
         "provider_ref": sub.get("provider_ref"),
     }
+
+
+def _init_plan_credits_safe(account_id: str, plan_code: str) -> Dict[str, Any]:
+    """
+    Best-effort credit initialization after successful plan activation.
+    Does not throw.
+    """
+    try:
+        res = init_credits_for_plan(account_id, plan_code)
+        return res if isinstance(res, dict) else {"ok": False, "error": "credit_init_unknown_result"}
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": "credit_init_failed",
+            "root_cause": f"{type(e).__name__}: {_clip(e)}",
+            "details": {"account_id": account_id, "plan_code": plan_code},
+        }
 
 
 def _upsert_user_subscription(
@@ -852,6 +870,8 @@ def billing_verify():
         provider_ref=reference,
     )
 
+    credit_init = _init_plan_credits_safe(account_id, plan_code)
+
     return jsonify(
         {
             "ok": True,
@@ -861,6 +881,8 @@ def billing_verify():
             "subscription": sub,
             "subscription_summary": _build_subscription_summary(sub),
             "plan": plan,
+            "credits_initialized": bool(credit_init.get("ok")),
+            "credit_init_result": credit_init,
         }
     ), 200
 
@@ -872,6 +894,7 @@ def billing_webhook():
     - validates signature
     - stores event
     - on charge.success -> activates subscription
+    - initializes plan credits
     """
     raw_body = request.get_data(cache=False) or b""
     sig = (request.headers.get("x-paystack-signature") or "").strip()
@@ -907,5 +930,6 @@ def billing_webhook():
                     provider="paystack",
                     provider_ref=reference,
                 )
+                _init_plan_credits_safe(account_id, plan_code)
 
     return jsonify({"ok": True}), 200
