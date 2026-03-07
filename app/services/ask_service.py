@@ -1,4 +1,3 @@
-# app/services/ask_service.py
 from __future__ import annotations
 
 """
@@ -6,6 +5,13 @@ ASK SERVICE (CANONICAL)
 
 - Uses ONLY canonical identity: accounts.account_id
 - If older clients send accounts.id, it translates to accounts.account_id and exposes it in debug
+- Enforces:
+  - active subscription injected by ask route
+  - daily plan limit
+  - credit balance
+- Charges:
+  - cached answer -> counts toward daily limit, does NOT consume credits
+  - fresh AI answer -> counts toward daily limit AND consumes 1 credit after success
 """
 
 import os
@@ -13,7 +19,13 @@ import uuid
 from typing import Any, Dict
 
 from app.core.supabase_client import supabase
-from app.services.credits_service import check_credit_balance
+from app.services.credits_service import (
+    check_credit_balance,
+    consume_credits,
+    enforce_daily_limit,
+    get_plan_limits,
+    increment_daily_usage,
+)
 from app.services.qa_cache_service import answer_from_cache, increment_cache_use
 from app.services.ai_service import call_ai
 
@@ -129,6 +141,30 @@ def resolve_canonical_account_id(raw_account_id: str) -> Dict[str, Any]:
         }
 
 
+def _resolve_plan_context(body: Dict[str, Any]) -> Dict[str, Any]:
+    sub = body.get("__subscription") or {}
+    plan_code = (sub.get("plan_code") or "").strip().lower()
+    if not plan_code:
+        return {
+            "ok": False,
+            "error": "subscription_plan_missing",
+            "root_cause": "subscription was injected but plan_code is missing",
+            "fix": "Repair user_subscriptions.plan_code or subscription_guard response.",
+        }
+
+    limits = get_plan_limits(plan_code)
+    if not limits.get("ok"):
+        return limits
+
+    return {
+        "ok": True,
+        "plan_code": plan_code,
+        "daily_answers_limit": int(limits.get("daily_answers_limit") or 0),
+        "ai_credits_total": int(limits.get("ai_credits_total") or 0),
+        "plan_limits": limits,
+    }
+
+
 def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
     question = (body.get("question") or "").strip()
     if not question:
@@ -154,6 +190,8 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     bypass = bool(body.get("__bypass"))
+    subscription_bypass = bool(body.get("__subscription_bypass"))
+
     if bypass and not _truthy(os.getenv("ALLOW_DEV_BYPASS", "1")):
         return {
             "ok": False,
@@ -162,46 +200,85 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
             "fix": "Remove bypass headers or set ALLOW_DEV_BYPASS=1 in backend env.",
         }
 
+    plan_ctx: Dict[str, Any] = {
+        "ok": True,
+        "plan_code": None,
+        "daily_answers_limit": 0,
+        "ai_credits_total": 0,
+    }
+
+    if not subscription_bypass:
+        plan_ctx = _resolve_plan_context(body)
+        if not plan_ctx.get("ok"):
+            return {
+                "ok": False,
+                "error": plan_ctx.get("error") or "plan_context_failed",
+                "root_cause": plan_ctx.get("root_cause"),
+                "fix": plan_ctx.get("fix"),
+                "details": plan_ctx.get("details"),
+                "debug": {**translation_debug},
+            }
+
+        daily = enforce_daily_limit(account_id, int(plan_ctx.get("daily_answers_limit") or 0))
+        if not daily.get("ok"):
+            return {
+                "ok": False,
+                "error": daily.get("error") or "daily_limit_check_failed",
+                "root_cause": daily.get("root_cause"),
+                "fix": daily.get("fix"),
+                "details": daily.get("details"),
+                "debug": {**translation_debug, "plan_code": plan_ctx.get("plan_code")},
+            }
+
     cached = answer_from_cache(question, lang=(body.get("lang") or "en"))
     if cached:
         try:
             increment_cache_use(cached.get("id"))
         except Exception:
             pass
+
+        if not subscription_bypass:
+            usage = increment_daily_usage(account_id, inc=1)
+            if not usage.get("ok"):
+                return {
+                    "ok": False,
+                    "error": usage.get("error") or "daily_usage_update_failed",
+                    "root_cause": usage.get("root_cause"),
+                    "fix": usage.get("fix"),
+                    "details": usage.get("details"),
+                    "debug": {**translation_debug, "plan_code": plan_ctx.get("plan_code"), "from_cache": True},
+                }
+
         return {
             "ok": True,
             "answer": cached.get("answer"),
             "from_cache": True,
             "account_id": account_id,
             "subscription": body.get("__subscription"),
+            "plan_code": plan_ctx.get("plan_code"),
+            "usage_charged": True if not subscription_bypass else False,
+            "credits_consumed": 0,
             "debug": {**translation_debug},
         }
 
-    if not bypass:
-        bal = check_credit_balance(account_id)
+    if not bypass and not subscription_bypass:
+        bal = check_credit_balance(account_id, cost=1)
         if not bal.get("ok"):
             return {
                 "ok": False,
-                "error": "credit_check_failed",
+                "error": bal.get("error") or "credit_check_failed",
                 "root_cause": bal.get("root_cause") or bal.get("error"),
                 "fix": bal.get("fix") or "Fix credits table/RLS.",
                 "details": bal.get("details") or {"account_id": account_id},
-                "debug": {**translation_debug},
-            }
-
-        balance_val = int(bal.get("balance") or 0)
-        if balance_val <= 0:
-            return {
-                "ok": False,
-                "error": "insufficient_credits",
-                "root_cause": "ai_credits_balance_zero",
-                "fix": "Top up credits or subscribe to a plan that includes AI credits.",
-                "details": {"account_id": account_id, "balance": balance_val},
-                "debug": {**translation_debug},
+                "debug": {**translation_debug, "plan_code": plan_ctx.get("plan_code")},
             }
 
     try:
-        ai = call_ai(question=question, lang=(body.get("lang") or "en"), channel=(body.get("channel") or "web"))
+        ai = call_ai(
+            question=question,
+            lang=(body.get("lang") or "en"),
+            channel=(body.get("channel") or "web"),
+        )
     except Exception as e:
         return {
             "ok": False,
@@ -209,7 +286,7 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
             "root_cause": f"{type(e).__name__}: {_clip(str(e))}",
             "fix": "Check AI provider keys, network access, and ai_service configuration.",
             "details": {"account_id": account_id},
-            "debug": {**translation_debug},
+            "debug": {**translation_debug, "plan_code": plan_ctx.get("plan_code")},
         }
 
     if not isinstance(ai, dict) or not ai.get("ok"):
@@ -219,8 +296,34 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
             "root_cause": (ai or {}).get("root_cause") or (ai or {}).get("error") or "unknown_ai_failure",
             "fix": (ai or {}).get("fix") or "Inspect ai_service logs.",
             "details": {"account_id": account_id},
-            "debug": {**translation_debug},
+            "debug": {**translation_debug, "plan_code": plan_ctx.get("plan_code")},
         }
+
+    if not subscription_bypass:
+        usage = increment_daily_usage(account_id, inc=1)
+        if not usage.get("ok"):
+            return {
+                "ok": False,
+                "error": usage.get("error") or "daily_usage_update_failed",
+                "root_cause": usage.get("root_cause"),
+                "fix": usage.get("fix"),
+                "details": usage.get("details"),
+                "debug": {**translation_debug, "plan_code": plan_ctx.get("plan_code")},
+            }
+
+    credits_consumed = 0
+    if not bypass and not subscription_bypass:
+        consume = consume_credits(account_id, cost=1)
+        if not consume.get("ok"):
+            return {
+                "ok": False,
+                "error": consume.get("error") or "credit_consume_failed",
+                "root_cause": consume.get("root_cause"),
+                "fix": consume.get("fix"),
+                "details": consume.get("details"),
+                "debug": {**translation_debug, "plan_code": plan_ctx.get("plan_code")},
+            }
+        credits_consumed = 1
 
     return {
         "ok": True,
@@ -228,5 +331,8 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
         "from_cache": False,
         "account_id": account_id,
         "subscription": body.get("__subscription"),
+        "plan_code": plan_ctx.get("plan_code"),
+        "usage_charged": True if not subscription_bypass else False,
+        "credits_consumed": credits_consumed,
         "debug": {**translation_debug},
     }
