@@ -88,6 +88,15 @@ def _normalize_ip(ip: Optional[str]) -> str:
     return (ip or "").strip()
 
 
+def _normalize_email(email: Optional[str]) -> str:
+    return (email or "").strip().lower()
+
+
+def _looks_like_email(v: Optional[str]) -> bool:
+    s = _normalize_email(v)
+    return "@" in s and "." in s.split("@")[-1] if "@" in s else False
+
+
 def _build_fingerprint(ip: Optional[str], user_agent: Optional[str]) -> str:
     raw = f"fp:v1|ip:{_normalize_ip(ip)}|ua:{_normalize_user_agent(user_agent)}"
     return _sha256_hex(raw)
@@ -186,10 +195,10 @@ def request_web_otp(
     ip: Optional[str] = None,
     user_agent: Optional[str] = None,
 ) -> Dict[str, Any]:
-    contact = (contact or "").strip().lower()
+    contact = _normalize_email(contact)
     purpose = (purpose or "web_login").strip().lower()
 
-    if "@" not in contact:
+    if not _looks_like_email(contact):
         _log_auth_event(contact, ip, "request_otp", False, "invalid_contact_email")
         return _fail(stage="validate_contact", error="invalid_contact_email", extra={"contact": contact})
 
@@ -228,6 +237,7 @@ def request_web_otp(
             "tables": {"otp_table": WEB_OTP_TABLE, "token_table": WEB_TOKEN_TABLE, "accounts_table": "accounts"},
             "supabase": dbg,
             "otp_row_id": (created or {}).get("id"),
+            "device_id_received": bool(device_id),
         },
     }
 
@@ -259,6 +269,25 @@ def _mark_otp_used(otp_id: str) -> Dict[str, Any]:
     return _fail(stage="otp_mark_used", error="otp_mark_used_failed", root_cause=dbg.get("error_body") or data, debug=dbg)
 
 
+def _account_sort_key(row: Dict[str, Any]) -> tuple:
+    """
+    Prefer rows that already look healthy:
+    1. provider=web
+    2. email present
+    3. account_id present
+    4. newer updated_at/created_at naturally come first from query order
+    """
+    provider = (row.get("provider") or "").strip().lower()
+    email = _normalize_email(row.get("email"))
+    account_id = str(row.get("account_id") or "").strip()
+
+    return (
+        1 if provider == "web" else 0,
+        1 if _looks_like_email(email) else 0,
+        1 if account_id else 0,
+    )
+
+
 def _patch_account(accounts_row_id: str, patch: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
     ok, data, dbg = _sb_request("PATCH", f"/accounts?id=eq.{accounts_row_id}", json=patch)
     if not ok:
@@ -266,41 +295,110 @@ def _patch_account(accounts_row_id: str, patch: Dict[str, Any]) -> Tuple[bool, D
     return True, {"ok": True, "supabase": dbg}
 
 
-def _get_or_create_web_account(contact: str) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
-    contact = (contact or "").strip().lower()
-
+def _lookup_accounts_by_provider_user_id(contact: str) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
     params = {
-        "select": "id,account_id,provider,provider_user_id,email,created_at,updated_at",
-        "provider": "eq.web",
+        "select": "id,account_id,provider,provider_user_id,email,display_name,created_at,updated_at",
         "provider_user_id": f"eq.{contact}",
-        "limit": "1",
+        "order": "updated_at.desc,created_at.desc",
+        "limit": "20",
     }
     ok, data, dbg = _sb_request("GET", "/accounts", params=params)
     if not ok:
-        return None, _fail(stage="account_lookup", error="account_lookup_failed", root_cause=dbg.get("error_body") or data, debug=dbg)
+        return [], _fail(stage="account_lookup_provider_user_id", error="account_lookup_failed", root_cause=dbg.get("error_body") or data, debug=dbg)
 
     rows = data if isinstance(data, list) else []
-    if rows:
-        acct = rows[0] or {}
-        row_id = str(acct.get("id") or "").strip()
-        acct_id = str(acct.get("account_id") or "").strip()
-        email = str(acct.get("email") or "").strip().lower()
+    return rows, None
 
-        patch: Dict[str, Any] = {}
-        if row_id and not email:
-            patch["email"] = contact
-        if row_id and not acct_id:
-            patch["account_id"] = row_id
 
-        if patch:
-            patch["updated_at"] = _now_utc().isoformat()
-            ok2, info = _patch_account(row_id, patch)
-            if not ok2:
-                acct["_repair_warning"] = info
-            else:
-                acct.update(patch)
+def _lookup_accounts_by_email(contact: str) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    params = {
+        "select": "id,account_id,provider,provider_user_id,email,display_name,created_at,updated_at",
+        "email": f"eq.{contact}",
+        "order": "updated_at.desc,created_at.desc",
+        "limit": "20",
+    }
+    ok, data, dbg = _sb_request("GET", "/accounts", params=params)
+    if not ok:
+        return [], _fail(stage="account_lookup_email", error="account_lookup_failed", root_cause=dbg.get("error_body") or data, debug=dbg)
 
-        return acct, None
+    rows = data if isinstance(data, list) else []
+    return rows, None
+
+
+def _repair_account_row(acct: Dict[str, Any], contact: str) -> Dict[str, Any]:
+    """
+    Self-heal legacy rows:
+    - ensure email exists
+    - ensure provider=web
+    - ensure provider_user_id=email
+    - ensure account_id=id
+    """
+    acct = dict(acct or {})
+    row_id = str(acct.get("id") or "").strip()
+    if not row_id:
+        acct["_repair_warning"] = {"error": "account_row_missing_id"}
+        return acct
+
+    patch: Dict[str, Any] = {}
+    if not _looks_like_email(acct.get("email")):
+        patch["email"] = contact
+
+    provider = (acct.get("provider") or "").strip().lower()
+    if provider != "web":
+        patch["provider"] = "web"
+
+    provider_user_id = _normalize_email(acct.get("provider_user_id"))
+    if provider_user_id != contact:
+        patch["provider_user_id"] = contact
+
+    account_id = str(acct.get("account_id") or "").strip()
+    if not account_id:
+        patch["account_id"] = row_id
+
+    if patch:
+        patch["updated_at"] = _now_utc().isoformat()
+        ok, info = _patch_account(row_id, patch)
+        if not ok:
+            acct["_repair_warning"] = info
+        else:
+            acct.update(patch)
+
+    return acct
+
+
+def _get_or_create_web_account(contact: str) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """
+    Reliable resolver for authenticated web users.
+
+    Strategy:
+    1. Search by provider_user_id=email
+    2. Search by email
+    3. Choose best row
+    4. Repair row if needed
+    5. If none exists, create fresh canonical row
+    """
+    contact = _normalize_email(contact)
+
+    rows_by_puid, err1 = _lookup_accounts_by_provider_user_id(contact)
+    if err1:
+        return None, err1
+
+    rows_by_email, err2 = _lookup_accounts_by_email(contact)
+    if err2:
+        return None, err2
+
+    merged: Dict[str, Dict[str, Any]] = {}
+    for row in (rows_by_puid or []) + (rows_by_email or []):
+        row_id = str(row.get("id") or "").strip()
+        if row_id:
+            merged[row_id] = row
+
+    candidates = list(merged.values())
+    if candidates:
+        candidates.sort(key=_account_sort_key, reverse=True)
+        chosen = _repair_account_row(candidates[0], contact)
+        chosen["_candidate_count"] = len(candidates)
+        return chosen, None
 
     new_id = str(uuid.uuid4())
     row = {
@@ -312,16 +410,35 @@ def _get_or_create_web_account(contact: str) -> Tuple[Optional[Dict[str, Any]], 
         "created_at": _now_utc().isoformat(),
         "updated_at": _now_utc().isoformat(),
     }
+
     ok3, data3, dbg3 = _sb_request("POST", "/accounts", json=row)
     if not ok3:
         return None, _fail(stage="account_create", error="account_create_failed", root_cause=dbg3.get("error_body") or data3, debug=dbg3)
 
     created = data3[0] if isinstance(data3, list) and data3 else data3
+    created = created or row
+
+    # extra verification read-back
+    verify_rows, verify_err = _lookup_accounts_by_provider_user_id(contact)
+    if verify_err:
+        created["_verify_warning"] = verify_err
+        return created, None
+
+    if verify_rows:
+        verify_rows.sort(key=_account_sort_key, reverse=True)
+        chosen = _repair_account_row(verify_rows[0], contact)
+        chosen["_candidate_count"] = len(verify_rows)
+        return chosen, None
+
     return created, None
 
 
 def _revoke_all_sessions_for_account(account_row_id: str) -> None:
-    _sb_request("PATCH", f"/{WEB_TOKEN_TABLE}?account_id=eq.{account_row_id}", json={"revoked": True, "revoked_at": _now_utc().isoformat()})
+    _sb_request(
+        "PATCH",
+        f"/{WEB_TOKEN_TABLE}?account_id=eq.{account_row_id}",
+        json={"revoked": True, "revoked_at": _now_utc().isoformat()},
+    )
 
 
 def _insert_web_session(*, account_row_id: str, ip: Optional[str], user_agent: Optional[str]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
@@ -369,7 +486,7 @@ def _insert_web_session(*, account_row_id: str, ip: Optional[str], user_agent: O
 
 
 def verify_web_otp_and_issue_token(*, contact: str, otp: str, purpose: str, ip: Optional[str] = None, user_agent: Optional[str] = None) -> Dict[str, Any]:
-    contact = (contact or "").strip().lower()
+    contact = _normalize_email(contact)
     purpose = (purpose or "web_login").strip().lower()
     otp = (otp or "").strip()
 
@@ -377,7 +494,7 @@ def verify_web_otp_and_issue_token(*, contact: str, otp: str, purpose: str, ip: 
         _log_auth_event(contact, ip, "verify_failed", False, "contact_and_otp_required")
         return _fail(stage="validate_input", error="contact_and_otp_required")
 
-    if "@" not in contact:
+    if not _looks_like_email(contact):
         _log_auth_event(contact, ip, "verify_failed", False, "invalid_contact_email")
         return _fail(stage="validate_contact", error="invalid_contact_email", extra={"contact": contact})
 
@@ -448,6 +565,8 @@ def verify_web_otp_and_issue_token(*, contact: str, otp: str, purpose: str, ip: 
                 "provider_user_id": acct.get("provider_user_id"),
                 "email": acct.get("email") or contact,
                 "repair_warning": acct.get("_repair_warning"),
+                "candidate_count": acct.get("_candidate_count"),
+                "verify_warning": acct.get("_verify_warning"),
             },
             "session_insert": {
                 "table": WEB_TOKEN_TABLE,
@@ -507,7 +626,7 @@ def _lookup_token_plain(token_plain: str, *, ip: Optional[str] = None, user_agen
     token_hash = _hash_token(token_plain)
 
     params = {
-        "select": "id,account_id,expires_at,revoked,revoked_at,last_seen_at,created_at,fingerprint,accounts(id,account_id)",
+        "select": "id,account_id,expires_at,revoked,revoked_at,last_seen_at,created_at,fingerprint,accounts(id,account_id,email,provider_user_id,provider)",
         "token_hash": f"eq.{token_hash}",
         "limit": "1",
     }
