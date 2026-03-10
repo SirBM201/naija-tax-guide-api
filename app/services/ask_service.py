@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 """
-ASK SERVICE (CANONICAL + EXACT CACHE + HYBRID SEARCH + AI FALLBACK)
+ASK SERVICE (CANONICAL)
 
-Flow:
-1. validate account / subscription / limits
-2. exact cache
-3. hybrid keyword + semantic search
-4. if strong hit -> return cached answer
-5. if weak/no hit -> call AI
-6. save reusable answer to qa_cache
-7. insert semantic embedding for future vector reuse
+- Uses ONLY canonical identity: accounts.account_id
+- If older clients send accounts.id, it translates to accounts.account_id and exposes it in debug
+- Enforces:
+  - active subscription injected by ask route
+  - daily plan limit
+  - credit balance
+- Charges:
+  - cached answer -> counts toward daily limit, does NOT consume credits
+  - fresh AI answer -> counts toward daily limit AND consumes 1 credit after success
+- Writes:
+  - qa_history
+  - qa_embeddings (when cache_id exists and embeddings are configured)
 """
 
 import os
@@ -18,7 +22,6 @@ import uuid
 from typing import Any, Dict, Optional
 
 from app.core.supabase_client import supabase
-from app.services.ai_service import call_ai
 from app.services.credits_service import (
     check_credit_balance,
     consume_credits,
@@ -29,16 +32,12 @@ from app.services.credits_service import (
 from app.services.qa_cache_service import (
     answer_from_cache,
     increment_cache_use,
-    normalize_question_for_cache,
-    derive_canonical_key,
     upsert_ai_answer_to_cache_best_effort,
+    derive_canonical_key,
+    normalize_question_for_cache,
 )
-from app.services.qa_semantic_cache_service import (
-    increment_embedding_hit_best_effort,
-    insert_semantic_embedding_best_effort,
-    semantic_match_question,
-)
-from app.services.qa_hybrid_search_service import hybrid_match_question
+from app.services.ai_service import call_ai
+from app.services.semantic_runtime_service import semantic_write_runtime
 
 
 def _sb():
@@ -77,7 +76,7 @@ def resolve_canonical_account_id(raw_account_id: str) -> Dict[str, Any]:
             "ok": False,
             "error": "account_required",
             "root_cause": "missing_account_id",
-            "fix": "Provide account_id or authenticate so the backend derives it.",
+            "fix": "Provide account_id or authenticate via web cookie/bearer so the server can derive it.",
         }
 
     if not _is_uuid(v):
@@ -111,7 +110,7 @@ def resolve_canonical_account_id(raw_account_id: str) -> Dict[str, Any]:
                 "ok": False,
                 "error": "account_not_found",
                 "root_cause": "no accounts row matches account_id nor id",
-                "fix": "Ensure the account exists and OTP/session flow has run.",
+                "fix": "Ensure the account exists. If using web auth, verify OTP first to create/resolve account.",
                 "details": {"provided": v},
             }
 
@@ -128,7 +127,7 @@ def resolve_canonical_account_id(raw_account_id: str) -> Dict[str, Any]:
                     "ok": False,
                     "error": "account_id_repair_failed",
                     "root_cause": f"accounts.account_id was NULL and repair failed: {type(e).__name__}: {_clip(str(e))}",
-                    "fix": "Run SQL backfill for accounts.account_id and ensure service-role writes are available.",
+                    "fix": "Run SQL: update accounts set account_id=id where account_id is null; then UNIQUE index on account_id.",
                     "details": {"row_id": row_id},
                 }
 
@@ -176,81 +175,10 @@ def _resolve_plan_context(body: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _best_answer_from_hybrid(best: Optional[Dict[str, Any]]) -> Optional[str]:
-    if not best:
-        return None
-
-    row = best.get("row") if isinstance(best, dict) else None
+def _extract_cache_id(row: Optional[Dict[str, Any]]) -> Optional[str]:
     if not isinstance(row, dict):
         return None
-
-    return (row.get("answer") or "").strip() or None
-
-
-def _best_cache_id_from_hybrid(best: Optional[Dict[str, Any]]) -> Optional[str]:
-    if not best:
-        return None
-
-    row = best.get("row") if isinstance(best, dict) else None
-    if not isinstance(row, dict):
-        return None
-
-    cache_id = row.get("cache_id") or row.get("id")
-    return str(cache_id).strip() if cache_id else None
-
-
-def _best_embedding_id_from_hybrid(best: Optional[Dict[str, Any]]) -> Optional[str]:
-    if not best:
-        return None
-
-    mode = str(best.get("mode") or "").strip().lower()
-    row = best.get("row") if isinstance(best, dict) else None
-    if not isinstance(row, dict):
-        return None
-
-    if mode == "semantic":
-        embedding_id = row.get("id")
-        return str(embedding_id).strip() if embedding_id else None
-
-    return None
-
-
-def _log_history_best_effort(
-    *,
-    account_id: str,
-    question: str,
-    answer: str,
-    source: str,
-    provider: str,
-    lang: str,
-    normalized_question: Optional[str],
-    canonical_key: Optional[str],
-    from_cache: bool,
-    plan_code: Optional[str],
-    credits_consumed: int,
-    usage_charged: bool,
-    channel: str,
-) -> None:
-    payload = {
-        "account_id": account_id,
-        "question": question,
-        "answer": answer,
-        "source": source,
-        "provider": provider,
-        "lang": lang,
-        "normalized_question": normalized_question,
-        "canonical_key": canonical_key,
-        "from_cache": bool(from_cache),
-        "plan_code": plan_code,
-        "credits_consumed": int(credits_consumed or 0),
-        "usage_charged": bool(usage_charged),
-        "channel": channel,
-    }
-
-    try:
-        _sb().table("qa_history").insert(payload).execute()
-    except Exception:
-        return
+    return str(row.get("id") or "").strip() or None
 
 
 def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
@@ -264,9 +192,7 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     lang = (body.get("lang") or "en").strip() or "en"
-    channel = (body.get("channel") or body.get("provider") or "web").strip().lower() or "web"
-    provider = (body.get("provider") or "web").strip().lower() or "web"
-
+    provider = (body.get("provider") or "web").strip() or "web"
     normalized_question = normalize_question_for_cache(question)
     canonical_key = derive_canonical_key(question, lang=lang)
 
@@ -325,7 +251,6 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
                 "debug": {**translation_debug, "plan_code": plan_ctx.get("plan_code")},
             }
 
-    # 1. Exact cache first (fastest and safest)
     cached = answer_from_cache(question, lang=lang, canonical_key=canonical_key)
     if cached:
         try:
@@ -345,118 +270,37 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
                     "debug": {**translation_debug, "plan_code": plan_ctx.get("plan_code"), "from_cache": True},
                 }
 
-        answer_text = (cached.get("answer") or "").strip()
-        _log_history_best_effort(
+        semantic_runtime = semantic_write_runtime(
             account_id=account_id,
             question=question,
-            answer=answer_text,
-            source="exact_cache",
+            answer=str(cached.get("answer") or ""),
+            source="cache",
             provider=provider,
             lang=lang,
             normalized_question=normalized_question,
             canonical_key=canonical_key,
-            from_cache=True,
-            plan_code=plan_ctx.get("plan_code"),
-            credits_consumed=0,
-            usage_charged=(not subscription_bypass),
-            channel=channel,
+            cache_id=_extract_cache_id(cached),
         )
 
         return {
             "ok": True,
-            "answer": answer_text,
+            "answer": cached.get("answer"),
             "from_cache": True,
-            "cache_mode": "exact",
             "account_id": account_id,
             "subscription": body.get("__subscription"),
             "plan_code": plan_ctx.get("plan_code"),
             "usage_charged": True if not subscription_bypass else False,
             "credits_consumed": 0,
-            "debug": {**translation_debug, "canonical_key": canonical_key},
+            "history_written": bool((semantic_runtime.get("history_result") or {}).get("ok")),
+            "embedding_written": bool((semantic_runtime.get("embedding_result") or {}).get("ok")),
+            "embedding_id": semantic_runtime.get("embedding_id"),
+            "debug": {
+                **translation_debug,
+                "canonical_key": canonical_key,
+                "semantic_runtime": semantic_runtime,
+            },
         }
 
-    # 2. Hybrid search (keyword + vector)
-    hybrid = hybrid_match_question(
-        question=question,
-        lang=lang,
-        jurisdiction="nigeria",
-    )
-
-    if hybrid.get("ok") and hybrid.get("decision") in {"direct_hit", "review_hit"}:
-        best = hybrid.get("best")
-        answer_text = _best_answer_from_hybrid(best)
-
-        if answer_text:
-            cache_id = _best_cache_id_from_hybrid(best)
-            embedding_id = _best_embedding_id_from_hybrid(best)
-
-            if cache_id:
-                try:
-                    increment_cache_use(cache_id)
-                except Exception:
-                    pass
-
-            if embedding_id:
-                try:
-                    increment_embedding_hit_best_effort(embedding_id)
-                except Exception:
-                    pass
-
-            if not subscription_bypass:
-                usage = increment_daily_usage(account_id, inc=1)
-                if not usage.get("ok"):
-                    return {
-                        "ok": False,
-                        "error": usage.get("error") or "daily_usage_update_failed",
-                        "root_cause": usage.get("root_cause"),
-                        "fix": usage.get("fix"),
-                        "details": usage.get("details"),
-                        "debug": {
-                            **translation_debug,
-                            "plan_code": plan_ctx.get("plan_code"),
-                            "hybrid": hybrid,
-                        },
-                    }
-
-            cache_mode = "hybrid_direct" if hybrid.get("decision") == "direct_hit" else "hybrid_review"
-
-            _log_history_best_effort(
-                account_id=account_id,
-                question=question,
-                answer=answer_text,
-                source=cache_mode,
-                provider=provider,
-                lang=lang,
-                normalized_question=normalized_question,
-                canonical_key=canonical_key,
-                from_cache=True,
-                plan_code=plan_ctx.get("plan_code"),
-                credits_consumed=0,
-                usage_charged=(not subscription_bypass),
-                channel=channel,
-            )
-
-            return {
-                "ok": True,
-                "answer": answer_text,
-                "from_cache": True,
-                "cache_mode": cache_mode,
-                "account_id": account_id,
-                "subscription": body.get("__subscription"),
-                "plan_code": plan_ctx.get("plan_code"),
-                "usage_charged": True if not subscription_bypass else False,
-                "credits_consumed": 0,
-                "debug": {
-                    **translation_debug,
-                    "canonical_key": canonical_key,
-                    "hybrid": {
-                        "decision": hybrid.get("decision"),
-                        "pipeline": hybrid.get("pipeline"),
-                    },
-                },
-            }
-
-    # 3. Fresh AI answer path
     if not bypass and not subscription_bypass:
         bal = check_credit_balance(account_id, cost=1)
         if not bal.get("ok"):
@@ -469,11 +313,21 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
                 "debug": {**translation_debug, "plan_code": plan_ctx.get("plan_code")},
             }
 
-    ai = call_ai(
-        question=question,
-        lang=lang,
-        channel=channel,
-    )
+    try:
+        ai = call_ai(
+            question=question,
+            lang=lang,
+            channel=(body.get("channel") or "web"),
+        )
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": "ai_call_failed",
+            "root_cause": f"{type(e).__name__}: {_clip(str(e))}",
+            "fix": "Check AI provider keys, network access, and ai_service configuration.",
+            "details": {"account_id": account_id},
+            "debug": {**translation_debug, "plan_code": plan_ctx.get("plan_code"), "canonical_key": canonical_key},
+        }
 
     if not isinstance(ai, dict) or not ai.get("ok"):
         return {
@@ -482,11 +336,7 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
             "root_cause": (ai or {}).get("root_cause") or (ai or {}).get("error") or "unknown_ai_failure",
             "fix": (ai or {}).get("fix") or "Inspect ai_service logs.",
             "details": {"account_id": account_id},
-            "debug": {
-                **translation_debug,
-                "plan_code": plan_ctx.get("plan_code"),
-                "canonical_key": canonical_key,
-            },
+            "debug": {**translation_debug, "plan_code": plan_ctx.get("plan_code"), "canonical_key": canonical_key},
         }
 
     answer_text = (ai.get("answer") or "").strip()
@@ -526,10 +376,11 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
             }
         credits_consumed = 1
 
-    # Save to exact cache
+    cache_write_warning = None
+    cache_id: Optional[str] = None
     try:
-        upsert_ai_answer_to_cache_best_effort(
-            normalized_question=normalized_question,
+        cache_res = upsert_ai_answer_to_cache_best_effort(
+            normalized_question=question,
             answer=answer_text,
             source="ai",
             lang=lang,
@@ -537,44 +388,22 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
             enabled=True,
             priority=0,
         )
-    except Exception:
-        pass
 
-    # Read back cache row so we can attach semantic embedding
-    cache_row_id: Optional[str] = None
-    try:
-        q = (
-            _sb()
-            .table("qa_cache")
-            .select("id")
-            .eq("normalized_question", normalized_question)
-            .eq("lang", lang)
-            .limit(1)
-            .execute()
-        )
-        rows = getattr(q, "data", None) or []
-        if rows:
-            cache_row_id = str(rows[0].get("id") or "").strip() or None
-    except Exception:
-        cache_row_id = None
+        if isinstance(cache_res, dict):
+            cache_row = cache_res.get("cache") or cache_res.get("row") or cache_res.get("data") or cache_res
+            if isinstance(cache_row, dict):
+                cache_id = str(cache_row.get("id") or "").strip() or None
+    except Exception as e:
+        cache_write_warning = f"{type(e).__name__}: {_clip(str(e))}"
 
-    if cache_row_id:
+    if not cache_id:
         try:
-            insert_semantic_embedding_best_effort(
-                cache_id=cache_row_id,
-                question=question,
-                normalized_question=normalized_question,
-                canonical_key=canonical_key,
-                lang=lang,
-                jurisdiction="nigeria",
-                trust_score=0.85,
-                review_status="approved",
-                source_type="cache",
-            )
+            lookup = answer_from_cache(question, lang=lang, canonical_key=canonical_key)
+            cache_id = _extract_cache_id(lookup)
         except Exception:
             pass
 
-    _log_history_best_effort(
+    semantic_runtime = semantic_write_runtime(
         account_id=account_id,
         question=question,
         answer=answer_text,
@@ -583,26 +412,26 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
         lang=lang,
         normalized_question=normalized_question,
         canonical_key=canonical_key,
-        from_cache=False,
-        plan_code=plan_ctx.get("plan_code"),
-        credits_consumed=credits_consumed,
-        usage_charged=(not subscription_bypass),
-        channel=channel,
+        cache_id=cache_id,
     )
 
     return {
         "ok": True,
         "answer": answer_text,
         "from_cache": False,
-        "cache_mode": "ai_fallback",
         "account_id": account_id,
         "subscription": body.get("__subscription"),
         "plan_code": plan_ctx.get("plan_code"),
         "usage_charged": True if not subscription_bypass else False,
         "credits_consumed": credits_consumed,
+        "history_written": bool((semantic_runtime.get("history_result") or {}).get("ok")),
+        "embedding_written": bool((semantic_runtime.get("embedding_result") or {}).get("ok")),
+        "embedding_id": semantic_runtime.get("embedding_id"),
         "debug": {
             **translation_debug,
             "canonical_key": canonical_key,
-            "semantic_promoted": bool(cache_row_id),
+            "cache_id": cache_id,
+            "cache_write_warning": cache_write_warning,
+            "semantic_runtime": semantic_runtime,
         },
     }
