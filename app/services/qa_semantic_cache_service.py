@@ -15,6 +15,13 @@ def _clip(v: Any, n: int = 260) -> str:
     return s if len(s) <= n else s[:n] + "..."
 
 
+def _safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        return float(v)
+    except Exception:
+        return default
+
+
 def semantic_match_question(
     *,
     question: str,
@@ -65,6 +72,11 @@ def semantic_match_question(
             "ok": True,
             "matches": rows,
             "count": len(rows),
+            "embedding_meta": {
+                "provider": emb.get("provider"),
+                "model": emb.get("model"),
+                "dimensions": emb.get("dimensions"),
+            },
         }
 
     except Exception as e:
@@ -91,10 +103,11 @@ def choose_best_semantic_match(
         }
 
     best = matches[0]
-    similarity = float(best.get("similarity") or 0.0)
-    trust_score = float(best.get("trust_score") or 0.0)
+    similarity = _safe_float(best.get("similarity"), 0.0)
+    trust_score = _safe_float(best.get("trust_score"), 0.0)
+    hit_count = float(int(best.get("hit_count") or 0))
 
-    adjusted_score = similarity * 0.85 + trust_score * 0.15
+    adjusted_score = (similarity * 0.80) + (trust_score * 0.18) + (min(hit_count, 20) * 0.001)
 
     if adjusted_score >= direct_threshold:
         return {
@@ -140,8 +153,90 @@ def increment_embedding_hit_best_effort(embedding_id: str) -> None:
         _sb().table("qa_embeddings").update(
             {
                 "hit_count": count + 1,
-                "last_used_at": "now()",
             }
         ).eq("id", embedding_id).execute()
     except Exception:
         return
+
+
+def insert_semantic_embedding_best_effort(
+    *,
+    cache_id: str,
+    question: str,
+    normalized_question: Optional[str] = None,
+    canonical_key: Optional[str] = None,
+    lang: str = "en",
+    jurisdiction: str = "nigeria",
+    tax_type: Optional[str] = None,
+    audience: Optional[str] = None,
+    trust_score: float = 0.85,
+    review_status: str = "approved",
+    policy_version: Optional[str] = None,
+    source_type: str = "cache",
+) -> Dict[str, Any]:
+    cache_id = (cache_id or "").strip()
+    question = (question or "").strip()
+    normalized_question = (normalized_question or "").strip() or None
+    canonical_key = (canonical_key or "").strip() or None
+    lang = (lang or "en").strip() or "en"
+    jurisdiction = (jurisdiction or "nigeria").strip().lower() or "nigeria"
+    review_status = (review_status or "approved").strip().lower() or "approved"
+    source_type = (source_type or "cache").strip().lower() or "cache"
+
+    if not cache_id:
+        return {
+            "ok": False,
+            "error": "cache_id_required",
+            "root_cause": "missing_cache_id",
+        }
+
+    if not question:
+        return {
+            "ok": False,
+            "error": "question_required",
+            "root_cause": "missing_question",
+        }
+
+    emb = create_embedding(normalized_question or question)
+    if not emb.get("ok"):
+        return emb
+
+    vector = emb.get("embedding")
+    if not vector:
+        return {
+            "ok": False,
+            "error": "embedding_missing",
+            "root_cause": "Embedding provider returned no vector.",
+        }
+
+    payload = {
+        "cache_id": cache_id,
+        "question": question,
+        "normalized_question": normalized_question,
+        "canonical_key": canonical_key,
+        "lang": lang,
+        "jurisdiction": jurisdiction,
+        "tax_type": tax_type,
+        "audience": audience,
+        "trust_score": float(trust_score),
+        "review_status": review_status,
+        "policy_version": policy_version,
+        "source_type": source_type,
+        "embedding": vector,
+    }
+
+    try:
+        _sb().table("qa_embeddings").insert(payload).execute()
+        return {
+            "ok": True,
+            "cache_id": cache_id,
+            "provider": emb.get("provider"),
+            "model": emb.get("model"),
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": "semantic_embedding_insert_failed",
+            "root_cause": f"{type(e).__name__}: {_clip(e)}",
+            "fix": "Check qa_embeddings schema, vector extension, and backend DB access.",
+        }
