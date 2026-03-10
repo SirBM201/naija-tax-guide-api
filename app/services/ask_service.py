@@ -12,6 +12,7 @@ ASK SERVICE (CANONICAL)
 - Charges:
   - cached answer -> counts toward daily limit, does NOT consume credits
   - fresh AI answer -> counts toward daily limit AND consumes 1 credit after success
+- Persists successful user-visible Q/A to qa_history best-effort
 """
 
 import os
@@ -29,9 +30,12 @@ from app.services.credits_service import (
 from app.services.qa_cache_service import (
     answer_from_cache,
     increment_cache_use,
+    normalize_question_for_cache,
     upsert_ai_answer_to_cache_best_effort,
     derive_canonical_key,
 )
+from app.services.qa_history_service import log_history_item_best_effort
+from app.services.qa_logging_service import log_qa_event_best_effort
 from app.services.ai_service import call_ai
 
 
@@ -181,6 +185,8 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     lang = (body.get("lang") or "en").strip() or "en"
+    channel = (body.get("channel") or "web").strip() or "web"
+    normalized_question = normalize_question_for_cache(question)
     canonical_key = derive_canonical_key(question, lang=lang)
 
     raw_account_id = (body.get("account_id") or "").strip()
@@ -229,6 +235,26 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
 
         daily = enforce_daily_limit(account_id, int(plan_ctx.get("daily_answers_limit") or 0))
         if not daily.get("ok"):
+            try:
+                log_qa_event_best_effort(
+                    account_id=account_id,
+                    mode="ask",
+                    lang=lang,
+                    question_raw=question,
+                    normalized_question=normalized_question,
+                    canonical_key=canonical_key,
+                    outcome="blocked",
+                    reason=daily.get("error") or "daily_limit_reached",
+                    source=None,
+                    cache_hit=False,
+                    library_hit=False,
+                    ai_used=False,
+                    ai_credit_cost=0,
+                    latency_ms=0,
+                )
+            except Exception:
+                pass
+
             return {
                 "ok": False,
                 "error": daily.get("error") or "daily_limit_check_failed",
@@ -257,9 +283,49 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
                     "debug": {**translation_debug, "plan_code": plan_ctx.get("plan_code"), "from_cache": True},
                 }
 
+        answer_text = str(cached.get("answer") or "").strip()
+
+        try:
+            log_history_item_best_effort(
+                account_id=account_id,
+                question=question,
+                answer=answer_text,
+                lang=lang,
+                source="cache",
+                from_cache=True,
+                canonical_key=canonical_key,
+                normalized_question=normalized_question,
+                plan_code=plan_ctx.get("plan_code"),
+                credits_consumed=0,
+                usage_charged=not subscription_bypass,
+                channel=channel,
+            )
+        except Exception:
+            pass
+
+        try:
+            log_qa_event_best_effort(
+                account_id=account_id,
+                mode="ask",
+                lang=lang,
+                question_raw=question,
+                normalized_question=normalized_question,
+                canonical_key=canonical_key,
+                outcome="ok",
+                reason=None,
+                source="cache",
+                cache_hit=True,
+                library_hit=False,
+                ai_used=False,
+                ai_credit_cost=0,
+                latency_ms=0,
+            )
+        except Exception:
+            pass
+
         return {
             "ok": True,
-            "answer": cached.get("answer"),
+            "answer": answer_text,
             "from_cache": True,
             "account_id": account_id,
             "subscription": body.get("__subscription"),
@@ -272,6 +338,26 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
     if not bypass and not subscription_bypass:
         bal = check_credit_balance(account_id, cost=1)
         if not bal.get("ok"):
+            try:
+                log_qa_event_best_effort(
+                    account_id=account_id,
+                    mode="ask",
+                    lang=lang,
+                    question_raw=question,
+                    normalized_question=normalized_question,
+                    canonical_key=canonical_key,
+                    outcome="blocked",
+                    reason=bal.get("error") or "insufficient_credits",
+                    source=None,
+                    cache_hit=False,
+                    library_hit=False,
+                    ai_used=False,
+                    ai_credit_cost=0,
+                    latency_ms=0,
+                )
+            except Exception:
+                pass
+
             return {
                 "ok": False,
                 "error": bal.get("error") or "credit_check_failed",
@@ -285,7 +371,7 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
         ai = call_ai(
             question=question,
             lang=lang,
-            channel=(body.get("channel") or "web"),
+            channel=channel,
         )
     except Exception as e:
         return {
@@ -298,6 +384,26 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     if not isinstance(ai, dict) or not ai.get("ok"):
+        try:
+            log_qa_event_best_effort(
+                account_id=account_id,
+                mode="ask",
+                lang=lang,
+                question_raw=question,
+                normalized_question=normalized_question,
+                canonical_key=canonical_key,
+                outcome="error",
+                reason=(ai or {}).get("error") or "ai_failed",
+                source="ai",
+                cache_hit=False,
+                library_hit=False,
+                ai_used=True,
+                ai_credit_cost=0,
+                latency_ms=0,
+            )
+        except Exception:
+            pass
+
         return {
             "ok": False,
             "error": "ai_failed",
@@ -353,6 +459,44 @@ def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
             canonical_key=canonical_key,
             enabled=True,
             priority=0,
+        )
+    except Exception:
+        pass
+
+    try:
+        log_history_item_best_effort(
+            account_id=account_id,
+            question=question,
+            answer=answer_text,
+            lang=lang,
+            source="ai",
+            from_cache=False,
+            canonical_key=canonical_key,
+            normalized_question=normalized_question,
+            plan_code=plan_ctx.get("plan_code"),
+            credits_consumed=credits_consumed,
+            usage_charged=not subscription_bypass,
+            channel=channel,
+        )
+    except Exception:
+        pass
+
+    try:
+        log_qa_event_best_effort(
+            account_id=account_id,
+            mode="ask",
+            lang=lang,
+            question_raw=question,
+            normalized_question=normalized_question,
+            canonical_key=canonical_key,
+            outcome="ok",
+            reason=None,
+            source="ai",
+            cache_hit=False,
+            library_hit=False,
+            ai_used=True,
+            ai_credit_cost=credits_consumed,
+            latency_ms=0,
         )
     except Exception:
         pass
