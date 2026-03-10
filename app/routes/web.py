@@ -1,41 +1,54 @@
-# app/routes/me.py
-from flask import Blueprint, jsonify
-from app.core.supabase_client import supabase
-from app.services.auth_service import get_current_user
+from __future__ import annotations
 
-bp = Blueprint("me", __name__)
+from flask import Blueprint, jsonify, request
+
+bp = Blueprint("web", __name__)
 
 
-@bp.get("/me")
-def me():
-    user = get_current_user()
-    if not user:
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
+def _client_ip() -> str | None:
+    forwarded = (request.headers.get("X-Forwarded-For") or "").strip()
+    if forwarded:
+        return forwarded.split(",")[0].strip() or None
+    return (request.remote_addr or "").strip() or None
 
-    sb = supabase()
-    uid = user["id"]
 
-    # Prefer global account id: accounts.account_id
-    res = sb.table("accounts").select("id,account_id").eq("supabase_user_id", uid).limit(1).execute()
-    if res.data:
-        row = res.data[0]
-        gid = (row.get("account_id") or row.get("id") or "")
-        return jsonify({"ok": True, "account_id": gid, "user_id": uid})
-
-    # Create account if missing
-    created = sb.table("accounts").insert({"supabase_user_id": uid, "provider": "web"}).select("id,account_id").execute()
-    row = (created.data or [{}])[0]
-    gid = (row.get("account_id") or row.get("id") or "")
-
-    # Failure exposer if something odd happens
-    if not gid:
-        return jsonify({
-            "ok": False,
-            "error": "account_create_failed",
-            "debug": {
-                "reason": "missing_id_and_account_id",
-                "suggestion": "Ensure accounts has id default and/or account_id backfill trigger.",
+@bp.get("/web/ping")
+def web_ping():
+    """
+    Lightweight route to confirm the web blueprint is mounted correctly.
+    """
+    return (
+        jsonify(
+            {
+                "ok": True,
+                "service": "naija-tax-guide-api",
+                "route_group": "web",
+                "message": "Web routes are mounted correctly.",
             }
-        }), 500
+        ),
+        200,
+    )
 
-    return jsonify({"ok": True, "account_id": gid, "user_id": uid})
+
+@bp.get("/web/status")
+def web_status():
+    """
+    Small diagnostic-safe web status endpoint.
+    Does not require authentication.
+    Keeps app.routes.web valid and non-conflicting.
+    """
+    return (
+        jsonify(
+            {
+                "ok": True,
+                "route_group": "web",
+                "request": {
+                    "method": request.method,
+                    "path": request.path,
+                    "client_ip": _client_ip(),
+                    "user_agent": (request.headers.get("User-Agent") or "").strip() or None,
+                },
+            }
+        ),
+        200,
+    )
