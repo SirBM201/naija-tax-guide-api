@@ -1,4 +1,3 @@
-# app/__init__.py
 from __future__ import annotations
 
 import os
@@ -25,7 +24,6 @@ def _truthy(v: str | None) -> bool:
 
 
 def _cookie_mode_enabled() -> bool:
-    # Cookie auth mode requires explicit origins + credentials
     if _truthy(os.getenv("COOKIE_AUTH_ENABLED", "1")):
         return True
     if _truthy(os.getenv("WEB_AUTH_ENABLED", "")) and (os.getenv("COOKIE_SAMESITE") or "").strip():
@@ -77,15 +75,11 @@ def create_app() -> Flask:
 
     api_prefix = _normalize_api_prefix(API_PREFIX)
 
-    # ---------- CORS ----------
     cookie_mode = _cookie_mode_enabled()
     origins, supports_credentials, cors_err = _parse_origins(CORS_ORIGINS, cookie_mode=cookie_mode)
     if cors_err:
         raise RuntimeError(f"[CORS] {cors_err}")
 
-    # When cookie_mode=True:
-    # - supports_credentials must be True
-    # - origins must be explicit list (not '*')
     CORS(
         app,
         resources={rf"{api_prefix}/*": {"origins": origins}},
@@ -102,10 +96,9 @@ def create_app() -> Flask:
         expose_headers=["Set-Cookie", "X-Request-Id"],
         methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         max_age=86400,
-        vary_header=True,  # IMPORTANT: Vary: Origin for credentialed requests
+        vary_header=True,
     )
 
-    # ---------- Request id ----------
     @app.before_request
     def _assign_request_id():
         rid = (request.headers.get("X-Request-Id") or "").strip()
@@ -119,7 +112,6 @@ def create_app() -> Flask:
         if rid:
             resp.headers["X-Request-Id"] = rid
 
-        # extra safety: avoid caching auth responses
         if request.path.startswith(f"{api_prefix}/web/auth/"):
             resp.headers["Cache-Control"] = "no-store"
 
@@ -131,7 +123,6 @@ def create_app() -> Flask:
     def _debug_enabled() -> bool:
         return (request.headers.get("X-Debug") or "").strip() == "1"
 
-    # ---------- Boot report ----------
     boot: Dict[str, Any] = {
         "api_prefix": api_prefix,
         "cookie_mode": cookie_mode,
@@ -188,7 +179,6 @@ def create_app() -> Flask:
         entry["bp_name"] = bp_name
         boot["registered"].append(entry)
 
-    # ---------- REQUIRED routes ----------
     required_modules = [
         "app.routes.health",
         "app.routes.accounts",
@@ -209,15 +199,13 @@ def create_app() -> Flask:
     for dotted in required_modules:
         _register_bp(dotted, "bp", required=True, url_prefix=api_prefix)
 
-    # ---------- OPTIONAL routes ----------
     _register_bp("app.routes.cron", "bp", alias_name="cron", required=False, url_prefix=api_prefix)
+    _register_bp("app.routes.support", "bp", alias_name="support", required=False, url_prefix=api_prefix)
 
-    # ---------- DEBUG routes ----------
     if _safe_get_env_bool("ENABLE_DEBUG_ROUTES"):
         _register_bp("app.routes._debug", "bp", required=False, url_prefix=api_prefix)
         _register_bp("app.routes.debug_routes", "bp", required=False, url_prefix=api_prefix)
 
-    # ---------- Boot report endpoint ----------
     @app.get(f"{api_prefix}/_boot")
     def boot_report():
         admin_key_set = bool((os.getenv("ADMIN_KEY") or "").strip())
@@ -230,7 +218,6 @@ def create_app() -> Flask:
             }
         ), 200
 
-    # ---------- Runtime diagnostics ----------
     @app.get(f"{api_prefix}/_diag")
     def runtime_diag():
         hints: List[str] = []
@@ -238,6 +225,10 @@ def create_app() -> Flask:
         cron_registered = any((r.get("alias_name") == "cron") for r in boot.get("registered", []))
         if not cron_registered:
             hints.append("Cron blueprint is NOT registered. Confirm app/routes/cron.py exists and exports bp = Blueprint(...).")
+
+        support_registered = any((r.get("alias_name") == "support") for r in boot.get("registered", []))
+        if not support_registered:
+            hints.append("Support blueprint is not registered. Confirm app/routes/support.py exists and exports bp = Blueprint(...).")
 
         if cookie_mode and origins == "*":
             hints.append("COOKIE_MODE is enabled but CORS origins are '*'. Use explicit origins when cookies are used.")
@@ -253,6 +244,16 @@ def create_app() -> Flask:
         if not (os.getenv("PAYSTACK_WEBHOOK_SECRET") or "").strip():
             hints.append("PAYSTACK_WEBHOOK_SECRET is missing. Paystack signature verification will fail for /api/billing/webhook.")
 
+        if not (
+            (os.getenv("SUPPORT_TO_EMAIL") or "").strip()
+            or (os.getenv("SUPPORT_EMAIL") or "").strip()
+            or (os.getenv("MAIL_FROM_EMAIL") or "").strip()
+            or (os.getenv("SMTP_FROM") or "").strip()
+            or (os.getenv("MAIL_USER") or "").strip()
+            or (os.getenv("SMTP_USER") or "").strip()
+        ):
+            hints.append("Support inbox email is not configured. Set SUPPORT_TO_EMAIL for /api/support.")
+
         env_view = {
             "ADMIN_KEY_SET": bool((os.getenv("ADMIN_KEY") or "").strip()),
             "API_PREFIX": api_prefix,
@@ -266,12 +267,10 @@ def create_app() -> Flask:
 
         return jsonify({"ok": True, "request_id": _rid(), "env": env_view, "hints": hints}), 200
 
-    # ---------- Preflight safety net ----------
     @app.route(f"{api_prefix}/<path:_any>", methods=["OPTIONS"])
     def _api_preflight(_any: str):
         return ("", 204)
 
-    # ---------- Global error handler (always JSON) ----------
     @app.errorhandler(Exception)
     def _handle_any_error(e: Exception):
         status = getattr(e, "code", 500)
