@@ -1,514 +1,783 @@
-from __future__ import annotations
+"use client";
 
-"""
-ASK SERVICE (CANONICAL)
+import React, { useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
+import { useAuth } from "@/lib/auth";
+import AppShell from "@/components/app-shell";
+import WorkspaceActionBar from "@/components/workspace-action-bar";
+import WorkspaceSectionCard from "@/components/workspace-section-card";
+import {
+  Banner,
+  MetricCard,
+  ShortcutCard,
+  appInputStyle,
+  appSelectStyle,
+  formatDate,
+} from "@/components/ui";
+import {
+  CardsGrid,
+  SectionStack,
+  TwoColumnSection,
+} from "@/components/page-layout";
+import WorkspaceOverviewMetrics from "@/components/workspace-overview-metrics";
+import { useWorkspaceState } from "@/hooks/useWorkspaceState";
+import { buildWorkspaceAlerts } from "@/lib/workspace-alerts";
+import { getHistoryItems, type HistoryItem as LocalHistoryItem } from "@/lib/history-storage";
 
-- Uses ONLY canonical identity: accounts.account_id
-- If older clients send accounts.id, it translates to accounts.account_id and exposes it in debug
-- Enforces:
-  - active subscription injected by ask route
-  - daily plan limit
-  - credit balance
-- Charges:
-  - cached answer -> counts toward daily limit, does NOT consume credits
-  - fresh AI answer -> counts toward daily limit AND consumes 1 credit after success
-- Persists successful user-visible Q/A to qa_history best-effort
-"""
+type BackendHistoryItem = {
+  id?: string;
+  account_id?: string;
+  question?: string;
+  answer?: string;
+  lang?: string;
+  source?: string;
+  from_cache?: boolean;
+  canonical_key?: string | null;
+  normalized_question?: string | null;
+  plan_code?: string | null;
+  credits_consumed?: number;
+  usage_charged?: boolean;
+  channel?: string | null;
+  created_at?: string;
+  updated_at?: string;
+};
 
-import os
-import uuid
-from typing import Any, Dict
+type DisplayHistoryItem = {
+  id: string;
+  question: string;
+  answer: string;
+  language: string;
+  source: string;
+  created_at: string;
+  from_cache?: boolean;
+};
 
-from app.core.supabase_client import supabase
-from app.services.credits_service import (
-    check_credit_balance,
-    consume_credits,
-    enforce_daily_limit,
-    get_plan_limits,
-    increment_daily_usage,
-)
-from app.services.qa_cache_service import (
-    answer_from_cache,
-    increment_cache_use,
-    normalize_question_for_cache,
-    upsert_ai_answer_to_cache_best_effort,
-    derive_canonical_key,
-)
-from app.services.qa_history_service import log_history_item_best_effort
-from app.services.qa_logging_service import log_qa_event_best_effort
-from app.services.ai_service import call_ai
+type HistoryApiResponse = {
+  ok: boolean;
+  items?: BackendHistoryItem[];
+  count?: number;
+  error?: string;
+  message?: string;
+  root_cause?: string;
+};
 
+function resolveApiBase(): string {
+  const envBase =
+    (process.env.NEXT_PUBLIC_API_BASE || process.env.NEXT_PUBLIC_API_URL || "").trim();
 
-def _sb():
-    return supabase() if callable(supabase) else supabase
+  if (envBase) {
+    return envBase.replace(/\/+$/, "");
+  }
 
+  if (typeof window !== "undefined") {
+    return window.location.origin.replace(/\/+$/, "");
+  }
 
-def _truthy(v: str | None) -> bool:
-    return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+  return "";
+}
 
+function buildAuthHeaders(): Record<string, string> {
+  const headers: Record<string, string> = {};
 
-def _clip(s: str, n: int = 240) -> str:
-    s = str(s or "")
-    return s if len(s) <= n else s[:n] + "…"
+  if (typeof window !== "undefined") {
+    const token = (window.localStorage.getItem("nt_access_token") || "").trim();
+    if (token) {
+      headers.Authorization = `Bearer ${token}`;
+    }
+  }
 
+  return headers;
+}
 
-def _is_uuid(v: str) -> bool:
-    try:
-        uuid.UUID(str(v))
-        return True
-    except Exception:
-        return False
+async function fetchHistoryItems(params?: {
+  source?: string;
+  q?: string;
+  limit?: number;
+}): Promise<HistoryApiResponse> {
+  const apiBase = resolveApiBase();
+  const url = new URL(`${apiBase}/api/history`);
 
+  if (params?.source && params.source !== "all") {
+    url.searchParams.set("source", params.source);
+  }
+  if (params?.q) {
+    url.searchParams.set("q", params.q);
+  }
+  url.searchParams.set("limit", String(params?.limit || 50));
 
-def _has_column(table: str, col: str) -> bool:
-    try:
-        _sb().table(table).select(col).limit(1).execute()
-        return True
-    except Exception:
-        return False
+  const res = await fetch(url.toString(), {
+    method: "GET",
+    headers: buildAuthHeaders(),
+    credentials: "include",
+  });
 
+  let data: HistoryApiResponse | null = null;
+  try {
+    data = await res.json();
+  } catch {
+    data = null;
+  }
 
-def resolve_canonical_account_id(raw_account_id: str) -> Dict[str, Any]:
-    v = (raw_account_id or "").strip()
-    if not v:
-        return {
-            "ok": False,
-            "error": "account_required",
-            "root_cause": "missing_account_id",
-            "fix": "Provide account_id or authenticate via web cookie/bearer so the server can derive it.",
-        }
+  if (!res.ok) {
+    return data || { ok: false, error: "history_fetch_failed", message: `Failed with status ${res.status}` };
+  }
 
-    if not _is_uuid(v):
-        return {
-            "ok": False,
-            "error": "account_invalid",
-            "root_cause": "account_id_not_uuid",
-            "fix": "Send a valid UUID for account_id.",
-            "details": {"account_id": v},
-        }
+  return data || { ok: false, error: "invalid_response", message: "Invalid history response." };
+}
 
-    if _has_column("accounts", "account_id"):
-        try:
-            q = _sb().table("accounts").select("id,account_id").eq("account_id", v).limit(1).execute()
-            rows = getattr(q, "data", None) or []
-            if rows:
-                return {"ok": True, "account_id": str(rows[0].get("account_id") or v)}
-        except Exception as e:
-            return {
-                "ok": False,
-                "error": "account_lookup_failed",
-                "root_cause": f"accounts lookup by account_id failed: {type(e).__name__}: {_clip(str(e))}",
-                "fix": "Check Supabase connectivity/RLS for accounts table.",
-            }
+function truncateText(value: string, max = 180) {
+  const text = String(value || "").trim();
+  if (text.length <= max) return text;
+  return `${text.slice(0, max)}...`;
+}
 
-    try:
-        q = _sb().table("accounts").select("id,account_id").eq("id", v).limit(1).execute()
-        rows = getattr(q, "data", None) or []
-        if not rows:
-            return {
-                "ok": False,
-                "error": "account_not_found",
-                "root_cause": "no accounts row matches account_id nor id",
-                "fix": "Ensure the account exists. If using web auth, verify OTP first to create/resolve account.",
-                "details": {"provided": v},
-            }
+function sourceLabel(source?: string) {
+  const v = String(source || "").toLowerCase();
+  if (v === "web") return "Web";
+  if (v === "whatsapp") return "WhatsApp";
+  if (v === "telegram") return "Telegram";
+  if (v === "cache") return "Cache";
+  if (v === "ai") return "AI";
+  return "Unknown";
+}
 
-        row = rows[0] or {}
-        canonical = str(row.get("account_id") or "").strip()
-        row_id = str(row.get("id") or "").strip()
+function languageLabel(language?: string) {
+  const v = String(language || "").trim();
+  return v || "English";
+}
 
-        if not canonical and row_id:
-            try:
-                _sb().table("accounts").update({"account_id": row_id}).eq("id", row_id).execute()
-                canonical = row_id
-            except Exception as e:
-                return {
-                    "ok": False,
-                    "error": "account_id_repair_failed",
-                    "root_cause": f"accounts.account_id was NULL and repair failed: {type(e).__name__}: {_clip(str(e))}",
-                    "fix": "Run SQL: update accounts set account_id=id where account_id is null; then UNIQUE index on account_id.",
-                    "details": {"row_id": row_id},
+function toneFromHistoryCount(count: number): "good" | "warn" | "default" {
+  if (count >= 5) return "good";
+  if (count >= 1) return "warn";
+  return "default";
+}
+
+function mapBackendItem(row: BackendHistoryItem, index: number): DisplayHistoryItem {
+  return {
+    id: String(row.id || `${row.created_at || "history"}-${index}`),
+    question: String(row.question || ""),
+    answer: String(row.answer || ""),
+    language: String(row.lang || "en"),
+    source: String(row.source || "web"),
+    created_at: String(row.created_at || row.updated_at || ""),
+    from_cache: Boolean(row.from_cache),
+  };
+}
+
+function mapLocalItem(row: LocalHistoryItem, index: number): DisplayHistoryItem {
+  return {
+    id: String((row as any).id || `${row.created_at || "local"}-${index}`),
+    question: String(row.question || ""),
+    answer: String(row.answer || ""),
+    language: String(row.language || "English"),
+    source: String(row.source || "web"),
+    created_at: String(row.created_at || ""),
+  };
+}
+
+function HistoryItemCard({
+  item,
+  expanded,
+  onToggle,
+}: {
+  item: DisplayHistoryItem;
+  expanded: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <div
+      style={{
+        borderRadius: 22,
+        border: "1px solid var(--border)",
+        background: "var(--surface)",
+        padding: 18,
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          gap: 12,
+          alignItems: "flex-start",
+          flexWrap: "wrap",
+        }}
+      >
+        <div style={{ minWidth: 0 }}>
+          <div
+            style={{
+              color: "var(--gold)",
+              fontWeight: 900,
+              fontSize: 12,
+              textTransform: "uppercase",
+              letterSpacing: 0.45,
+            }}
+          >
+            {sourceLabel(item.source)} • {languageLabel(item.language)}
+          </div>
+
+          <div
+            style={{
+              marginTop: 10,
+              color: "var(--text)",
+              fontWeight: 900,
+              fontSize: 18,
+              lineHeight: 1.5,
+              wordBreak: "break-word",
+            }}
+          >
+            {expanded ? String(item.question || "Untitled question") : truncateText(String(item.question || "Untitled question"), 140)}
+          </div>
+        </div>
+
+        <div
+          style={{
+            color: "var(--text-faint)",
+            fontSize: 13,
+            whiteSpace: "nowrap",
+          }}
+        >
+          {formatDate(item.created_at)}
+        </div>
+      </div>
+
+      <div
+        style={{
+          marginTop: 16,
+          borderRadius: 18,
+          border: "1px solid var(--border)",
+          background: "var(--surface-soft)",
+          padding: 16,
+        }}
+      >
+        <div
+          style={{
+            color: "var(--text-faint)",
+            fontSize: 12,
+            fontWeight: 800,
+            textTransform: "uppercase",
+            letterSpacing: 0.35,
+          }}
+        >
+          Answer
+        </div>
+        <div
+          style={{
+            marginTop: 10,
+            color: "var(--text-muted)",
+            lineHeight: 1.75,
+            fontSize: 14,
+            whiteSpace: "pre-wrap",
+            wordBreak: "break-word",
+          }}
+        >
+          {expanded ? String(item.answer || "No saved answer.") : truncateText(String(item.answer || "No saved answer."), 320)}
+        </div>
+      </div>
+
+      <div
+        style={{
+          marginTop: 14,
+          display: "flex",
+          justifyContent: "space-between",
+          gap: 12,
+          alignItems: "center",
+          flexWrap: "wrap",
+        }}
+      >
+        <div
+          style={{
+            color: "var(--text-faint)",
+            fontSize: 13,
+            lineHeight: 1.5,
+          }}
+        >
+          Saved item available for continuity, follow-up, and user review.
+        </div>
+
+        <button
+          onClick={onToggle}
+          style={{
+            padding: "12px 16px",
+            borderRadius: 14,
+            border: "1px solid var(--border-strong)",
+            background: "var(--button-bg)",
+            color: "var(--text)",
+            fontWeight: 900,
+            cursor: "pointer",
+          }}
+        >
+          {expanded ? "Show Less" : "Open Full Item"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+export default function HistoryPage() {
+  const router = useRouter();
+  const { refreshSession, logout } = useAuth();
+
+  const [historyItems, setHistoryItems] = useState<DisplayHistoryItem[]>([]);
+  const [search, setSearch] = useState("");
+  const [sourceFilter, setSourceFilter] = useState("all");
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [loadingHistory, setLoadingHistory] = useState(false);
+  const [historyNotice, setHistoryNotice] = useState<{
+    title: string;
+    message: string;
+    tone: "good" | "warn" | "danger" | "default";
+  } | null>(null);
+
+  const {
+    busy,
+    status,
+    load,
+    accountId,
+    activeNow,
+    planCode,
+    creditBalance,
+    dailyUsage,
+    dailyLimit,
+    expiresAt,
+    pendingPlanCode,
+    pendingStartsAt,
+  } = useWorkspaceState({
+    refreshSession,
+    autoLoad: false,
+    includeAccount: true,
+    includeBilling: true,
+    includeDebug: true,
+    loadingMessage: "Loading history workspace...",
+  });
+
+  const loadHistoryWorkspace = async (message = "Loading history workspace...") => {
+    await load(message);
+
+    try {
+      setLoadingHistory(true);
+      setHistoryNotice(null);
+
+      const result = await fetchHistoryItems({
+        source: sourceFilter,
+        q: search.trim(),
+        limit: 50,
+      });
+
+      if (result.ok && Array.isArray(result.items)) {
+        setHistoryItems(result.items.map(mapBackendItem));
+        return;
+      }
+
+      const localItems = getHistoryItems().map(mapLocalItem);
+      setHistoryItems(localItems);
+
+      if (result.error) {
+        setHistoryNotice({
+          title: "Backend history unavailable",
+          message:
+            result.message ||
+            result.root_cause ||
+            "Falling back to local history storage because backend history is not yet fully available.",
+          tone: "warn",
+        });
+      }
+    } catch (err: any) {
+      const localItems = getHistoryItems().map(mapLocalItem);
+      setHistoryItems(localItems);
+
+      setHistoryNotice({
+        title: "History fallback in use",
+        message:
+          err?.message ||
+          "A backend history error occurred, so local history storage is being shown instead.",
+        tone: "warn",
+      });
+    } finally {
+      setLoadingHistory(false);
+    }
+  };
+
+  useEffect(() => {
+    loadHistoryWorkspace();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const alerts = buildWorkspaceAlerts({
+    activeNow,
+    creditBalance,
+    dailyUsage,
+    dailyLimit,
+    pendingPlanCode,
+    pendingStartsAt,
+    status,
+    includeStatusAlert: true,
+    statusTitle: "Current history workspace status",
+  });
+
+  const filteredItems = useMemo(() => {
+    const term = search.trim().toLowerCase();
+
+    return historyItems.filter((item) => {
+      const matchesSource =
+        sourceFilter === "all"
+          ? true
+          : String(item.source || "").toLowerCase() === sourceFilter;
+
+      if (!matchesSource) return false;
+
+      if (!term) return true;
+
+      const question = String(item.question || "").toLowerCase();
+      const answer = String(item.answer || "").toLowerCase();
+      const language = String(item.language || "").toLowerCase();
+      const source = String(item.source || "").toLowerCase();
+
+      return (
+        question.includes(term) ||
+        answer.includes(term) ||
+        language.includes(term) ||
+        source.includes(term)
+      );
+    });
+  }, [historyItems, search, sourceFilter]);
+
+  const webCount = historyItems.filter(
+    (item) => String(item.source || "").toLowerCase() === "web"
+  ).length;
+
+  const whatsappCount = historyItems.filter(
+    (item) => String(item.source || "").toLowerCase() === "whatsapp"
+  ).length;
+
+  const telegramCount = historyItems.filter(
+    (item) => String(item.source || "").toLowerCase() === "telegram"
+  ).length;
+
+  const newestItem = historyItems[0];
+  const oldestItem = historyItems[historyItems.length - 1];
+
+  return (
+    <AppShell
+      title="History"
+      subtitle="Review saved tax questions and previous AI answers so users can continue work without losing continuity or repeating earlier requests."
+      actions={
+        <WorkspaceActionBar
+          items={[
+            { label: "Ask Tax AI", href: "/ask", tone: "primary" },
+            { label: "Credits", href: "/credits", tone: "secondary" },
+            {
+              label: "Refresh",
+              onClick: () => loadHistoryWorkspace("Refreshing history workspace..."),
+              tone: "secondary",
+              disabled: busy || loadingHistory,
+            },
+            {
+              label: "Logout",
+              onClick: logout,
+              tone: "danger",
+              disabled: busy || loadingHistory,
+            },
+          ]}
+        />
+      }
+    >
+      <SectionStack>
+        {historyNotice ? (
+          <Banner
+            title={historyNotice.title}
+            message={historyNotice.message}
+            tone={historyNotice.tone}
+          />
+        ) : null}
+
+        {alerts.map((alert) => (
+          <Banner
+            key={alert.key}
+            title={alert.title}
+            message={alert.message}
+            tone={alert.tone}
+          />
+        ))}
+
+        <WorkspaceOverviewMetrics
+          mode="dashboard"
+          accountId={accountId}
+          activeNow={activeNow}
+          planCode={planCode}
+          creditBalance={creditBalance}
+          dailyUsage={dailyUsage}
+          dailyLimit={dailyLimit}
+          expiresAt={expiresAt}
+        />
+
+        <CardsGrid min={220}>
+          <MetricCard
+            label="Saved Items"
+            value={String(historyItems.length)}
+            tone={toneFromHistoryCount(historyItems.length)}
+            helper="Total visible question-answer items currently saved for this workspace."
+          />
+          <MetricCard
+            label="Filtered Results"
+            value={String(filteredItems.length)}
+            tone={filteredItems.length > 0 ? "good" : "warn"}
+            helper="Visible results after current search and source filter are applied."
+          />
+          <MetricCard
+            label="Newest Item"
+            value={newestItem ? formatDate(newestItem.created_at) : "—"}
+            tone={newestItem ? "good" : "default"}
+            helper="Most recent saved entry currently visible in history."
+          />
+          <MetricCard
+            label="Oldest Item"
+            value={oldestItem ? formatDate(oldestItem.created_at) : "—"}
+            tone={oldestItem ? "default" : "warn"}
+            helper="Earliest visible entry still available in history."
+          />
+        </CardsGrid>
+
+        <TwoColumnSection leftRatio={1.08} rightRatio={0.92}>
+          <WorkspaceSectionCard
+            title="History Search"
+            subtitle="Find previous questions quickly by keyword or channel source."
+          >
+            <div style={{ display: "grid", gap: 14 }}>
+              <div style={{ display: "grid", gap: 8 }}>
+                <div
+                  style={{
+                    color: "var(--text)",
+                    fontWeight: 800,
+                    fontSize: 14,
+                  }}
+                >
+                  Search saved history
+                </div>
+                <input
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                  placeholder="Search question text, answer text, source, or language..."
+                  style={appInputStyle}
+                />
+              </div>
+
+              <div style={{ display: "grid", gap: 8 }}>
+                <div
+                  style={{
+                    color: "var(--text)",
+                    fontWeight: 800,
+                    fontSize: 14,
+                  }}
+                >
+                  Filter by source
+                </div>
+                <select
+                  value={sourceFilter}
+                  onChange={(e) => setSourceFilter(e.target.value)}
+                  style={appSelectStyle}
+                >
+                  <option value="all">All Sources</option>
+                  <option value="web">Web</option>
+                  <option value="whatsapp">WhatsApp</option>
+                  <option value="telegram">Telegram</option>
+                  <option value="ai">AI</option>
+                  <option value="cache">Cache</option>
+                </select>
+              </div>
+
+              <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+                <WorkspaceActionBar
+                  items={[
+                    {
+                      label: loadingHistory ? "Searching..." : "Apply Search",
+                      onClick: () => loadHistoryWorkspace("Refreshing filtered history..."),
+                      tone: "primary",
+                      disabled: loadingHistory || busy,
+                    },
+                  ]}
+                />
+              </div>
+
+              <div
+                style={{
+                  borderRadius: 18,
+                  border: "1px solid var(--border)",
+                  background: "var(--surface)",
+                  padding: 16,
+                  color: "var(--text-muted)",
+                  lineHeight: 1.75,
+                  fontSize: 14,
+                }}
+              >
+                History is part of user continuity. It should help users return to previous tax guidance, compare earlier answers, and continue work without retyping the same question again.
+              </div>
+            </div>
+          </WorkspaceSectionCard>
+
+          <WorkspaceSectionCard
+            title="History Breakdown"
+            subtitle="Quick operational view of where saved items came from."
+          >
+            <CardsGrid min={180}>
+              <MetricCard
+                label="Web"
+                value={String(webCount)}
+                tone={webCount > 0 ? "good" : "default"}
+                helper="Items saved from the web workspace."
+              />
+              <MetricCard
+                label="WhatsApp"
+                value={String(whatsappCount)}
+                tone={whatsappCount > 0 ? "good" : "default"}
+                helper="Items saved from WhatsApp usage."
+              />
+              <MetricCard
+                label="Telegram"
+                value={String(telegramCount)}
+                tone={telegramCount > 0 ? "good" : "default"}
+                helper="Items saved from Telegram usage."
+              />
+            </CardsGrid>
+
+            <MetricCard
+              label="Continuity State"
+              value={historyItems.length > 0 ? "Available" : "Empty"}
+              tone={historyItems.length > 0 ? "good" : "warn"}
+              helper="Whether the user currently has any saved history to revisit."
+            />
+          </WorkspaceSectionCard>
+        </TwoColumnSection>
+
+        <WorkspaceSectionCard
+          title="Saved Questions and Answers"
+          subtitle="Open previous records to continue work with confidence and continuity."
+        >
+          {filteredItems.length > 0 ? (
+            <div style={{ display: "grid", gap: 16 }}>
+              {filteredItems.map((item) => {
+                const itemId = String(item.id);
+
+                return (
+                  <HistoryItemCard
+                    key={itemId}
+                    item={item}
+                    expanded={expandedId === itemId}
+                    onToggle={() =>
+                      setExpandedId((current) => (current === itemId ? null : itemId))
+                    }
+                  />
+                );
+              })}
+            </div>
+          ) : (
+            <Banner
+              title="No matching history found"
+              message={
+                historyItems.length > 0
+                  ? "No saved items match your current search or source filter. Adjust the filters and try again."
+                  : "No question history is visible yet. Once successful tax questions are saved, they will appear here for future review."
+              }
+              tone={historyItems.length > 0 ? "warn" : "default"}
+            />
+          )}
+        </WorkspaceSectionCard>
+
+        <WorkspaceSectionCard
+          title="Recommended Actions"
+          subtitle="Use history together with other workspace tools to reduce repeated work."
+        >
+          <CardsGrid min={240}>
+            <ShortcutCard
+              title="Ask Tax AI"
+              subtitle={
+                !activeNow
+                  ? "Your account may need active paid access before new questions can continue."
+                  : creditBalance <= 0
+                  ? "Your visible credits are exhausted. Review Credits or Plans before continuing."
+                  : "Ask a new tax question when saved history is no longer enough."
+              }
+              tone={!activeNow ? "warn" : creditBalance <= 0 ? "danger" : "good"}
+              onClick={() => router.push("/ask")}
+            />
+
+            <ShortcutCard
+              title="Credits"
+              subtitle="Review balance and daily usage before deciding whether to continue with fresh AI requests."
+              tone={creditBalance <= 3 ? "warn" : "default"}
+              onClick={() => router.push("/credits")}
+            />
+
+            <ShortcutCard
+              title="Billing"
+              subtitle="Check subscription condition, expiry, and billing readiness if access needs attention."
+              tone={!activeNow ? "warn" : "default"}
+              onClick={() => router.push("/billing")}
+            />
+
+            <ShortcutCard
+              title="Help Center"
+              subtitle="Open guided help if the user needs assistance interpreting results or workspace behavior."
+              tone="default"
+              onClick={() => router.push("/help")}
+            />
+          </CardsGrid>
+        </WorkspaceSectionCard>
+
+        <TwoColumnSection>
+          <WorkspaceSectionCard
+            title="History Notes"
+            subtitle="How this page should function in a real SaaS workflow."
+          >
+            <div
+              style={{
+                display: "grid",
+                gap: 10,
+                color: "var(--text-muted)",
+                fontSize: 14,
+                lineHeight: 1.75,
+              }}
+            >
+              <div>1. History should make the product feel continuous, not disposable.</div>
+              <div>2. Users should be able to find earlier answers without friction.</div>
+              <div>3. Search and source filtering reduce repeated questioning.</div>
+              <div>4. Saved answers improve trust because users can revisit prior guidance.</div>
+              <div>5. This page is now prepared for real backend-linked continuity.</div>
+            </div>
+          </WorkspaceSectionCard>
+
+          <WorkspaceSectionCard
+            title="Next Best Decision"
+            subtitle="Fast summary of what the user should do next."
+          >
+            <CardsGrid min={220}>
+              <MetricCard
+                label="Best Immediate Action"
+                value={
+                  filteredItems.length > 0
+                    ? "Review Saved Answers"
+                    : historyItems.length > 0
+                    ? "Adjust Filters"
+                    : "Ask First Question"
                 }
-
-        if not canonical:
-            return {
-                "ok": False,
-                "error": "account_id_missing",
-                "root_cause": "accounts row exists but account_id is empty",
-                "fix": "Ensure accounts.account_id exists and is populated.",
-                "details": {"row_id": row_id},
-            }
-
-        return {"ok": True, "account_id": canonical, "translated_from_id": v}
-
-    except Exception as e:
-        return {
-            "ok": False,
-            "error": "account_lookup_failed",
-            "root_cause": f"accounts lookup by id failed: {type(e).__name__}: {_clip(str(e))}",
-            "fix": "Check Supabase connectivity/RLS for accounts table.",
-        }
-
-
-def _resolve_plan_context(body: Dict[str, Any]) -> Dict[str, Any]:
-    sub = body.get("__subscription") or {}
-    plan_code = (sub.get("plan_code") or "").strip().lower()
-    if not plan_code:
-        return {
-            "ok": False,
-            "error": "subscription_plan_missing",
-            "root_cause": "subscription was injected but plan_code is missing",
-            "fix": "Repair user_subscriptions.plan_code or subscription_guard response.",
-        }
-
-    limits = get_plan_limits(plan_code)
-    if not limits.get("ok"):
-        return limits
-
-    return {
-        "ok": True,
-        "plan_code": plan_code,
-        "daily_answers_limit": int(limits.get("daily_answers_limit") or 0),
-        "ai_credits_total": int(limits.get("ai_credits_total") or 0),
-        "plan_limits": limits,
-    }
-
-
-def ask_guarded(body: Dict[str, Any]) -> Dict[str, Any]:
-    question = (body.get("question") or "").strip()
-    if not question:
-        return {
-            "ok": False,
-            "error": "question_required",
-            "root_cause": "missing_question",
-            "fix": "Provide a non-empty question string.",
-        }
-
-    lang = (body.get("lang") or "en").strip() or "en"
-    channel = (body.get("channel") or "web").strip() or "web"
-    normalized_question = normalize_question_for_cache(question)
-    canonical_key = derive_canonical_key(question, lang=lang)
-
-    raw_account_id = (body.get("account_id") or "").strip()
-    resolved = resolve_canonical_account_id(raw_account_id)
-    if not resolved.get("ok"):
-        return resolved
-
-    account_id = str(resolved["account_id"]).strip()
-
-    translation_debug: Dict[str, Any] = {}
-    if resolved.get("translated_from_id"):
-        translation_debug = {
-            "note": "legacy accounts.id was supplied; translated to canonical accounts.account_id",
-            "translated_from_id": resolved.get("translated_from_id"),
-        }
-
-    bypass = bool(body.get("__bypass"))
-    subscription_bypass = bool(body.get("__subscription_bypass"))
-
-    if bypass and not _truthy(os.getenv("ALLOW_DEV_BYPASS", "1")):
-        return {
-            "ok": False,
-            "error": "bypass_disabled",
-            "root_cause": "__bypass provided but ALLOW_DEV_BYPASS=0",
-            "fix": "Remove bypass headers or set ALLOW_DEV_BYPASS=1 in backend env.",
-        }
-
-    plan_ctx: Dict[str, Any] = {
-        "ok": True,
-        "plan_code": None,
-        "daily_answers_limit": 0,
-        "ai_credits_total": 0,
-    }
-
-    if not subscription_bypass:
-        plan_ctx = _resolve_plan_context(body)
-        if not plan_ctx.get("ok"):
-            return {
-                "ok": False,
-                "error": plan_ctx.get("error") or "plan_context_failed",
-                "root_cause": plan_ctx.get("root_cause"),
-                "fix": plan_ctx.get("fix"),
-                "details": plan_ctx.get("details"),
-                "debug": {**translation_debug},
-            }
-
-        daily = enforce_daily_limit(account_id, int(plan_ctx.get("daily_answers_limit") or 0))
-        if not daily.get("ok"):
-            try:
-                log_qa_event_best_effort(
-                    account_id=account_id,
-                    mode="ask",
-                    lang=lang,
-                    question_raw=question,
-                    normalized_question=normalized_question,
-                    canonical_key=canonical_key,
-                    outcome="blocked",
-                    reason=daily.get("error") or "daily_limit_reached",
-                    source=None,
-                    cache_hit=False,
-                    library_hit=False,
-                    ai_used=False,
-                    ai_credit_cost=0,
-                    latency_ms=0,
-                )
-            except Exception:
-                pass
-
-            return {
-                "ok": False,
-                "error": daily.get("error") or "daily_limit_check_failed",
-                "root_cause": daily.get("root_cause"),
-                "fix": daily.get("fix"),
-                "details": daily.get("details"),
-                "debug": {**translation_debug, "plan_code": plan_ctx.get("plan_code")},
-            }
-
-    cached = answer_from_cache(question, lang=lang, canonical_key=canonical_key)
-    if cached:
-        try:
-            increment_cache_use(cached.get("id"))
-        except Exception:
-            pass
-
-        if not subscription_bypass:
-            usage = increment_daily_usage(account_id, inc=1)
-            if not usage.get("ok"):
-                return {
-                    "ok": False,
-                    "error": usage.get("error") or "daily_usage_update_failed",
-                    "root_cause": usage.get("root_cause"),
-                    "fix": usage.get("fix"),
-                    "details": usage.get("details"),
-                    "debug": {**translation_debug, "plan_code": plan_ctx.get("plan_code"), "from_cache": True},
+                tone={
+                  filteredItems.length > 0
+                    ? "good"
+                    : historyItems.length > 0
+                    ? "warn"
+                    : "default"
                 }
-
-        answer_text = str(cached.get("answer") or "").strip()
-
-        try:
-            log_history_item_best_effort(
-                account_id=account_id,
-                question=question,
-                answer=answer_text,
-                lang=lang,
-                source="cache",
-                from_cache=True,
-                canonical_key=canonical_key,
-                normalized_question=normalized_question,
-                plan_code=plan_ctx.get("plan_code"),
-                credits_consumed=0,
-                usage_charged=not subscription_bypass,
-                channel=channel,
-            )
-        except Exception:
-            pass
-
-        try:
-            log_qa_event_best_effort(
-                account_id=account_id,
-                mode="ask",
-                lang=lang,
-                question_raw=question,
-                normalized_question=normalized_question,
-                canonical_key=canonical_key,
-                outcome="ok",
-                reason=None,
-                source="cache",
-                cache_hit=True,
-                library_hit=False,
-                ai_used=False,
-                ai_credit_cost=0,
-                latency_ms=0,
-            )
-        except Exception:
-            pass
-
-        return {
-            "ok": True,
-            "answer": answer_text,
-            "from_cache": True,
-            "account_id": account_id,
-            "subscription": body.get("__subscription"),
-            "plan_code": plan_ctx.get("plan_code"),
-            "usage_charged": True if not subscription_bypass else False,
-            "credits_consumed": 0,
-            "debug": {**translation_debug, "canonical_key": canonical_key},
-        }
-
-    if not bypass and not subscription_bypass:
-        bal = check_credit_balance(account_id, cost=1)
-        if not bal.get("ok"):
-            try:
-                log_qa_event_best_effort(
-                    account_id=account_id,
-                    mode="ask",
-                    lang=lang,
-                    question_raw=question,
-                    normalized_question=normalized_question,
-                    canonical_key=canonical_key,
-                    outcome="blocked",
-                    reason=bal.get("error") or "insufficient_credits",
-                    source=None,
-                    cache_hit=False,
-                    library_hit=False,
-                    ai_used=False,
-                    ai_credit_cost=0,
-                    latency_ms=0,
-                )
-            except Exception:
-                pass
-
-            return {
-                "ok": False,
-                "error": bal.get("error") or "credit_check_failed",
-                "root_cause": bal.get("root_cause") or bal.get("error"),
-                "fix": bal.get("fix") or "Fix credits table/RLS.",
-                "details": bal.get("details") or {"account_id": account_id},
-                "debug": {**translation_debug, "plan_code": plan_ctx.get("plan_code")},
-            }
-
-    try:
-        ai = call_ai(
-            question=question,
-            lang=lang,
-            channel=channel,
-        )
-    except Exception as e:
-        return {
-            "ok": False,
-            "error": "ai_call_failed",
-            "root_cause": f"{type(e).__name__}: {_clip(str(e))}",
-            "fix": "Check AI provider keys, network access, and ai_service configuration.",
-            "details": {"account_id": account_id},
-            "debug": {**translation_debug, "plan_code": plan_ctx.get("plan_code"), "canonical_key": canonical_key},
-        }
-
-    if not isinstance(ai, dict) or not ai.get("ok"):
-        try:
-            log_qa_event_best_effort(
-                account_id=account_id,
-                mode="ask",
-                lang=lang,
-                question_raw=question,
-                normalized_question=normalized_question,
-                canonical_key=canonical_key,
-                outcome="error",
-                reason=(ai or {}).get("error") or "ai_failed",
-                source="ai",
-                cache_hit=False,
-                library_hit=False,
-                ai_used=True,
-                ai_credit_cost=0,
-                latency_ms=0,
-            )
-        except Exception:
-            pass
-
-        return {
-            "ok": False,
-            "error": "ai_failed",
-            "root_cause": (ai or {}).get("root_cause") or (ai or {}).get("error") or "unknown_ai_failure",
-            "fix": (ai or {}).get("fix") or "Inspect ai_service logs.",
-            "details": {"account_id": account_id},
-            "debug": {**translation_debug, "plan_code": plan_ctx.get("plan_code"), "canonical_key": canonical_key},
-        }
-
-    answer_text = (ai.get("answer") or "").strip()
-    if not answer_text:
-        return {
-            "ok": False,
-            "error": "ai_empty_answer",
-            "root_cause": "AI returned ok=True but answer was empty",
-            "fix": "Check ai_service provider response parsing.",
-            "details": {"account_id": account_id},
-            "debug": {**translation_debug, "plan_code": plan_ctx.get("plan_code"), "canonical_key": canonical_key},
-        }
-
-    if not subscription_bypass:
-        usage = increment_daily_usage(account_id, inc=1)
-        if not usage.get("ok"):
-            return {
-                "ok": False,
-                "error": usage.get("error") or "daily_usage_update_failed",
-                "root_cause": usage.get("root_cause"),
-                "fix": usage.get("fix"),
-                "details": usage.get("details"),
-                "debug": {**translation_debug, "plan_code": plan_ctx.get("plan_code"), "canonical_key": canonical_key},
-            }
-
-    credits_consumed = 0
-    if not bypass and not subscription_bypass:
-        consume = consume_credits(account_id, cost=1)
-        if not consume.get("ok"):
-            return {
-                "ok": False,
-                "error": consume.get("error") or "credit_consume_failed",
-                "root_cause": consume.get("root_cause"),
-                "fix": consume.get("fix"),
-                "details": consume.get("details"),
-                "debug": {**translation_debug, "plan_code": plan_ctx.get("plan_code"), "canonical_key": canonical_key},
-            }
-        credits_consumed = 1
-
-    try:
-        upsert_ai_answer_to_cache_best_effort(
-            normalized_question=question,
-            answer=answer_text,
-            source="ai",
-            lang=lang,
-            canonical_key=canonical_key,
-            enabled=True,
-            priority=0,
-        )
-    except Exception:
-        pass
-
-    try:
-        log_history_item_best_effort(
-            account_id=account_id,
-            question=question,
-            answer=answer_text,
-            lang=lang,
-            source="ai",
-            from_cache=False,
-            canonical_key=canonical_key,
-            normalized_question=normalized_question,
-            plan_code=plan_ctx.get("plan_code"),
-            credits_consumed=credits_consumed,
-            usage_charged=not subscription_bypass,
-            channel=channel,
-        )
-    except Exception:
-        pass
-
-    try:
-        log_qa_event_best_effort(
-            account_id=account_id,
-            mode="ask",
-            lang=lang,
-            question_raw=question,
-            normalized_question=normalized_question,
-            canonical_key=canonical_key,
-            outcome="ok",
-            reason=None,
-            source="ai",
-            cache_hit=False,
-            library_hit=False,
-            ai_used=True,
-            ai_credit_cost=credits_consumed,
-            latency_ms=0,
-        )
-    except Exception:
-        pass
-
-    return {
-        "ok": True,
-        "answer": answer_text,
-        "from_cache": False,
-        "account_id": account_id,
-        "subscription": body.get("__subscription"),
-        "plan_code": plan_ctx.get("plan_code"),
-        "usage_charged": True if not subscription_bypass else False,
-        "credits_consumed": credits_consumed,
-        "debug": {**translation_debug, "canonical_key": canonical_key},
-    }
+                helper="Most sensible next move based on current visible history."
+              />
+              <MetricCard
+                label="History Utility"
+                value={historyItems.length > 0 ? "Useful" : "Not Yet Built"}
+                tone={historyItems.length > 0 ? "good" : "warn"}
+                helper="Shows whether user continuity is already active in this workspace."
+              />
+            </CardsGrid>
+          </WorkspaceSectionCard>
+        </TwoColumnSection>
+      </SectionStack>
+    </AppShell>
+  );
+}
