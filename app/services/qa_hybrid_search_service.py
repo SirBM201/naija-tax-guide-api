@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional
 
 from app.core.supabase_client import supabase
 from app.services.qa_cache_service import normalize_question_for_cache, derive_canonical_key
-from app.services.qa_semantic_cache_service import semantic_match_question, choose_best_semantic_match
+from app.services.qa_semantic_cache_service import semantic_match_question
 
 
 def _sb():
@@ -14,6 +14,20 @@ def _sb():
 def _clip(v: Any, n: int = 260) -> str:
     s = str(v or "")
     return s if len(s) <= n else s[:n] + "..."
+
+
+def _safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        return float(v)
+    except Exception:
+        return default
+
+
+def _safe_int(v: Any, default: int = 0) -> int:
+    try:
+        return int(v)
+    except Exception:
+        return default
 
 
 def exact_cache_match(
@@ -103,31 +117,12 @@ def keyword_cache_match(
         }
 
 
-def _safe_float(v: Any, default: float = 0.0) -> float:
-    try:
-        return float(v)
-    except Exception:
-        return default
-
-
-def _safe_int(v: Any, default: int = 0) -> int:
-    try:
-        return int(v)
-    except Exception:
-        return default
-
-
 def rank_hybrid_results(
     *,
     exact_match: Optional[Dict[str, Any]],
     keyword_matches: List[Dict[str, Any]],
     semantic_matches: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """
-    Production-style fusion:
-    exact > keyword > semantic
-    but semantic can still win strongly if confidence is very high.
-    """
     candidates: List[Dict[str, Any]] = []
 
     if exact_match:
