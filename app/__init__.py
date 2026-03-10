@@ -195,6 +195,7 @@ def create_app() -> Flask:
         "app.routes.email_link",
         "app.routes.web_auth",
         "app.routes.web_session",
+        "app.routes.feedback",
     ]
     for dotted in required_modules:
         _register_bp(dotted, "bp", required=True, url_prefix=api_prefix)
@@ -227,14 +228,6 @@ def create_app() -> Flask:
         if not cron_registered:
             hints.append("Cron blueprint is NOT registered. Confirm app/routes/cron.py exists and exports bp = Blueprint(...).")
 
-        support_registered = any((r.get("alias_name") == "support") for r in boot.get("registered", []))
-        if not support_registered:
-            hints.append("Support blueprint is not registered. Confirm app/routes/support.py exists and exports bp = Blueprint(...).")
-
-        history_registered = any((r.get("alias_name") == "history") for r in boot.get("registered", []))
-        if not history_registered:
-            hints.append("History blueprint is not registered. Confirm app/routes/history.py exists and exports bp = Blueprint(...).")
-
         if cookie_mode and origins == "*":
             hints.append("COOKIE_MODE is enabled but CORS origins are '*'. Use explicit origins when cookies are used.")
 
@@ -248,16 +241,6 @@ def create_app() -> Flask:
 
         if not (os.getenv("PAYSTACK_WEBHOOK_SECRET") or "").strip():
             hints.append("PAYSTACK_WEBHOOK_SECRET is missing. Paystack signature verification will fail for /api/billing/webhook.")
-
-        if not (
-            (os.getenv("SUPPORT_TO_EMAIL") or "").strip()
-            or (os.getenv("SUPPORT_EMAIL") or "").strip()
-            or (os.getenv("MAIL_FROM_EMAIL") or "").strip()
-            or (os.getenv("SMTP_FROM") or "").strip()
-            or (os.getenv("MAIL_USER") or "").strip()
-            or (os.getenv("SMTP_USER") or "").strip()
-        ):
-            hints.append("Support inbox email is not configured. Set SUPPORT_TO_EMAIL for /api/support.")
 
         env_view = {
             "ADMIN_KEY_SET": bool((os.getenv("ADMIN_KEY") or "").strip()),
