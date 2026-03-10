@@ -1,783 +1,303 @@
-"use client";
+from __future__ import annotations
 
-import React, { useEffect, useMemo, useState } from "react";
-import { useRouter } from "next/navigation";
-import { useAuth } from "@/lib/auth";
-import AppShell from "@/components/app-shell";
-import WorkspaceActionBar from "@/components/workspace-action-bar";
-import WorkspaceSectionCard from "@/components/workspace-section-card";
-import {
-  Banner,
-  MetricCard,
-  ShortcutCard,
-  appInputStyle,
-  appSelectStyle,
-  formatDate,
-} from "@/components/ui";
-import {
-  CardsGrid,
-  SectionStack,
-  TwoColumnSection,
-} from "@/components/page-layout";
-import WorkspaceOverviewMetrics from "@/components/workspace-overview-metrics";
-import { useWorkspaceState } from "@/hooks/useWorkspaceState";
-import { buildWorkspaceAlerts } from "@/lib/workspace-alerts";
-import { getHistoryItems, type HistoryItem as LocalHistoryItem } from "@/lib/history-storage";
+import os
+import uuid
+from typing import Any, Dict, Optional, Tuple, List, Union
 
-type BackendHistoryItem = {
-  id?: string;
-  account_id?: string;
-  question?: string;
-  answer?: string;
-  lang?: string;
-  source?: string;
-  from_cache?: boolean;
-  canonical_key?: string | null;
-  normalized_question?: string | null;
-  plan_code?: string | null;
-  credits_consumed?: number;
-  usage_charged?: boolean;
-  channel?: string | null;
-  created_at?: string;
-  updated_at?: string;
-};
+from flask import Flask, jsonify, request
+from flask_cors import CORS
 
-type DisplayHistoryItem = {
-  id: string;
-  question: string;
-  answer: string;
-  language: string;
-  source: string;
-  created_at: string;
-  from_cache?: boolean;
-};
+from app.core.config import API_PREFIX, CORS_ORIGINS
 
-type HistoryApiResponse = {
-  ok: boolean;
-  items?: BackendHistoryItem[];
-  count?: number;
-  error?: string;
-  message?: string;
-  root_cause?: string;
-};
 
-function resolveApiBase(): string {
-  const envBase =
-    (process.env.NEXT_PUBLIC_API_BASE || process.env.NEXT_PUBLIC_API_URL || "").trim();
+def _normalize_api_prefix(v: str) -> str:
+    v = (v or "").strip()
+    if not v:
+        return "/api"
+    if not v.startswith("/"):
+        v = "/" + v
+    return v.rstrip("/")
 
-  if (envBase) {
-    return envBase.replace(/\/+$/, "");
-  }
 
-  if (typeof window !== "undefined") {
-    return window.location.origin.replace(/\/+$/, "");
-  }
+def _truthy(v: str | None) -> bool:
+    return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
-  return "";
-}
 
-function buildAuthHeaders(): Record<string, string> {
-  const headers: Record<string, string> = {};
+def _cookie_mode_enabled() -> bool:
+    if _truthy(os.getenv("COOKIE_AUTH_ENABLED", "1")):
+        return True
+    if _truthy(os.getenv("WEB_AUTH_ENABLED", "")) and (os.getenv("COOKIE_SAMESITE") or "").strip():
+        return True
+    return False
 
-  if (typeof window !== "undefined") {
-    const token = (window.localStorage.getItem("nt_access_token") || "").trim();
-    if (token) {
-      headers.Authorization = `Bearer ${token}`;
+
+def _parse_origins(
+    origins_raw: str, *, cookie_mode: bool
+) -> Tuple[Union[str, List[str]], bool, Optional[str]]:
+    raw = (origins_raw or "").strip()
+
+    if not raw:
+        if cookie_mode:
+            return [], True, "CORS_ORIGINS is empty but cookie auth requires explicit origins."
+        return "*", False, None
+
+    if raw == "*":
+        if cookie_mode:
+            return [], True, "CORS_ORIGINS='*' is not allowed with cookie auth. Use explicit comma-separated origins."
+        return "*", False, None
+
+    origins = [o.strip() for o in raw.split(",") if o.strip()]
+    if not origins:
+        if cookie_mode:
+            return [], True, "CORS_ORIGINS parsed empty but cookie auth requires explicit origins."
+        return "*", False, None
+
+    if cookie_mode:
+        return origins, True, None
+
+    return origins, False, None
+
+
+def _import_attr(dotted: str, attr: str):
+    try:
+        mod = __import__(dotted, fromlist=[attr])
+        return getattr(mod, attr), None
+    except Exception as e:
+        return None, f"{dotted}:{attr} -> {repr(e)}"
+
+
+def _safe_get_env_bool(name: str) -> bool:
+    return _truthy(os.getenv(name, ""))
+
+
+def create_app() -> Flask:
+    app = Flask(__name__)
+
+    api_prefix = _normalize_api_prefix(API_PREFIX)
+
+    cookie_mode = _cookie_mode_enabled()
+    origins, supports_credentials, cors_err = _parse_origins(CORS_ORIGINS, cookie_mode=cookie_mode)
+    if cors_err:
+        raise RuntimeError(f"[CORS] {cors_err}")
+
+    CORS(
+        app,
+        resources={rf"{api_prefix}/*": {"origins": origins}},
+        supports_credentials=supports_credentials,
+        allow_headers=[
+            "Content-Type",
+            "Authorization",
+            "X-Auth-Token",
+            "X-Requested-With",
+            "X-Admin-Key",
+            "X-Debug",
+            "X-Request-Id",
+        ],
+        expose_headers=["Set-Cookie", "X-Request-Id"],
+        methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        max_age=86400,
+        vary_header=True,
+    )
+
+    @app.before_request
+    def _assign_request_id():
+        rid = (request.headers.get("X-Request-Id") or "").strip()
+        if not rid:
+            rid = str(uuid.uuid4())
+        request.environ["REQUEST_ID"] = rid
+
+    @app.after_request
+    def _attach_request_id(resp):
+        rid = str(request.environ.get("REQUEST_ID") or "")
+        if rid:
+            resp.headers["X-Request-Id"] = rid
+
+        if request.path.startswith(f"{api_prefix}/web/auth/"):
+            resp.headers["Cache-Control"] = "no-store"
+
+        return resp
+
+    def _rid() -> str:
+        return str(request.environ.get("REQUEST_ID") or "")
+
+    def _debug_enabled() -> bool:
+        return (request.headers.get("X-Debug") or "").strip() == "1"
+
+    boot: Dict[str, Any] = {
+        "api_prefix": api_prefix,
+        "cookie_mode": cookie_mode,
+        "cors": {"origins": origins, "supports_credentials": supports_credentials},
+        "strict": (os.getenv("STRICT_BLUEPRINTS", "1").strip() != "0"),
+        "debug_routes_enabled": _safe_get_env_bool("ENABLE_DEBUG_ROUTES"),
+        "registered": [],
+        "failed": [],
     }
-  }
+    strict = bool(boot["strict"])
 
-  return headers;
-}
+    def _register_bp(
+        dotted: str,
+        attr: str = "bp",
+        *,
+        alias_name: Optional[str] = None,
+        required: bool = True,
+        url_prefix: Optional[str] = api_prefix,
+    ):
+        obj, err = _import_attr(dotted, attr)
+        entry: Dict[str, Any] = {
+            "module": dotted,
+            "attr": attr,
+            "alias_name": alias_name or dotted.split(".")[-1],
+            "url_prefix": url_prefix,
+            "required": required,
+        }
 
-async function fetchHistoryItems(params?: {
-  source?: string;
-  q?: string;
-  limit?: number;
-}): Promise<HistoryApiResponse> {
-  const apiBase = resolveApiBase();
-  const url = new URL(`${apiBase}/api/history`);
+        if obj is None:
+            entry["error"] = err
+            boot["failed"].append(entry)
+            if required and strict:
+                raise RuntimeError(f"[boot] REQUIRED blueprint import failed: {err}")
+            return
 
-  if (params?.source && params.source !== "all") {
-    url.searchParams.set("source", params.source);
-  }
-  if (params?.q) {
-    url.searchParams.set("q", params.q);
-  }
-  url.searchParams.set("limit", String(params?.limit || 50));
+        bp_name = getattr(obj, "name", None) or f"{dotted}:{attr}"
 
-  const res = await fetch(url.toString(), {
-    method: "GET",
-    headers: buildAuthHeaders(),
-    credentials: "include",
-  });
+        if not hasattr(app, "_bp_names"):
+            app._bp_names = set()  # type: ignore[attr-defined]
+        if bp_name in app._bp_names:  # type: ignore[attr-defined]
+            msg = f"[boot] Duplicate blueprint name detected: {bp_name} from {dotted}:{attr}"
+            entry["error"] = msg
+            boot["failed"].append(entry)
+            if required and strict:
+                raise RuntimeError(msg)
+            return
+        app._bp_names.add(bp_name)  # type: ignore[attr-defined]
 
-  let data: HistoryApiResponse | null = null;
-  try {
-    data = await res.json();
-  } catch {
-    data = null;
-  }
+        if url_prefix is not None:
+            app.register_blueprint(obj, url_prefix=url_prefix)
+        else:
+            app.register_blueprint(obj)
 
-  if (!res.ok) {
-    return data || { ok: false, error: "history_fetch_failed", message: `Failed with status ${res.status}` };
-  }
+        entry["bp_name"] = bp_name
+        boot["registered"].append(entry)
 
-  return data || { ok: false, error: "invalid_response", message: "Invalid history response." };
-}
+    required_modules = [
+        "app.routes.health",
+        "app.routes.accounts",
+        "app.routes.subscriptions",
+        "app.routes.ask",
+        "app.routes.web",
+        "app.routes.webhooks",
+        "app.routes.plans",
+        "app.routes.billing",
+        "app.routes.link_tokens",
+        "app.routes.admin_link_tokens",
+        "app.routes.accounts_admin",
+        "app.routes.meta",
+        "app.routes.email_link",
+        "app.routes.web_auth",
+        "app.routes.web_session",
+    ]
+    for dotted in required_modules:
+        _register_bp(dotted, "bp", required=True, url_prefix=api_prefix)
 
-function truncateText(value: string, max = 180) {
-  const text = String(value || "").trim();
-  if (text.length <= max) return text;
-  return `${text.slice(0, max)}...`;
-}
+    _register_bp("app.routes.cron", "bp", alias_name="cron", required=False, url_prefix=api_prefix)
+    _register_bp("app.routes.support", "bp", alias_name="support", required=False, url_prefix=api_prefix)
+    _register_bp("app.routes.history", "bp", alias_name="history", required=False, url_prefix=api_prefix)
 
-function sourceLabel(source?: string) {
-  const v = String(source || "").toLowerCase();
-  if (v === "web") return "Web";
-  if (v === "whatsapp") return "WhatsApp";
-  if (v === "telegram") return "Telegram";
-  if (v === "cache") return "Cache";
-  if (v === "ai") return "AI";
-  return "Unknown";
-}
+    if _safe_get_env_bool("ENABLE_DEBUG_ROUTES"):
+        _register_bp("app.routes._debug", "bp", required=False, url_prefix=api_prefix)
+        _register_bp("app.routes.debug_routes", "bp", required=False, url_prefix=api_prefix)
 
-function languageLabel(language?: string) {
-  const v = String(language || "").trim();
-  return v || "English";
-}
-
-function toneFromHistoryCount(count: number): "good" | "warn" | "default" {
-  if (count >= 5) return "good";
-  if (count >= 1) return "warn";
-  return "default";
-}
-
-function mapBackendItem(row: BackendHistoryItem, index: number): DisplayHistoryItem {
-  return {
-    id: String(row.id || `${row.created_at || "history"}-${index}`),
-    question: String(row.question || ""),
-    answer: String(row.answer || ""),
-    language: String(row.lang || "en"),
-    source: String(row.source || "web"),
-    created_at: String(row.created_at || row.updated_at || ""),
-    from_cache: Boolean(row.from_cache),
-  };
-}
-
-function mapLocalItem(row: LocalHistoryItem, index: number): DisplayHistoryItem {
-  return {
-    id: String((row as any).id || `${row.created_at || "local"}-${index}`),
-    question: String(row.question || ""),
-    answer: String(row.answer || ""),
-    language: String(row.language || "English"),
-    source: String(row.source || "web"),
-    created_at: String(row.created_at || ""),
-  };
-}
-
-function HistoryItemCard({
-  item,
-  expanded,
-  onToggle,
-}: {
-  item: DisplayHistoryItem;
-  expanded: boolean;
-  onToggle: () => void;
-}) {
-  return (
-    <div
-      style={{
-        borderRadius: 22,
-        border: "1px solid var(--border)",
-        background: "var(--surface)",
-        padding: 18,
-      }}
-    >
-      <div
-        style={{
-          display: "flex",
-          justifyContent: "space-between",
-          gap: 12,
-          alignItems: "flex-start",
-          flexWrap: "wrap",
-        }}
-      >
-        <div style={{ minWidth: 0 }}>
-          <div
-            style={{
-              color: "var(--gold)",
-              fontWeight: 900,
-              fontSize: 12,
-              textTransform: "uppercase",
-              letterSpacing: 0.45,
-            }}
-          >
-            {sourceLabel(item.source)} • {languageLabel(item.language)}
-          </div>
-
-          <div
-            style={{
-              marginTop: 10,
-              color: "var(--text)",
-              fontWeight: 900,
-              fontSize: 18,
-              lineHeight: 1.5,
-              wordBreak: "break-word",
-            }}
-          >
-            {expanded ? String(item.question || "Untitled question") : truncateText(String(item.question || "Untitled question"), 140)}
-          </div>
-        </div>
-
-        <div
-          style={{
-            color: "var(--text-faint)",
-            fontSize: 13,
-            whiteSpace: "nowrap",
-          }}
-        >
-          {formatDate(item.created_at)}
-        </div>
-      </div>
-
-      <div
-        style={{
-          marginTop: 16,
-          borderRadius: 18,
-          border: "1px solid var(--border)",
-          background: "var(--surface-soft)",
-          padding: 16,
-        }}
-      >
-        <div
-          style={{
-            color: "var(--text-faint)",
-            fontSize: 12,
-            fontWeight: 800,
-            textTransform: "uppercase",
-            letterSpacing: 0.35,
-          }}
-        >
-          Answer
-        </div>
-        <div
-          style={{
-            marginTop: 10,
-            color: "var(--text-muted)",
-            lineHeight: 1.75,
-            fontSize: 14,
-            whiteSpace: "pre-wrap",
-            wordBreak: "break-word",
-          }}
-        >
-          {expanded ? String(item.answer || "No saved answer.") : truncateText(String(item.answer || "No saved answer."), 320)}
-        </div>
-      </div>
-
-      <div
-        style={{
-          marginTop: 14,
-          display: "flex",
-          justifyContent: "space-between",
-          gap: 12,
-          alignItems: "center",
-          flexWrap: "wrap",
-        }}
-      >
-        <div
-          style={{
-            color: "var(--text-faint)",
-            fontSize: 13,
-            lineHeight: 1.5,
-          }}
-        >
-          Saved item available for continuity, follow-up, and user review.
-        </div>
-
-        <button
-          onClick={onToggle}
-          style={{
-            padding: "12px 16px",
-            borderRadius: 14,
-            border: "1px solid var(--border-strong)",
-            background: "var(--button-bg)",
-            color: "var(--text)",
-            fontWeight: 900,
-            cursor: "pointer",
-          }}
-        >
-          {expanded ? "Show Less" : "Open Full Item"}
-        </button>
-      </div>
-    </div>
-  );
-}
-
-export default function HistoryPage() {
-  const router = useRouter();
-  const { refreshSession, logout } = useAuth();
-
-  const [historyItems, setHistoryItems] = useState<DisplayHistoryItem[]>([]);
-  const [search, setSearch] = useState("");
-  const [sourceFilter, setSourceFilter] = useState("all");
-  const [expandedId, setExpandedId] = useState<string | null>(null);
-  const [loadingHistory, setLoadingHistory] = useState(false);
-  const [historyNotice, setHistoryNotice] = useState<{
-    title: string;
-    message: string;
-    tone: "good" | "warn" | "danger" | "default";
-  } | null>(null);
-
-  const {
-    busy,
-    status,
-    load,
-    accountId,
-    activeNow,
-    planCode,
-    creditBalance,
-    dailyUsage,
-    dailyLimit,
-    expiresAt,
-    pendingPlanCode,
-    pendingStartsAt,
-  } = useWorkspaceState({
-    refreshSession,
-    autoLoad: false,
-    includeAccount: true,
-    includeBilling: true,
-    includeDebug: true,
-    loadingMessage: "Loading history workspace...",
-  });
-
-  const loadHistoryWorkspace = async (message = "Loading history workspace...") => {
-    await load(message);
-
-    try {
-      setLoadingHistory(true);
-      setHistoryNotice(null);
-
-      const result = await fetchHistoryItems({
-        source: sourceFilter,
-        q: search.trim(),
-        limit: 50,
-      });
-
-      if (result.ok && Array.isArray(result.items)) {
-        setHistoryItems(result.items.map(mapBackendItem));
-        return;
-      }
-
-      const localItems = getHistoryItems().map(mapLocalItem);
-      setHistoryItems(localItems);
-
-      if (result.error) {
-        setHistoryNotice({
-          title: "Backend history unavailable",
-          message:
-            result.message ||
-            result.root_cause ||
-            "Falling back to local history storage because backend history is not yet fully available.",
-          tone: "warn",
-        });
-      }
-    } catch (err: any) {
-      const localItems = getHistoryItems().map(mapLocalItem);
-      setHistoryItems(localItems);
-
-      setHistoryNotice({
-        title: "History fallback in use",
-        message:
-          err?.message ||
-          "A backend history error occurred, so local history storage is being shown instead.",
-        tone: "warn",
-      });
-    } finally {
-      setLoadingHistory(false);
-    }
-  };
-
-  useEffect(() => {
-    loadHistoryWorkspace();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  const alerts = buildWorkspaceAlerts({
-    activeNow,
-    creditBalance,
-    dailyUsage,
-    dailyLimit,
-    pendingPlanCode,
-    pendingStartsAt,
-    status,
-    includeStatusAlert: true,
-    statusTitle: "Current history workspace status",
-  });
-
-  const filteredItems = useMemo(() => {
-    const term = search.trim().toLowerCase();
-
-    return historyItems.filter((item) => {
-      const matchesSource =
-        sourceFilter === "all"
-          ? true
-          : String(item.source || "").toLowerCase() === sourceFilter;
-
-      if (!matchesSource) return false;
-
-      if (!term) return true;
-
-      const question = String(item.question || "").toLowerCase();
-      const answer = String(item.answer || "").toLowerCase();
-      const language = String(item.language || "").toLowerCase();
-      const source = String(item.source || "").toLowerCase();
-
-      return (
-        question.includes(term) ||
-        answer.includes(term) ||
-        language.includes(term) ||
-        source.includes(term)
-      );
-    });
-  }, [historyItems, search, sourceFilter]);
-
-  const webCount = historyItems.filter(
-    (item) => String(item.source || "").toLowerCase() === "web"
-  ).length;
-
-  const whatsappCount = historyItems.filter(
-    (item) => String(item.source || "").toLowerCase() === "whatsapp"
-  ).length;
-
-  const telegramCount = historyItems.filter(
-    (item) => String(item.source || "").toLowerCase() === "telegram"
-  ).length;
-
-  const newestItem = historyItems[0];
-  const oldestItem = historyItems[historyItems.length - 1];
-
-  return (
-    <AppShell
-      title="History"
-      subtitle="Review saved tax questions and previous AI answers so users can continue work without losing continuity or repeating earlier requests."
-      actions={
-        <WorkspaceActionBar
-          items={[
-            { label: "Ask Tax AI", href: "/ask", tone: "primary" },
-            { label: "Credits", href: "/credits", tone: "secondary" },
+    @app.get(f"{api_prefix}/_boot")
+    def boot_report():
+        admin_key_set = bool((os.getenv("ADMIN_KEY") or "").strip())
+        return jsonify(
             {
-              label: "Refresh",
-              onClick: () => loadHistoryWorkspace("Refreshing history workspace..."),
-              tone: "secondary",
-              disabled: busy || loadingHistory,
-            },
-            {
-              label: "Logout",
-              onClick: logout,
-              tone: "danger",
-              disabled: busy || loadingHistory,
-            },
-          ]}
-        />
-      }
-    >
-      <SectionStack>
-        {historyNotice ? (
-          <Banner
-            title={historyNotice.title}
-            message={historyNotice.message}
-            tone={historyNotice.tone}
-          />
-        ) : null}
+                "ok": True,
+                "request_id": _rid(),
+                "admin_key_set": admin_key_set,
+                "boot": boot,
+            }
+        ), 200
 
-        {alerts.map((alert) => (
-          <Banner
-            key={alert.key}
-            title={alert.title}
-            message={alert.message}
-            tone={alert.tone}
-          />
-        ))}
+    @app.get(f"{api_prefix}/_diag")
+    def runtime_diag():
+        hints: List[str] = []
 
-        <WorkspaceOverviewMetrics
-          mode="dashboard"
-          accountId={accountId}
-          activeNow={activeNow}
-          planCode={planCode}
-          creditBalance={creditBalance}
-          dailyUsage={dailyUsage}
-          dailyLimit={dailyLimit}
-          expiresAt={expiresAt}
-        />
+        cron_registered = any((r.get("alias_name") == "cron") for r in boot.get("registered", []))
+        if not cron_registered:
+            hints.append("Cron blueprint is NOT registered. Confirm app/routes/cron.py exists and exports bp = Blueprint(...).")
 
-        <CardsGrid min={220}>
-          <MetricCard
-            label="Saved Items"
-            value={String(historyItems.length)}
-            tone={toneFromHistoryCount(historyItems.length)}
-            helper="Total visible question-answer items currently saved for this workspace."
-          />
-          <MetricCard
-            label="Filtered Results"
-            value={String(filteredItems.length)}
-            tone={filteredItems.length > 0 ? "good" : "warn"}
-            helper="Visible results after current search and source filter are applied."
-          />
-          <MetricCard
-            label="Newest Item"
-            value={newestItem ? formatDate(newestItem.created_at) : "—"}
-            tone={newestItem ? "good" : "default"}
-            helper="Most recent saved entry currently visible in history."
-          />
-          <MetricCard
-            label="Oldest Item"
-            value={oldestItem ? formatDate(oldestItem.created_at) : "—"}
-            tone={oldestItem ? "default" : "warn"}
-            helper="Earliest visible entry still available in history."
-          />
-        </CardsGrid>
+        support_registered = any((r.get("alias_name") == "support") for r in boot.get("registered", []))
+        if not support_registered:
+            hints.append("Support blueprint is not registered. Confirm app/routes/support.py exists and exports bp = Blueprint(...).")
 
-        <TwoColumnSection leftRatio={1.08} rightRatio={0.92}>
-          <WorkspaceSectionCard
-            title="History Search"
-            subtitle="Find previous questions quickly by keyword or channel source."
-          >
-            <div style={{ display: "grid", gap: 14 }}>
-              <div style={{ display: "grid", gap: 8 }}>
-                <div
-                  style={{
-                    color: "var(--text)",
-                    fontWeight: 800,
-                    fontSize: 14,
-                  }}
-                >
-                  Search saved history
-                </div>
-                <input
-                  value={search}
-                  onChange={(e) => setSearch(e.target.value)}
-                  placeholder="Search question text, answer text, source, or language..."
-                  style={appInputStyle}
-                />
-              </div>
+        history_registered = any((r.get("alias_name") == "history") for r in boot.get("registered", []))
+        if not history_registered:
+            hints.append("History blueprint is not registered. Confirm app/routes/history.py exists and exports bp = Blueprint(...).")
 
-              <div style={{ display: "grid", gap: 8 }}>
-                <div
-                  style={{
-                    color: "var(--text)",
-                    fontWeight: 800,
-                    fontSize: 14,
-                  }}
-                >
-                  Filter by source
-                </div>
-                <select
-                  value={sourceFilter}
-                  onChange={(e) => setSourceFilter(e.target.value)}
-                  style={appSelectStyle}
-                >
-                  <option value="all">All Sources</option>
-                  <option value="web">Web</option>
-                  <option value="whatsapp">WhatsApp</option>
-                  <option value="telegram">Telegram</option>
-                  <option value="ai">AI</option>
-                  <option value="cache">Cache</option>
-                </select>
-              </div>
+        if cookie_mode and origins == "*":
+            hints.append("COOKIE_MODE is enabled but CORS origins are '*'. Use explicit origins when cookies are used.")
 
-              <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
-                <WorkspaceActionBar
-                  items={[
-                    {
-                      label: loadingHistory ? "Searching..." : "Apply Search",
-                      onClick: () => loadHistoryWorkspace("Refreshing filtered history..."),
-                      tone: "primary",
-                      disabled: loadingHistory || busy,
-                    },
-                  ]}
-                />
-              </div>
+        if cookie_mode and (isinstance(origins, list) and not origins):
+            hints.append("COOKIE_MODE is enabled but parsed origins list is empty. Set CORS_ORIGINS to your frontend URL(s).")
 
-              <div
-                style={{
-                  borderRadius: 18,
-                  border: "1px solid var(--border)",
-                  background: "var(--surface)",
-                  padding: 16,
-                  color: "var(--text-muted)",
-                  lineHeight: 1.75,
-                  fontSize: 14,
-                }}
-              >
-                History is part of user continuity. It should help users return to previous tax guidance, compare earlier answers, and continue work without retyping the same question again.
-              </div>
-            </div>
-          </WorkspaceSectionCard>
+        if not (os.getenv("SUPABASE_URL") or "").strip():
+            hints.append("SUPABASE_URL is missing -> Supabase RPC/table calls will fail.")
+        if not (os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY") or "").strip():
+            hints.append("Supabase service key is missing -> RPC/table calls may fail.")
 
-          <WorkspaceSectionCard
-            title="History Breakdown"
-            subtitle="Quick operational view of where saved items came from."
-          >
-            <CardsGrid min={180}>
-              <MetricCard
-                label="Web"
-                value={String(webCount)}
-                tone={webCount > 0 ? "good" : "default"}
-                helper="Items saved from the web workspace."
-              />
-              <MetricCard
-                label="WhatsApp"
-                value={String(whatsappCount)}
-                tone={whatsappCount > 0 ? "good" : "default"}
-                helper="Items saved from WhatsApp usage."
-              />
-              <MetricCard
-                label="Telegram"
-                value={String(telegramCount)}
-                tone={telegramCount > 0 ? "good" : "default"}
-                helper="Items saved from Telegram usage."
-              />
-            </CardsGrid>
+        if not (os.getenv("PAYSTACK_WEBHOOK_SECRET") or "").strip():
+            hints.append("PAYSTACK_WEBHOOK_SECRET is missing. Paystack signature verification will fail for /api/billing/webhook.")
 
-            <MetricCard
-              label="Continuity State"
-              value={historyItems.length > 0 ? "Available" : "Empty"}
-              tone={historyItems.length > 0 ? "good" : "warn"}
-              helper="Whether the user currently has any saved history to revisit."
-            />
-          </WorkspaceSectionCard>
-        </TwoColumnSection>
+        if not (
+            (os.getenv("SUPPORT_TO_EMAIL") or "").strip()
+            or (os.getenv("SUPPORT_EMAIL") or "").strip()
+            or (os.getenv("MAIL_FROM_EMAIL") or "").strip()
+            or (os.getenv("SMTP_FROM") or "").strip()
+            or (os.getenv("MAIL_USER") or "").strip()
+            or (os.getenv("SMTP_USER") or "").strip()
+        ):
+            hints.append("Support inbox email is not configured. Set SUPPORT_TO_EMAIL for /api/support.")
 
-        <WorkspaceSectionCard
-          title="Saved Questions and Answers"
-          subtitle="Open previous records to continue work with confidence and continuity."
-        >
-          {filteredItems.length > 0 ? (
-            <div style={{ display: "grid", gap: 16 }}>
-              {filteredItems.map((item) => {
-                const itemId = String(item.id);
+        env_view = {
+            "ADMIN_KEY_SET": bool((os.getenv("ADMIN_KEY") or "").strip()),
+            "API_PREFIX": api_prefix,
+            "COOKIE_MODE": cookie_mode,
+            "CORS_ORIGINS_MODE": ("*" if origins == "*" else "list"),
+            "ENABLE_DEBUG_ROUTES": _safe_get_env_bool("ENABLE_DEBUG_ROUTES"),
+            "STRICT_BLUEPRINTS": strict,
+            "SUPPORTS_CREDENTIALS": supports_credentials,
+            "WEB_AUTH_ENABLED": _safe_get_env_bool("WEB_AUTH_ENABLED"),
+        }
 
-                return (
-                  <HistoryItemCard
-                    key={itemId}
-                    item={item}
-                    expanded={expandedId === itemId}
-                    onToggle={() =>
-                      setExpandedId((current) => (current === itemId ? null : itemId))
-                    }
-                  />
-                );
-              })}
-            </div>
-          ) : (
-            <Banner
-              title="No matching history found"
-              message={
-                historyItems.length > 0
-                  ? "No saved items match your current search or source filter. Adjust the filters and try again."
-                  : "No question history is visible yet. Once successful tax questions are saved, they will appear here for future review."
-              }
-              tone={historyItems.length > 0 ? "warn" : "default"}
-            />
-          )}
-        </WorkspaceSectionCard>
+        return jsonify({"ok": True, "request_id": _rid(), "env": env_view, "hints": hints}), 200
 
-        <WorkspaceSectionCard
-          title="Recommended Actions"
-          subtitle="Use history together with other workspace tools to reduce repeated work."
-        >
-          <CardsGrid min={240}>
-            <ShortcutCard
-              title="Ask Tax AI"
-              subtitle={
-                !activeNow
-                  ? "Your account may need active paid access before new questions can continue."
-                  : creditBalance <= 0
-                  ? "Your visible credits are exhausted. Review Credits or Plans before continuing."
-                  : "Ask a new tax question when saved history is no longer enough."
-              }
-              tone={!activeNow ? "warn" : creditBalance <= 0 ? "danger" : "good"}
-              onClick={() => router.push("/ask")}
-            />
+    @app.route(f"{api_prefix}/<path:_any>", methods=["OPTIONS"])
+    def _api_preflight(_any: str):
+        return ("", 204)
 
-            <ShortcutCard
-              title="Credits"
-              subtitle="Review balance and daily usage before deciding whether to continue with fresh AI requests."
-              tone={creditBalance <= 3 ? "warn" : "default"}
-              onClick={() => router.push("/credits")}
-            />
+    @app.errorhandler(Exception)
+    def _handle_any_error(e: Exception):
+        status = getattr(e, "code", 500)
+        msg = str(e) or type(e).__name__
 
-            <ShortcutCard
-              title="Billing"
-              subtitle="Check subscription condition, expiry, and billing readiness if access needs attention."
-              tone={!activeNow ? "warn" : "default"}
-              onClick={() => router.push("/billing")}
-            />
+        out: Dict[str, Any] = {
+            "ok": False,
+            "request_id": _rid(),
+            "error": type(e).__name__,
+            "message": msg[:800],
+        }
 
-            <ShortcutCard
-              title="Help Center"
-              subtitle="Open guided help if the user needs assistance interpreting results or workspace behavior."
-              tone="default"
-              onClick={() => router.push("/help")}
-            />
-          </CardsGrid>
-        </WorkspaceSectionCard>
+        if _debug_enabled():
+            import traceback as _tb
 
-        <TwoColumnSection>
-          <WorkspaceSectionCard
-            title="History Notes"
-            subtitle="How this page should function in a real SaaS workflow."
-          >
-            <div
-              style={{
-                display: "grid",
-                gap: 10,
-                color: "var(--text-muted)",
-                fontSize: 14,
-                lineHeight: 1.75,
-              }}
-            >
-              <div>1. History should make the product feel continuous, not disposable.</div>
-              <div>2. Users should be able to find earlier answers without friction.</div>
-              <div>3. Search and source filtering reduce repeated questioning.</div>
-              <div>4. Saved answers improve trust because users can revisit prior guidance.</div>
-              <div>5. This page is now prepared for real backend-linked continuity.</div>
-            </div>
-          </WorkspaceSectionCard>
+            out["debug"] = {
+                "path": request.path,
+                "method": request.method,
+                "content_type": request.content_type,
+            }
+            out["traceback"] = _tb.format_exc(limit=60)
 
-          <WorkspaceSectionCard
-            title="Next Best Decision"
-            subtitle="Fast summary of what the user should do next."
-          >
-            <CardsGrid min={220}>
-              <MetricCard
-                label="Best Immediate Action"
-                value={
-                  filteredItems.length > 0
-                    ? "Review Saved Answers"
-                    : historyItems.length > 0
-                    ? "Adjust Filters"
-                    : "Ask First Question"
-                }
-                tone={
-                  filteredItems.length > 0
-                    ? "good"
-                    : historyItems.length > 0
-                    ? "warn"
-                    : "default"
-                }
-                helper="Most sensible next move based on current visible history."
-              />
-              <MetricCard
-                label="History Utility"
-                value={historyItems.length > 0 ? "Useful" : "Not Yet Built"}
-                tone={historyItems.length > 0 ? "good" : "warn"}
-                helper="Shows whether user continuity is already active in this workspace."
-              />
-            </CardsGrid>
-          </WorkspaceSectionCard>
-        </TwoColumnSection>
-      </SectionStack>
-    </AppShell>
-  );
-}
+        return jsonify(out), status
+
+    return app
