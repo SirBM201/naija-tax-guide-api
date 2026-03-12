@@ -165,9 +165,6 @@ def ask_guarded(
 
     best_candidate = decision.best_candidate or (ranked[0] if ranked else None)
 
-    # IMPORTANT:
-    # Always try a safe candidate answer first before falling into grounded synthesis.
-    # This prevents simple definition questions from returning internal-style synthesis text.
     safe_candidate = _try_safe_candidate_answer(
         candidate=best_candidate,
         question_meta=question_meta,
@@ -186,6 +183,8 @@ def ask_guarded(
             )
             return res.__dict__
 
+    # If there is no fresh AI credit left, stop here.
+    # This is now aligned with visible credit balance + monthly allowance.
     if decision.mode == "insufficient_credits_uncached" or not credits_available:
         res = compose_insufficient_uncached(debug=_filtered_debug(debug))
         return res.__dict__
