@@ -1,5 +1,4 @@
 # app/services/tax_grounding_service.py
-
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
@@ -57,25 +56,25 @@ def _float(value: Any, default: float = 0.0) -> float:
 
 
 def _jurisdiction_ok(question_meta: Dict[str, Any], candidate: Dict[str, Any]) -> bool:
-    qj = _normalize(question_meta.get("jurisdiction"))
-    cj = _normalize(candidate.get("jurisdiction"))
-
-    if not qj:
-        qj = "nigeria"
-
+    qj = _normalize(question_meta.get("jurisdiction") or "nigeria")
+    cj = _normalize(candidate.get("jurisdiction") or "nigeria")
     return cj in NIGERIA_ALIASES and qj in NIGERIA_ALIASES
 
 
 def _topic_ok(question_meta: Dict[str, Any], candidate: Dict[str, Any]) -> bool:
     qt = _normalize(question_meta.get("topic"))
     ct = _normalize(candidate.get("topic"))
-    return bool(qt and ct and qt == ct)
+    if not qt or not ct:
+        return True
+    return qt == ct
 
 
 def _intent_ok(question_meta: Dict[str, Any], candidate: Dict[str, Any]) -> bool:
     qi = _normalize(question_meta.get("intent_type"))
     ci = _normalize(candidate.get("intent_type"))
-    return bool(qi and ci and qi == ci)
+    if not qi or not ci:
+        return True
+    return qi == ci
 
 
 def _collect_candidate_evidence(candidate: Dict[str, Any]) -> List[GroundingEvidence]:
@@ -112,7 +111,7 @@ def _authority_score(candidate: Dict[str, Any], evidences: List[GroundingEvidenc
         source_type = _normalize(candidate.get("source_type"))
         if source_type in OFFICIAL_SOURCE_TYPES:
             return 0.9
-        return 0.35
+        return 0.65 if candidate.get("source") == "cache" else 0.35
 
     top = max(e.authority_score for e in evidences)
     avg = sum(e.authority_score for e in evidences) / len(evidences)
@@ -131,8 +130,8 @@ def build_grounded_answer(
     topic_ok = _topic_ok(question_meta, candidate)
     intent_ok = _intent_ok(question_meta, candidate)
     authority_score = _authority_score(candidate, evidences)
-    trust_score = _float(candidate.get("trust_score"), 0.0)
-    similarity = _float(candidate.get("similarity"), 0.0)
+    trust_score = _float(candidate.get("trust_score"), 1.0)
+    similarity = _float(candidate.get("similarity"), 1.0 if candidate.get("source") == "cache" else 0.0)
 
     confidence = min(
         1.0,
@@ -193,54 +192,3 @@ def build_grounded_answer(
         evidence=[asdict(e) for e in evidences],
         answer_text=composed_answer or candidate.get("answer"),
     )
-
-
-def grounding_prompt_context(
-    *,
-    question_meta: Dict[str, Any],
-    grounded: GroundedAnswer,
-) -> str:
-    """
-    Builds a strict prompt context for downstream AI synthesis if needed.
-    This should be passed into the AI layer so the model behaves like a grounded tax assistant.
-    """
-    evidence_lines: List[str] = []
-    for idx, item in enumerate(grounded.evidence, start=1):
-        citation = item.get("citation") or "No citation"
-        title = item.get("source_title") or "Untitled"
-        excerpt = item.get("excerpt") or ""
-        evidence_lines.append(
-            f"{idx}. [{item.get('source_type', 'unknown')}] {title} | {citation} | {excerpt}"
-        )
-
-    evidence_blob = "\n".join(evidence_lines) if evidence_lines else "No evidence provided."
-
-    return f"""
-You are answering as a Nigerian tax guidance assistant.
-
-Strict rules:
-- Answer only within Nigerian tax context.
-- Do not drift into other countries.
-- Prefer official and approved guidance.
-- If the evidence does not support a confident answer, say so clearly.
-- Do not invent legal provisions, rates, deadlines, penalties, or filing steps.
-- Keep answer practical, direct, and accurate.
-- If the question asks for procedure, do not respond with only a definition.
-- If the question asks for a definition, do not produce a multi-step registration workflow unless clearly needed.
-
-Question classification:
-- topic: {question_meta.get("topic")}
-- intent_type: {question_meta.get("intent_type")}
-- jurisdiction: {question_meta.get("jurisdiction")}
-- complexity: {question_meta.get("complexity")}
-- risk_level: {question_meta.get("risk_level")}
-
-Grounding summary:
-- grounded: {grounded.grounded}
-- grounding_mode: {grounded.grounding_mode}
-- confidence: {grounded.confidence:.2f}
-- authority_score: {grounded.authority_score:.2f}
-
-Evidence:
-{evidence_blob}
-""".strip()
