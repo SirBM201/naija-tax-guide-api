@@ -1,5 +1,4 @@
 # app/services/response_refiner.py
-
 from __future__ import annotations
 
 from typing import Any, Dict, Optional
@@ -23,6 +22,34 @@ def _float(value: Any, default: float = 0.0) -> float:
 
 def _same(a: Any, b: Any) -> bool:
     return _normalize(a) == _normalize(b)
+
+
+def looks_like_ai_failure(text: str) -> bool:
+    t = _normalize(text)
+    if not t:
+        return True
+
+    bad_patterns = [
+        "ai temporarily unavailable",
+        "ai service not configured",
+        "openai_api_key not set",
+        "invalid_api_key",
+        "incorrect api key",
+        "quota",
+        "rate limit",
+        "request timed out",
+        "no answer generated",
+        "openai import failed",
+        "client init failed",
+        "something went wrong",
+        "unauthorized",
+        "401",
+        "ai_not_configured",
+        "openai_call_failed",
+        "openai_empty_answer",
+        "openai_sdk_missing",
+    ]
+    return any(p in t for p in bad_patterns)
 
 
 def refine_response(
@@ -55,11 +82,11 @@ def refine_response(
             ),
         }
 
-    review_status = _normalize(candidate.get("review_status"))
-    trust_score = _float(candidate.get("trust_score"))
+    review_status = _normalize(candidate.get("review_status") or "approved")
+    trust_score = _float(candidate.get("trust_score"), 1.0)
     candidate_topic = candidate.get("topic")
     candidate_intent = candidate.get("intent_type")
-    candidate_jurisdiction = candidate.get("jurisdiction")
+    candidate_jurisdiction = candidate.get("jurisdiction") or "nigeria"
 
     question_topic = question_meta.get("topic")
     question_intent = question_meta.get("intent_type")
@@ -85,7 +112,7 @@ def refine_response(
             ),
         }
 
-    if not _same(candidate_topic, question_topic):
+    if question_topic and candidate_topic and not _same(candidate_topic, question_topic):
         return {
             "allowed": False,
             "decision": "reject",
@@ -95,7 +122,7 @@ def refine_response(
             ),
         }
 
-    if not _same(candidate_intent, question_intent):
+    if question_intent and candidate_intent and not _same(candidate_intent, question_intent):
         return {
             "allowed": False,
             "decision": "reject",
@@ -202,11 +229,22 @@ def refine_response(
             ),
         }
 
+    answer_text = str(grounded_result.get("answer_text") or candidate.get("answer") or "").strip()
+    if looks_like_ai_failure(answer_text):
+        return {
+            "allowed": False,
+            "decision": "reject",
+            "reason": "answer_text_invalid",
+            "user_message": (
+                "The answer source did not produce a valid response."
+            ),
+        }
+
     return {
         "allowed": True,
         "decision": "direct_cache",
         "reason": "safe_grounded_answer",
-        "answer": grounded_result.get("answer_text") or candidate.get("answer"),
+        "answer": answer_text,
         "source": candidate.get("match_type") or "cache",
         "confidence": confidence,
         "authority_score": authority_score,
