@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from app.schemas.ask_models import RetrievalCandidate
 
@@ -14,6 +14,7 @@ class AskExecutionResult:
     needs_credit: bool = False
     debug: Dict[str, Any] = field(default_factory=dict)
     meta: Dict[str, Any] = field(default_factory=dict)
+    error: Optional[str] = None
 
 
 def _safe_str(value: Any) -> str:
@@ -40,11 +41,12 @@ def _candidate_meta(candidate: RetrievalCandidate) -> Dict[str, Any]:
 def compose_direct_cache_answer(
     candidate: RetrievalCandidate,
     *,
+    answer_text: Optional[str] = None,
     debug: Optional[Dict[str, Any]] = None,
 ) -> AskExecutionResult:
     return AskExecutionResult(
         ok=True,
-        answer=_safe_str(candidate.answer),
+        answer=_safe_str(answer_text or candidate.answer),
         source="cache",
         needs_credit=False,
         debug=debug or {},
@@ -97,11 +99,10 @@ def compose_insufficient_uncached(
 ) -> AskExecutionResult:
     return AskExecutionResult(
         ok=False,
-        answer=(
-            "Your available AI usage for this period is exhausted, and I do not have a sufficiently reliable cached answer for this question yet."
-        ),
+        answer="",
         source="none",
         needs_credit=True,
+        error="insufficient_credits_uncached",
         debug=debug or {},
         meta={
             "mode": "insufficient_credits_uncached",
