@@ -1,4 +1,3 @@
-# app/services/tax_grounding_service.py
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
@@ -131,7 +130,10 @@ def build_grounded_answer(
     intent_ok = _intent_ok(question_meta, candidate)
     authority_score = _authority_score(candidate, evidences)
     trust_score = _float(candidate.get("trust_score"), 1.0)
-    similarity = _float(candidate.get("similarity"), 1.0 if candidate.get("source") == "cache" else 0.0)
+    similarity = _float(
+        candidate.get("similarity"),
+        1.0 if candidate.get("source") == "cache" else 0.0,
+    )
 
     confidence = min(
         1.0,
@@ -191,4 +193,52 @@ def build_grounded_answer(
         intent_ok=True,
         evidence=[asdict(e) for e in evidences],
         answer_text=composed_answer or candidate.get("answer"),
+    )
+
+
+def grounding_prompt_context(
+    *,
+    question_meta: Dict[str, Any],
+    grounded: GroundedAnswer,
+) -> str:
+    evidence_lines: List[str] = []
+
+    for idx, item in enumerate(grounded.evidence, start=1):
+        source_type = str(item.get("source_type") or "unknown").strip()
+        title = str(item.get("source_title") or "Untitled Source").strip()
+        citation = str(item.get("citation") or "No citation").strip()
+        excerpt = str(item.get("excerpt") or "").strip()
+
+        line = f"{idx}. [{source_type}] {title} | {citation}"
+        if excerpt:
+            line += f" | {excerpt}"
+        evidence_lines.append(line)
+
+    evidence_blob = "\n".join(evidence_lines) if evidence_lines else "No evidence provided."
+
+    return (
+        "You are answering as Naija Tax Guide, a grounded Nigerian tax assistant.\n"
+        "Strict rules:\n"
+        "- Answer only within Nigerian tax context.\n"
+        "- Do not drift into other jurisdictions.\n"
+        "- Prefer approved and authoritative guidance.\n"
+        "- Do not invent penalties, rates, deadlines, procedures, or legal provisions.\n"
+        "- If the evidence is insufficient, say so clearly.\n"
+        "- Match the user's intent. If the user asks for procedure, do not answer with only a definition.\n"
+        "- If the user asks for a definition, answer with the definition first.\n"
+        "\n"
+        f"Question classification:\n"
+        f"- topic: {question_meta.get('topic')}\n"
+        f"- intent_type: {question_meta.get('intent_type')}\n"
+        f"- jurisdiction: {question_meta.get('jurisdiction')}\n"
+        f"- complexity: {question_meta.get('complexity')}\n"
+        f"- risk_level: {question_meta.get('risk_level')}\n"
+        "\n"
+        f"Grounding summary:\n"
+        f"- grounded: {grounded.grounded}\n"
+        f"- grounding_mode: {grounded.grounding_mode}\n"
+        f"- confidence: {grounded.confidence:.2f}\n"
+        f"- authority_score: {grounded.authority_score:.2f}\n"
+        "\n"
+        f"Evidence:\n{evidence_blob}"
     )
