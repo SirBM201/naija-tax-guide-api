@@ -1,85 +1,126 @@
-# app/services/answer_composer.py
-
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
+
+from app.schemas.ask_models import RetrievalCandidate
 
 
-def _normalize(value: Any) -> str:
+@dataclass
+class AskExecutionResult:
+    ok: bool
+    answer: str
+    source: str
+    needs_credit: bool = False
+    debug: Dict[str, Any] = field(default_factory=dict)
+    meta: Dict[str, Any] = field(default_factory=dict)
+
+
+def _safe_str(value: Any) -> str:
     return str(value or "").strip()
 
 
-def _build_evidence_footer(evidence: List[Dict[str, Any]]) -> str:
-    if not evidence:
-        return ""
+def _candidate_meta(candidate: RetrievalCandidate) -> Dict[str, Any]:
+    return {
+        "candidate_id": candidate.candidate_id,
+        "canonical_key": candidate.canonical_key,
+        "topic": candidate.topic,
+        "intent_type": candidate.intent_type,
+        "jurisdiction": candidate.jurisdiction,
+        "lang": candidate.lang,
+        "trust_score": candidate.trust_score,
+        "source_authority_score": candidate.source_authority_score,
+        "similarity": candidate.similarity,
+        "match_type": candidate.match_type,
+        "rank_score": candidate.rank_score,
+        "review_status": candidate.review_status,
+    }
 
-    lines = []
-    for item in evidence[:3]:
-        title = _normalize(item.get("source_title")) or "Untitled Source"
-        citation = _normalize(item.get("citation")) or "Reference not specified"
-        lines.append(f"- {title}: {citation}")
 
-    return "\n\nRelevant basis:\n" + "\n".join(lines)
-
-
-def compose_final_answer(
+def compose_direct_cache_answer(
+    candidate: RetrievalCandidate,
     *,
+    debug: Optional[Dict[str, Any]] = None,
+) -> AskExecutionResult:
+    return AskExecutionResult(
+        ok=True,
+        answer=_safe_str(candidate.answer),
+        source="cache",
+        needs_credit=False,
+        debug=debug or {},
+        meta={
+            "mode": "direct_cache",
+            "candidate": _candidate_meta(candidate),
+        },
+    )
+
+
+def compose_ai_answer(
     answer_text: str,
-    question_meta: Dict[str, Any],
-    refined_result: Dict[str, Any],
-) -> Dict[str, Any]:
-    """
-    Builds the final user-facing answer payload.
-    """
-
-    topic = _normalize(question_meta.get("topic"))
-    intent_type = _normalize(question_meta.get("intent_type"))
-    jurisdiction = _normalize(question_meta.get("jurisdiction") or "Nigeria")
-
-    evidence = refined_result.get("evidence") or []
-    confidence = refined_result.get("confidence")
-    authority_score = refined_result.get("authority_score")
-    grounding_mode = _normalize(refined_result.get("grounding_mode"))
-
-    footer = _build_evidence_footer(evidence)
-
-    final_text = _normalize(answer_text)
-    if footer:
-        final_text += footer
-
-    return {
-        "answer": final_text,
-        "meta": {
-            "topic": topic,
-            "intent_type": intent_type,
-            "jurisdiction": jurisdiction,
-            "source": refined_result.get("source"),
-            "confidence": confidence,
-            "authority_score": authority_score,
-            "grounding_mode": grounding_mode,
-            "safe": True,
-        },
-    }
-
-
-def compose_refusal(
     *,
-    refined_result: Dict[str, Any],
-    question_meta: Dict[str, Any],
-) -> Dict[str, Any]:
-    return {
-        "answer": refined_result.get("user_message")
-        or "I could not produce a sufficiently reliable answer for that question yet.",
-        "meta": {
-            "topic": _normalize(question_meta.get("topic")),
-            "intent_type": _normalize(question_meta.get("intent_type")),
-            "jurisdiction": _normalize(question_meta.get("jurisdiction") or "Nigeria"),
-            "source": "none",
-            "confidence": 0.0,
-            "authority_score": 0.0,
-            "grounding_mode": "refusal",
-            "safe": True,
-            "reason": refined_result.get("reason"),
-            "decision": refined_result.get("decision"),
+    debug: Optional[Dict[str, Any]] = None,
+) -> AskExecutionResult:
+    return AskExecutionResult(
+        ok=True,
+        answer=_safe_str(answer_text),
+        source="ai",
+        needs_credit=False,
+        debug=debug or {},
+        meta={
+            "mode": "grounded_synthesis",
         },
-    }
+    )
+
+
+def compose_clarification(
+    *,
+    debug: Optional[Dict[str, Any]] = None,
+) -> AskExecutionResult:
+    return AskExecutionResult(
+        ok=True,
+        answer=(
+            "I need a little more detail to answer that safely. "
+            "Please clarify the tax type, taxpayer type, or exact action you want to take."
+        ),
+        source="clarification",
+        needs_credit=False,
+        debug=debug or {},
+        meta={
+            "mode": "clarification",
+        },
+    )
+
+
+def compose_insufficient_uncached(
+    *,
+    debug: Optional[Dict[str, Any]] = None,
+) -> AskExecutionResult:
+    return AskExecutionResult(
+        ok=False,
+        answer=(
+            "Your available AI usage for this period is exhausted, and I do not have a sufficiently reliable cached answer for this question yet."
+        ),
+        source="none",
+        needs_credit=True,
+        debug=debug or {},
+        meta={
+            "mode": "insufficient_credits_uncached",
+        },
+    )
+
+
+def compose_rules_engine_answer(
+    answer_text: str,
+    *,
+    debug: Optional[Dict[str, Any]] = None,
+) -> AskExecutionResult:
+    return AskExecutionResult(
+        ok=True,
+        answer=_safe_str(answer_text),
+        source="rules_engine",
+        needs_credit=False,
+        debug=debug or {},
+        meta={
+            "mode": "rules_engine",
+        },
+    )
