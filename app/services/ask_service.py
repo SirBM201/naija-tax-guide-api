@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, Optional
 
-from app.schemas.ask_models import AskExecutionResult
 from app.services.query_classifier import classify_query
 from app.services.semantic_cache_service import retrieve_ranked_candidates, ranked_debug_dump
 from app.services.decision_engine import decide_answer_mode
@@ -20,6 +20,14 @@ from app.services.tax_grounding_service import build_grounded_answer, grounding_
 from app.services.response_refiner import refine_response
 from app.services.tax_rules.vat_rules import can_handle_vat_rule, resolve_vat_rule
 from app.services.tax_rules.paye_rules import can_handle_paye_rule, resolve_paye_rule
+
+
+def _truthy(v: str | None) -> bool:
+    return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _include_debug() -> bool:
+    return _truthy(os.getenv("DEBUG_AI")) or _truthy(os.getenv("SHOW_ASK_DEBUG"))
 
 
 def _candidate_to_dict(c) -> Dict[str, Any]:
@@ -65,6 +73,51 @@ def _resolve_rules(question: str, topic: str, intent_type: str) -> Optional[str]
     return None
 
 
+def _filtered_debug(debug: Dict[str, Any]) -> Dict[str, Any]:
+    if _include_debug():
+        return debug
+    return {}
+
+
+def _try_safe_candidate_answer(
+    *,
+    candidate,
+    question_meta: Dict[str, Any],
+    credits_available: bool,
+) -> Optional[Dict[str, Any]]:
+    if not candidate:
+        return None
+
+    candidate_dict = _candidate_to_dict(candidate)
+
+    grounded = build_grounded_answer(
+        question_meta=question_meta,
+        candidate=candidate_dict,
+        composed_answer=candidate_dict.get("answer"),
+    )
+
+    refined = refine_response(
+        question_meta=question_meta,
+        candidate=candidate_dict,
+        grounded_result=grounded.__dict__,
+        credits_available=credits_available,
+    )
+
+    if refined.get("allowed"):
+        return {
+            "allowed": True,
+            "answer": str(refined.get("answer") or candidate.answer or "").strip(),
+            "grounded": grounded.__dict__,
+            "refined": refined,
+        }
+
+    return {
+        "allowed": False,
+        "grounded": grounded.__dict__,
+        "refined": refined,
+    }
+
+
 def ask_guarded(
     *,
     account_id: str,
@@ -77,13 +130,14 @@ def ask_guarded(
 
     usage_state = get_ai_usage_state(account_id)
     billing_state = get_billing_state(account_id)
+    credits_available = bool(usage_state.get("has_ai_credit"))
 
     ranked = retrieve_ranked_candidates(classification)
 
     decision = decide_answer_mode(
         classification,
         ranked,
-        has_ai_credit=bool(usage_state["has_ai_credit"]),
+        has_ai_credit=credits_available,
         monthly_ai_usage=int(usage_state["monthly_ai_usage"]),
         monthly_ai_limit=int(usage_state["monthly_ai_limit"]),
     )
@@ -100,53 +154,43 @@ def ask_guarded(
     }
 
     if decision.mode == "clarification":
-        res = compose_clarification(debug=debug)
+        res = compose_clarification(debug=_filtered_debug(debug))
         return res.__dict__
 
     if decision.mode == "rules_engine":
         rule_answer = _resolve_rules(question, classification.topic, classification.intent_type)
         if rule_answer:
-            res = compose_rules_engine_answer(rule_answer, debug=debug)
+            res = compose_rules_engine_answer(rule_answer, debug=_filtered_debug(debug))
             return res.__dict__
 
-    # SAFE DIRECT CACHE PATH
-    if decision.mode == "direct_cache" and decision.best_candidate:
-        candidate_dict = _candidate_to_dict(decision.best_candidate)
+    best_candidate = decision.best_candidate or (ranked[0] if ranked else None)
 
-        grounded = build_grounded_answer(
-            question_meta=question_meta,
-            candidate=candidate_dict,
-            composed_answer=candidate_dict.get("answer"),
-        )
+    # IMPORTANT:
+    # Always try a safe candidate answer first before falling into grounded synthesis.
+    # This prevents simple definition questions from returning internal-style synthesis text.
+    safe_candidate = _try_safe_candidate_answer(
+        candidate=best_candidate,
+        question_meta=question_meta,
+        credits_available=credits_available,
+    )
 
-        refined = refine_response(
-            question_meta=question_meta,
-            candidate=candidate_dict,
-            grounded_result=grounded.__dict__,
-            credits_available=bool(usage_state["has_ai_credit"]),
-        )
+    if safe_candidate:
+        debug["candidate_grounding"] = safe_candidate.get("grounded")
+        debug["candidate_refiner"] = safe_candidate.get("refined")
 
-        debug["cache_grounding"] = grounded.__dict__
-        debug["cache_refiner"] = refined
-
-        if refined.get("allowed"):
-            res = compose_direct_cache_answer(decision.best_candidate, debug=debug)
+        if safe_candidate.get("allowed"):
+            res = compose_direct_cache_answer(
+                best_candidate,
+                answer_text=safe_candidate.get("answer"),
+                debug=_filtered_debug(debug),
+            )
             return res.__dict__
 
-        # If cache candidate fails safety checks and there is no AI credit,
-        # return proper insufficient credits message instead of wrong answer.
-        if not bool(usage_state["has_ai_credit"]):
-            res = compose_insufficient_uncached(debug=debug)
-            return res.__dict__
-
-        # If cache candidate fails but AI credit exists, fall through to grounded synthesis.
-        decision.mode = "grounded_synthesis"
-
-    if decision.mode == "insufficient_credits_uncached":
-        res = compose_insufficient_uncached(debug=debug)
+    if decision.mode == "insufficient_credits_uncached" or not credits_available:
+        res = compose_insufficient_uncached(debug=_filtered_debug(debug))
         return res.__dict__
 
-    if decision.mode == "grounded_synthesis":
+    if decision.mode == "grounded_synthesis" or decision.mode == "direct_cache":
         grounded_candidates = [_candidate_to_dict(c) for c in ranked[:3]]
 
         grounding_context = None
@@ -169,8 +213,8 @@ def ask_guarded(
             grounding_context=grounding_context,
         )
 
-        res = compose_ai_answer(answer_text, debug=debug)
+        res = compose_ai_answer(answer_text, debug=_filtered_debug(debug))
         return res.__dict__
 
-    res = compose_insufficient_uncached(debug=debug)
+    res = compose_insufficient_uncached(debug=_filtered_debug(debug))
     return res.__dict__
