@@ -5,27 +5,38 @@ from typing import Any, Dict, List
 from app.core.supabase_client import supabase
 
 
+SOURCE_ID = "firs_vat_guidance_2024"
+
+
 def _sb():
     return supabase() if callable(supabase) else supabase
 
 
-def seed_sources() -> Dict[str, Any]:
-    sb = _sb()
+def _as_list(value: Any) -> List[Dict[str, Any]]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return []
 
-    source = {
-        "source_id": "firs_vat_guidance_2024",
+
+def _source_payload() -> Dict[str, Any]:
+    return {
+        "source_id": SOURCE_ID,
         "title": "FIRS VAT Guidance 2024",
         "source_type": "guidance",
         "jurisdiction": "NG",
         "tax_type": "vat",
-        "law_family": "VAT Act / Finance Act",
+        "law_family": "VAT Act / Finance Act / PITA",
         "authority_rank": 0.95,
         "source_url": "https://www.firs.gov.ng/",
     }
 
-    chunks: List[Dict[str, Any]] = [
+
+def _chunk_payloads() -> List[Dict[str, Any]]:
+    return [
         {
-            "source_id": "firs_vat_guidance_2024",
+            "source_id": SOURCE_ID,
             "topic": "vat",
             "intent_type": "definition",
             "jurisdiction": "NG",
@@ -34,7 +45,7 @@ def seed_sources() -> Dict[str, Any]:
             "keywords": ["vat", "value added tax", "vat meaning", "what is vat"],
         },
         {
-            "source_id": "firs_vat_guidance_2024",
+            "source_id": SOURCE_ID,
             "topic": "vat",
             "intent_type": "rate",
             "jurisdiction": "NG",
@@ -43,16 +54,16 @@ def seed_sources() -> Dict[str, Any]:
             "keywords": ["vat rate", "7.5%", "nigeria vat rate"],
         },
         {
-            "source_id": "firs_vat_guidance_2024",
+            "source_id": SOURCE_ID,
             "topic": "vat",
             "intent_type": "exemption",
             "jurisdiction": "NG",
             "summary": "VAT exemptions",
-            "text_content": "Some items may be exempt or zero-rated depending on the applicable Nigerian tax rules and guidance.",
+            "text_content": "Certain supplies may be exempt or zero-rated depending on the applicable Nigerian tax rules, schedules, and current FIRS guidance.",
             "keywords": ["vat exemptions", "vat exempt items", "zero rated vat"],
         },
         {
-            "source_id": "firs_vat_guidance_2024",
+            "source_id": SOURCE_ID,
             "topic": "paye",
             "intent_type": "definition",
             "jurisdiction": "NG",
@@ -61,37 +72,133 @@ def seed_sources() -> Dict[str, Any]:
             "keywords": ["paye", "what is paye", "paye meaning"],
         },
         {
-            "source_id": "firs_vat_guidance_2024",
+            "source_id": SOURCE_ID,
             "topic": "paye",
             "intent_type": "computation",
             "jurisdiction": "NG",
             "summary": "PAYE computation basics",
-            "text_content": "PAYE is computed using taxable income after allowable reliefs and the applicable progressive tax bands.",
+            "text_content": "PAYE is computed using taxable income after allowable reliefs and the applicable progressive tax bands under Nigerian personal income tax rules.",
             "keywords": ["paye calculation", "how to compute paye", "paye nigeria"],
         },
         {
-            "source_id": "firs_vat_guidance_2024",
+            "source_id": SOURCE_ID,
             "topic": "freelancer",
             "intent_type": "guidance",
             "jurisdiction": "NG",
             "summary": "Freelancer tax basics",
-            "text_content": "Freelancers in Nigeria may have personal income tax obligations depending on the nature of income, residency, and applicable state tax rules.",
+            "text_content": "Freelancers in Nigeria may have personal income tax obligations depending on the nature of income, tax residence, and applicable state tax rules.",
             "keywords": ["freelancer tax", "self employed tax", "creator tax nigeria"],
         },
     ]
 
-    sb.table("tax_source_registry").upsert(source, on_conflict="source_id").execute()
 
-    inserted = 0
+def _find_source(sb, source_id: str) -> List[Dict[str, Any]]:
+    res = (
+        sb.table("tax_source_registry")
+        .select("source_id")
+        .eq("source_id", source_id)
+        .limit(1)
+        .execute()
+    )
+    return _as_list(getattr(res, "data", None))
+
+
+def _find_chunk_by_summary(sb, source_id: str, summary: str) -> List[Dict[str, Any]]:
+    res = (
+        sb.table("tax_source_chunks")
+        .select("id, source_id, summary")
+        .eq("source_id", source_id)
+        .eq("summary", summary)
+        .limit(1)
+        .execute()
+    )
+    return _as_list(getattr(res, "data", None))
+
+
+def _delete_existing_chunks(sb, source_id: str) -> int:
+    existing = (
+        sb.table("tax_source_chunks")
+        .select("id")
+        .eq("source_id", source_id)
+        .execute()
+    )
+    rows = _as_list(getattr(existing, "data", None))
+    count = len(rows)
+
+    if count > 0:
+        sb.table("tax_source_chunks").delete().eq("source_id", source_id).execute()
+
+    return count
+
+
+def seed_sources(*, allow_reseed: bool = False) -> Dict[str, Any]:
+    sb = _sb()
+
+    source = _source_payload()
+    chunks = _chunk_payloads()
+
+    existing_source = _find_source(sb, SOURCE_ID)
+
+    if existing_source and not allow_reseed:
+        existing_chunk_count_res = (
+            sb.table("tax_source_chunks")
+            .select("id")
+            .eq("source_id", SOURCE_ID)
+            .execute()
+        )
+        existing_chunk_count = len(_as_list(getattr(existing_chunk_count_res, "data", None)))
+
+        return {
+            "status": "skipped_existing_source",
+            "source_id": SOURCE_ID,
+            "source_inserted": False,
+            "source_already_exists": True,
+            "chunks_deleted": 0,
+            "chunks_inserted": 0,
+            "existing_chunk_count": existing_chunk_count,
+        }
+
+    source_inserted = False
+    chunks_deleted = 0
+    chunks_inserted = 0
+    chunks_skipped = 0
+
+    sb.table("tax_source_registry").upsert(source, on_conflict="source_id").execute()
+    source_inserted = True
+
+    if allow_reseed:
+        chunks_deleted = _delete_existing_chunks(sb, SOURCE_ID)
+
     for chunk in chunks:
+        if not allow_reseed:
+            existing_chunk = _find_chunk_by_summary(sb, SOURCE_ID, chunk["summary"])
+            if existing_chunk:
+                chunks_skipped += 1
+                continue
+
         sb.table("tax_source_chunks").insert(chunk).execute()
-        inserted += 1
+        chunks_inserted += 1
+
+    final_chunk_count_res = (
+        sb.table("tax_source_chunks")
+        .select("id")
+        .eq("source_id", SOURCE_ID)
+        .execute()
+    )
+    final_chunk_count = len(_as_list(getattr(final_chunk_count_res, "data", None)))
 
     return {
-        "source_id": source["source_id"],
-        "chunks_inserted": inserted,
+        "status": "seed_completed",
+        "source_id": SOURCE_ID,
+        "source_inserted": source_inserted,
+        "source_already_exists": bool(existing_source),
+        "allow_reseed": allow_reseed,
+        "chunks_deleted": chunks_deleted,
+        "chunks_inserted": chunks_inserted,
+        "chunks_skipped": chunks_skipped,
+        "final_chunk_count": final_chunk_count,
     }
 
 
 if __name__ == "__main__":
-    print(seed_sources())
+    print(seed_sources(allow_reseed=False))
