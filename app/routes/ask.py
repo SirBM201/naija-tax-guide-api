@@ -129,15 +129,15 @@ def _handle_ask():
         return jsonify(body), 500
 
 
-@bp.route("", methods=["POST", "OPTIONS"], strict_slashes=False)
-def ask_root_no_slash():
+@bp.route("/ask", methods=["POST", "OPTIONS"], strict_slashes=False)
+def ask_no_slash():
     if request.method == "OPTIONS":
         return ("", 200)
     return _handle_ask()
 
 
-@bp.route("/", methods=["POST", "OPTIONS"], strict_slashes=False)
-def ask_root_with_slash():
+@bp.route("/ask/", methods=["POST", "OPTIONS"], strict_slashes=False)
+def ask_with_slash():
     if request.method == "OPTIONS":
         return ("", 200)
     return _handle_ask()
