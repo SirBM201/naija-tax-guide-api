@@ -25,6 +25,8 @@ from app.services.tax_grounding_service import build_grounded_answer, grounding_
 from app.services.response_refiner import refine_response
 from app.services.tax_rules.vat_rules import can_handle_vat_rule, resolve_vat_rule
 from app.services.tax_rules.paye_rules import can_handle_paye_rule, resolve_paye_rule
+from app.services.tax_intent_service import classify_tax_intent
+from app.services.tax_process_composer import try_compose
 
 
 def _truthy(v: str | None) -> bool:
@@ -74,6 +76,9 @@ def _tokenize(value: str) -> List[str]:
 
 
 def _candidate_to_dict(c) -> Dict[str, Any]:
+    if isinstance(c, dict):
+        return c
+
     return {
         "candidate_id": c.candidate_id,
         "question": c.question,
@@ -114,6 +119,37 @@ def _resolve_rules(question: str, topic: str, intent_type: str) -> Optional[str]
         return resolve_paye_rule(question, intent_type)
 
     return None
+
+
+def _try_process_composer(question: str) -> Optional[Dict[str, Any]]:
+    """
+    Deterministic process routing layer.
+    Handles questions like:
+    - how do i pay tax
+    - how to register tin
+    - how to file tax
+    """
+    intent = classify_tax_intent(question)
+
+    if not intent:
+        return None
+
+    composed = try_compose(intent)
+
+    if not composed:
+        return None
+
+    answer = str(composed.get("answer") or "").strip()
+    if not answer:
+        return None
+
+    meta = composed.get("meta") or {}
+
+    return {
+        "answer": answer,
+        "meta": meta,
+        "intent": intent,
+    }
 
 
 def _filtered_debug(debug: Dict[str, Any]) -> Dict[str, Any]:
@@ -368,10 +404,7 @@ def _try_safe_candidate_answer(
     if not candidate:
         return None
 
-    candidate_dict = (
-        candidate if isinstance(candidate, dict) and candidate.get("source") == "tax_kb"
-        else _candidate_to_dict(candidate)
-    )
+    candidate_dict = _candidate_to_dict(candidate)
 
     grounded = build_grounded_answer(
         question_meta=question_meta,
@@ -379,10 +412,12 @@ def _try_safe_candidate_answer(
         composed_answer=candidate_dict.get("answer"),
     )
 
+    grounded_result = grounded.__dict__ if hasattr(grounded, "__dict__") else dict(grounded)
+
     refined = refine_response(
         question_meta=question_meta,
         candidate=candidate_dict,
-        grounded_result=grounded.__dict__,
+        grounded_result=grounded_result,
         credits_available=credits_available,
     )
 
@@ -391,13 +426,13 @@ def _try_safe_candidate_answer(
         return {
             "allowed": True,
             "answer": str(refined.get("answer") or fallback_answer).strip(),
-            "grounded": grounded.__dict__,
+            "grounded": grounded_result,
             "refined": refined,
         }
 
     return {
         "allowed": False,
-        "grounded": grounded.__dict__,
+        "grounded": grounded_result,
         "refined": refined,
     }
 
@@ -423,8 +458,6 @@ def ask_guarded(
     }
 
     # Step 1: clarification gate
-    # We still use decision engine later for cache/AI decisions, but first handle
-    # clearly deterministic or official-source paths.
     temp_ranked = retrieve_ranked_candidates(classification)
     temp_decision = decide_answer_mode(
         classification,
@@ -444,14 +477,29 @@ def ask_guarded(
         res = compose_clarification(debug=_filtered_debug(debug))
         return res.__dict__
 
-    # Step 2: deterministic tax rules
+    # Step 2: deterministic tax rules (VAT/PAYE)
     rule_answer = _resolve_rules(question, classification.topic, classification.intent_type)
     if rule_answer:
         debug["final_path"] = "rules_engine"
         res = compose_rules_engine_answer(rule_answer, debug=_filtered_debug(debug))
         return res.__dict__
 
-    # Step 3: official tax knowledge retrieval
+    # Step 3: deterministic process composers (TIN / tax payment / tax filing)
+    process_result = _try_process_composer(question)
+    if process_result:
+        debug["process_composer"] = {
+            "intent": process_result.get("intent"),
+            "meta": process_result.get("meta"),
+        }
+        debug["final_path"] = "process_composer"
+
+        res = compose_rules_engine_answer(
+            process_result.get("answer", ""),
+            debug=_filtered_debug(debug),
+        )
+        return res.__dict__
+
+    # Step 4: official tax knowledge retrieval
     tax_matches = _retrieve_tax_knowledge_matches(question, classification)
     debug["tax_matches"] = tax_matches
     debug["tax_candidates"] = [
@@ -496,7 +544,7 @@ def ask_guarded(
             )
             return res.__dict__
 
-    # Step 4: semantic cache retrieval
+    # Step 5: semantic cache retrieval
     ranked = temp_ranked
     decision = decide_answer_mode(
         classification,
@@ -532,13 +580,13 @@ def ask_guarded(
             )
             return res.__dict__
 
-    # Step 5: if no AI credit, stop after deterministic + tax direct + cache attempts
+    # Step 6: if no AI credit, stop after deterministic + tax direct + cache attempts
     if decision.mode == "insufficient_credits_uncached" or not credits_available:
         debug["final_path"] = "insufficient_uncached"
         res = compose_insufficient_uncached(debug=_filtered_debug(debug))
         return res.__dict__
 
-    # Step 6: grounded AI synthesis using official tax KB + cache evidence
+    # Step 7: grounded AI synthesis using official tax KB + cache evidence
     grounded_candidates = [_candidate_to_dict(c) for c in ranked[:3]]
 
     grounding_context_parts: List[str] = []
@@ -556,13 +604,18 @@ def ask_guarded(
             candidate=grounded_candidates[0],
             composed_answer=grounded_candidates[0].get("answer"),
         )
+
+        grounded_preview_dict = (
+            grounded_preview.__dict__ if hasattr(grounded_preview, "__dict__") else dict(grounded_preview)
+        )
+
         cache_grounding = grounding_prompt_context(
             question_meta=question_meta,
             grounded=grounded_preview,
         )
         if cache_grounding:
             grounding_context_parts.append(cache_grounding)
-        debug["grounded_preview"] = grounded_preview.__dict__
+        debug["grounded_preview"] = grounded_preview_dict
 
     grounding_context = "\n\n".join([p for p in grounding_context_parts if p]).strip() or None
     debug["tax_grounding_context"] = tax_grounding
