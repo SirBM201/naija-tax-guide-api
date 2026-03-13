@@ -36,58 +36,76 @@ def _source_payload() -> Dict[str, Any]:
 def _chunk_payloads() -> List[Dict[str, Any]]:
     return [
         {
+            "chunk_id": "firs_vat_guidance_2024_vat_definition",
             "source_id": SOURCE_ID,
             "topic": "vat",
             "intent_type": "definition",
+            "relevance_tier": "medium",
             "jurisdiction": "NG",
-            "summary": "Definition of VAT",
             "text_content": "Value Added Tax (VAT) is a consumption tax charged on taxable goods and services in Nigeria.",
+            "summary": "Definition of VAT",
             "keywords": ["vat", "value added tax", "vat meaning", "what is vat"],
+            "is_active": True,
         },
         {
+            "chunk_id": "firs_vat_guidance_2024_vat_rate",
             "source_id": SOURCE_ID,
             "topic": "vat",
             "intent_type": "rate",
+            "relevance_tier": "high",
             "jurisdiction": "NG",
-            "summary": "VAT rate in Nigeria",
             "text_content": "The standard VAT rate in Nigeria is 7.5 percent.",
+            "summary": "VAT rate in Nigeria",
             "keywords": ["vat rate", "7.5%", "nigeria vat rate"],
+            "is_active": True,
         },
         {
+            "chunk_id": "firs_vat_guidance_2024_vat_exemptions",
             "source_id": SOURCE_ID,
             "topic": "vat",
             "intent_type": "exemption",
+            "relevance_tier": "medium",
             "jurisdiction": "NG",
-            "summary": "VAT exemptions",
             "text_content": "Certain supplies may be exempt or zero-rated depending on the applicable Nigerian tax rules, schedules, and current FIRS guidance.",
+            "summary": "VAT exemptions",
             "keywords": ["vat exemptions", "vat exempt items", "zero rated vat"],
+            "is_active": True,
         },
         {
+            "chunk_id": "firs_vat_guidance_2024_paye_definition",
             "source_id": SOURCE_ID,
             "topic": "paye",
             "intent_type": "definition",
+            "relevance_tier": "medium",
             "jurisdiction": "NG",
-            "summary": "PAYE definition",
             "text_content": "PAYE means Pay As You Earn, a system where employers deduct personal income tax from employee salaries and remit it to the relevant tax authority.",
+            "summary": "PAYE definition",
             "keywords": ["paye", "what is paye", "paye meaning"],
+            "is_active": True,
         },
         {
+            "chunk_id": "firs_vat_guidance_2024_paye_computation",
             "source_id": SOURCE_ID,
             "topic": "paye",
             "intent_type": "computation",
+            "relevance_tier": "high",
             "jurisdiction": "NG",
-            "summary": "PAYE computation basics",
             "text_content": "PAYE is computed using taxable income after allowable reliefs and the applicable progressive tax bands under Nigerian personal income tax rules.",
+            "summary": "PAYE computation basics",
             "keywords": ["paye calculation", "how to compute paye", "paye nigeria"],
+            "is_active": True,
         },
         {
+            "chunk_id": "firs_vat_guidance_2024_freelancer_guidance",
             "source_id": SOURCE_ID,
             "topic": "freelancer",
             "intent_type": "guidance",
+            "relevance_tier": "medium",
             "jurisdiction": "NG",
-            "summary": "Freelancer tax basics",
             "text_content": "Freelancers in Nigeria may have personal income tax obligations depending on the nature of income, tax residence, and applicable state tax rules.",
+            "summary": "Freelancer tax basics",
             "keywords": ["freelancer tax", "self employed tax", "creator tax nigeria"],
+            "is_active": True,
         },
     ]
 
@@ -103,12 +121,11 @@ def _find_source(sb, source_id: str) -> List[Dict[str, Any]]:
     return _as_list(getattr(res, "data", None))
 
 
-def _find_chunk_by_summary(sb, source_id: str, summary: str) -> List[Dict[str, Any]]:
+def _find_chunk_by_chunk_id(sb, chunk_id: str) -> List[Dict[str, Any]]:
     res = (
         sb.table("tax_source_chunks")
-        .select("source_id, summary")
-        .eq("source_id", source_id)
-        .eq("summary", summary)
+        .select("chunk_id")
+        .eq("chunk_id", chunk_id)
         .limit(1)
         .execute()
     )
@@ -118,7 +135,7 @@ def _find_chunk_by_summary(sb, source_id: str, summary: str) -> List[Dict[str, A
 def _count_existing_chunks(sb, source_id: str) -> int:
     res = (
         sb.table("tax_source_chunks")
-        .select("source_id, summary")
+        .select("chunk_id")
         .eq("source_id", source_id)
         .execute()
     )
@@ -140,18 +157,6 @@ def seed_sources(*, allow_reseed: bool = False) -> Dict[str, Any]:
 
     existing_source = _find_source(sb, SOURCE_ID)
 
-    if existing_source and not allow_reseed:
-        existing_chunk_count = _count_existing_chunks(sb, SOURCE_ID)
-        return {
-            "status": "skipped_existing_source",
-            "source_id": SOURCE_ID,
-            "source_inserted": False,
-            "source_already_exists": True,
-            "chunks_deleted": 0,
-            "chunks_inserted": 0,
-            "existing_chunk_count": existing_chunk_count,
-        }
-
     sb.table("tax_source_registry").upsert(source, on_conflict="source_id").execute()
 
     chunks_deleted = 0
@@ -162,11 +167,14 @@ def seed_sources(*, allow_reseed: bool = False) -> Dict[str, Any]:
         chunks_deleted = _delete_existing_chunks(sb, SOURCE_ID)
 
     for chunk in chunks:
-        if not allow_reseed:
-            existing_chunk = _find_chunk_by_summary(sb, SOURCE_ID, chunk["summary"])
-            if existing_chunk:
-                chunks_skipped += 1
-                continue
+        existing_chunk = _find_chunk_by_chunk_id(sb, chunk["chunk_id"])
+
+        if existing_chunk and not allow_reseed:
+            chunks_skipped += 1
+            continue
+
+        if existing_chunk and allow_reseed:
+            sb.table("tax_source_chunks").delete().eq("chunk_id", chunk["chunk_id"]).execute()
 
         sb.table("tax_source_chunks").insert(chunk).execute()
         chunks_inserted += 1
@@ -184,7 +192,6 @@ def seed_sources(*, allow_reseed: bool = False) -> Dict[str, Any]:
         "chunks_skipped": chunks_skipped,
         "final_chunk_count": final_chunk_count,
     }
-
 
 
 if __name__ == "__main__":
