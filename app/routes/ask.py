@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from flask import Blueprint, jsonify, request
 
@@ -15,13 +15,17 @@ def _truthy(v: str | None) -> bool:
     return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _debug_enabled() -> bool:
+    return _truthy(os.getenv("DEBUG_AI")) or _truthy(os.getenv("SHOW_ASK_DEBUG"))
+
+
 def _safe_json() -> Dict[str, Any]:
     return request.get_json(silent=True) or {}
 
 
-def _extract_account_id(auth_result: Any) -> tuple[Optional[str], Dict[str, Any]]:
+def _extract_account_id(auth_result: Any) -> Tuple[Optional[str], Dict[str, Any]]:
     """
-    Normalizes whatever get_account_id_from_request returns into:
+    Normalize whatever get_account_id_from_request returns into:
       (account_id, auth_debug)
 
     Supported shapes:
@@ -35,24 +39,34 @@ def _extract_account_id(auth_result: Any) -> tuple[Optional[str], Dict[str, Any]
         return (account_id or None, {})
 
     if isinstance(auth_result, tuple):
-        if len(auth_result) >= 1:
-            first = auth_result[0]
-            second = auth_result[1] if len(auth_result) > 1 and isinstance(auth_result[1], dict) else {}
-            if isinstance(first, str):
-                account_id = first.strip()
-                return (account_id or None, second)
-        return (None, {"error": "invalid_auth_tuple", "raw_type": str(type(auth_result))})
+        first = auth_result[0] if len(auth_result) > 0 else None
+        second = auth_result[1] if len(auth_result) > 1 and isinstance(auth_result[1], dict) else {}
+
+        if isinstance(first, str):
+            account_id = first.strip()
+            return (account_id or None, second)
+
+        return (None, {"error": "invalid_auth_tuple", "raw": repr(auth_result)})
 
     if isinstance(auth_result, dict):
         account_id = str(auth_result.get("account_id") or "").strip()
-        debug = dict(auth_result)
-        return (account_id or None, debug)
+        return (account_id or None, dict(auth_result))
 
     return (None, {"error": "unsupported_auth_result", "raw_type": str(type(auth_result))})
 
 
-@bp.post("")
-def ask():
+def _build_unauthorized(auth_debug: Dict[str, Any]):
+    body: Dict[str, Any] = {
+        "ok": False,
+        "error": "unauthorized",
+        "message": "Authentication required.",
+    }
+    if _debug_enabled():
+        body["debug"] = {"auth": auth_debug}
+    return jsonify(body), 401
+
+
+def _handle_ask():
     payload = _safe_json()
     question = str(payload.get("question") or "").strip()
     lang = str(payload.get("lang") or "en").strip() or "en"
@@ -71,14 +85,7 @@ def ask():
     account_id, auth_debug = _extract_account_id(auth_raw)
 
     if not account_id:
-        body: Dict[str, Any] = {
-            "ok": False,
-            "error": "unauthorized",
-            "message": "Authentication required.",
-        }
-        if _truthy(os.getenv("DEBUG_AI")) or _truthy(os.getenv("SHOW_ASK_DEBUG")):
-            body["debug"] = {"auth": auth_debug}
-        return jsonify(body), 401
+        return _build_unauthorized(auth_debug)
 
     try:
         result = ask_guarded(
@@ -89,13 +96,17 @@ def ask():
         )
 
         if not isinstance(result, dict):
-            return jsonify(
-                {
-                    "ok": False,
-                    "error": "invalid_ask_result",
-                    "message": "Ask service returned an invalid response.",
+            body: Dict[str, Any] = {
+                "ok": False,
+                "error": "invalid_ask_result",
+                "message": "Ask service returned an invalid response.",
+            }
+            if _debug_enabled():
+                body["debug"] = {
+                    "result_type": str(type(result)),
+                    "account_id": account_id,
                 }
-            ), 500
+            return jsonify(body), 500
 
         result.setdefault("ok", True)
         return jsonify(result), 200
@@ -107,12 +118,26 @@ def ask():
             "message": "We could not complete your request right now.",
         }
 
-        if _truthy(os.getenv("DEBUG_AI")) or _truthy(os.getenv("SHOW_ASK_DEBUG")):
+        if _debug_enabled():
             body["debug"] = {
                 "exception_type": exc.__class__.__name__,
                 "exception": str(exc),
-                "auth": auth_debug,
                 "account_id": account_id,
+                "auth": auth_debug,
             }
 
         return jsonify(body), 500
+
+
+@bp.route("", methods=["POST", "OPTIONS"], strict_slashes=False)
+def ask_root_no_slash():
+    if request.method == "OPTIONS":
+        return ("", 200)
+    return _handle_ask()
+
+
+@bp.route("/", methods=["POST", "OPTIONS"], strict_slashes=False)
+def ask_root_with_slash():
+    if request.method == "OPTIONS":
+        return ("", 200)
+    return _handle_ask()
