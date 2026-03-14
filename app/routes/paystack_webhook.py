@@ -1,14 +1,34 @@
-# app/routes/paystack_webhook.py
 from __future__ import annotations
 
 from typing import Any, Dict, Optional
+
 from flask import Blueprint, jsonify, request
 
 from app.core.supabase_client import supabase
 from app.services.paystack_service import verify_webhook_signature
+from app.services.referral_service import (
+    qualify_referral_after_successful_payment,
+    reverse_rewards_for_payment_reference,
+)
 from app.services.subscriptions_service import activate_subscription_now
 
 bp = Blueprint("paystack_webhook", __name__)
+
+
+SUCCESS_EVENTS = {
+    "charge.success",
+    "subscription.create",
+    "invoice.payment_succeeded",
+}
+
+REVERSAL_EVENTS = {
+    "charge.dispute.create",
+    "charge.dispute.reminder",
+    "charge.dispute.resolve",
+    "refund.processed",
+    "refund.failed",
+    "refund.pending",
+}
 
 
 def _sb():
@@ -16,10 +36,6 @@ def _sb():
 
 
 def _safe_update_paystack_tx(reference: str, payload: Dict[str, Any], status: str) -> None:
-    """
-    paystack_transactions schema varies across versions.
-    We attempt richer updates first, then fall back to minimal fields.
-    """
     if not reference:
         return
 
@@ -35,7 +51,6 @@ def _safe_update_paystack_tx(reference: str, payload: Dict[str, Any], status: st
     except Exception:
         pass
 
-    # fallback: minimal
     try:
         _sb().table("paystack_transactions").update(
             {
@@ -66,10 +81,6 @@ def _event_exists(event_id: str) -> bool:
 
 
 def _insert_event(event_id: str, event_type: str, reference: Optional[str], payload: Dict[str, Any]) -> None:
-    """
-    paystack_events columns you have:
-      id (bigint), event_id, event_type, reference, payload(jsonb), created_at(default now)
-    """
     try:
         _sb().table("paystack_events").insert(
             {
@@ -83,6 +94,88 @@ def _insert_event(event_id: str, event_type: str, reference: Optional[str], payl
         return
 
 
+def _extract_reference(data: Dict[str, Any]) -> str:
+    return (data.get("reference") or data.get("transaction_reference") or "").strip()
+
+
+def _extract_status(data: Dict[str, Any]) -> str:
+    return (data.get("status") or "").strip().lower()
+
+
+def _extract_metadata(data: Dict[str, Any]) -> Dict[str, Any]:
+    md = data.get("metadata")
+    return md if isinstance(md, dict) else {}
+
+
+def _extract_account_id(metadata: Dict[str, Any]) -> str:
+    return (metadata.get("account_id") or "").strip()
+
+
+def _extract_plan_code(metadata: Dict[str, Any]) -> str:
+    return (metadata.get("plan_code") or "").strip().lower()
+
+
+def _handle_successful_payment(
+    *,
+    event_type: str,
+    reference: str,
+    status: str,
+    metadata: Dict[str, Any],
+) -> Dict[str, Any]:
+    if event_type not in SUCCESS_EVENTS or status != "success":
+        return {"ok": True, "skipped": True, "reason": "not_success_event"}
+
+    account_id = _extract_account_id(metadata)
+    plan_code = _extract_plan_code(metadata)
+
+    if not account_id or not plan_code:
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": "missing_account_id_or_plan_code",
+            "account_id": account_id,
+            "plan_code": plan_code,
+        }
+
+    activation = activate_subscription_now(
+        account_id=account_id,
+        plan_code=plan_code,
+    )
+
+    referral = qualify_referral_after_successful_payment(
+        paying_account_id=account_id,
+        payment_reference=reference,
+        plan_code=plan_code,
+    )
+
+    return {
+        "ok": True,
+        "activation": activation,
+        "referral": referral,
+    }
+
+
+def _handle_reversal_event(
+    *,
+    event_type: str,
+    reference: str,
+) -> Dict[str, Any]:
+    if event_type not in REVERSAL_EVENTS:
+        return {"ok": True, "skipped": True, "reason": "not_reversal_event"}
+
+    if not reference:
+        return {"ok": True, "skipped": True, "reason": "missing_reference"}
+
+    reversal = reverse_rewards_for_payment_reference(
+        payment_reference=reference,
+        reversal_reason=f"paystack_event:{event_type}",
+    )
+    return {
+        "ok": True,
+        "reversal": reversal,
+    }
+
+
 @bp.post("/paystack/webhook")
 def paystack_webhook():
     raw = request.get_data() or b""
@@ -92,38 +185,38 @@ def paystack_webhook():
         return jsonify({"ok": False, "error": "invalid_signature"}), 401
 
     payload: Dict[str, Any] = request.get_json(silent=True) or {}
-    event_type = (payload.get("event") or "").strip()
-    event_id = (payload.get("id") or "").strip()
+    event_type = str(payload.get("event") or "").strip()
+    event_id = str(payload.get("id") or "").strip()
 
     data = payload.get("data") or {}
-    reference = (data.get("reference") or "").strip()
-    status = (data.get("status") or "").strip().lower()
-    metadata = data.get("metadata") or {}
+    reference = _extract_reference(data)
+    status = _extract_status(data)
+    metadata = _extract_metadata(data)
 
-    # 1) Idempotency: if event already processed, ack OK fast
     if event_id and _event_exists(event_id):
         return jsonify({"ok": True, "deduped": True}), 200
 
-    # 2) Persist event (best-effort)
     _insert_event(event_id=event_id, event_type=event_type, reference=reference, payload=payload)
-
-    # 3) Update transaction row (best-effort)
     _safe_update_paystack_tx(reference=reference, payload=payload, status=status)
 
-    # 4) Activate on success events only
-    success_events = {"charge.success", "subscription.create", "invoice.payment_succeeded"}
-    if event_type in success_events and status == "success":
-        account_id = (metadata.get("account_id") or "").strip()
-        plan_code = (metadata.get("plan_code") or "").strip().lower()
+    success_outcome = _handle_successful_payment(
+        event_type=event_type,
+        reference=reference,
+        status=status,
+        metadata=metadata,
+    )
 
-        if account_id and plan_code:
-            # This call is now FK-safe (resolves to accounts.id internally)
-            _ = activate_subscription_now(
-                account_id=account_id,
-                plan_code=plan_code,
-                status="active",
-                provider="paystack",
-                provider_ref=reference or None,
-            )
+    reversal_outcome = _handle_reversal_event(
+        event_type=event_type,
+        reference=reference,
+    )
 
-    return jsonify({"ok": True}), 200
+    return jsonify(
+        {
+            "ok": True,
+            "event_type": event_type,
+            "reference": reference,
+            "success_outcome": success_outcome,
+            "reversal_outcome": reversal_outcome,
+        }
+    ), 200
