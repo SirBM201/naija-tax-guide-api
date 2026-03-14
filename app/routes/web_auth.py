@@ -242,3 +242,4 @@ def logout():
     resp.delete_cookie(WEB_AUTH_COOKIE_NAME, path="/", domain=domain)
 
     return resp
+
