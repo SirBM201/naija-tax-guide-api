@@ -196,6 +196,7 @@ def create_app() -> Flask:
         "app.routes.feedback",
         "app.routes.admin_semantic",
         "app.routes.referrals",
+        "app.routes.paystack_webhook",
     ]
     for dotted in required_modules:
         _register_bp(dotted, "bp", required=True, url_prefix=api_prefix)
@@ -235,6 +236,10 @@ def create_app() -> Flask:
         if not referrals_registered:
             hints.append("Referrals blueprint is NOT registered. Confirm app/routes/referrals.py exists and exports bp = Blueprint(...).")
 
+        paystack_webhook_registered = any((r.get("alias_name") == "paystack_webhook") for r in boot.get("registered", []))
+        if not paystack_webhook_registered:
+            hints.append("Paystack webhook blueprint is NOT registered. Confirm app/routes/paystack_webhook.py exists and exports bp = Blueprint(...).")
+
         if cookie_mode and origins == "*":
             hints.append("COOKIE_MODE is enabled but CORS origins are '*'. Use explicit origins when cookies are used.")
 
@@ -251,5 +256,3 @@ def create_app() -> Flask:
         ), 200
 
     return app
-
-
