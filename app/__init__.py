@@ -121,9 +121,6 @@ def create_app() -> Flask:
     def _rid() -> str:
         return str(request.environ.get("REQUEST_ID") or "")
 
-    def _debug_enabled() -> bool:
-        return (request.headers.get("X-Debug") or "").strip() == "1"
-
     boot: Dict[str, Any] = {
         "api_prefix": api_prefix,
         "cookie_mode": cookie_mode,
@@ -198,6 +195,7 @@ def create_app() -> Flask:
         "app.routes.web_session",
         "app.routes.feedback",
         "app.routes.admin_semantic",
+        "app.routes.referrals",
     ]
     for dotted in required_modules:
         _register_bp(dotted, "bp", required=True, url_prefix=api_prefix)
@@ -220,7 +218,7 @@ def create_app() -> Flask:
                 "ok": True,
                 "request_id": _rid(),
                 "admin_key_set": admin_key_set,
-                "seed_tax_token_set": seed_token_set,
+                "seed_token_set": seed_token_set,
                 "boot": boot,
             }
         ), 200
@@ -233,9 +231,9 @@ def create_app() -> Flask:
         if not cron_registered:
             hints.append("Cron blueprint is NOT registered. Confirm app/routes/cron.py exists and exports bp = Blueprint(...).")
 
-        dev_tools_registered = any((r.get("alias_name") == "dev_tools") for r in boot.get("registered", []))
-        if not dev_tools_registered:
-            hints.append("dev_tools blueprint is NOT registered. Confirm app/routes/dev_tools.py exists and exports bp = Blueprint(...).")
+        referrals_registered = any((r.get("alias_name") == "referrals") for r in boot.get("registered", []))
+        if not referrals_registered:
+            hints.append("Referrals blueprint is NOT registered. Confirm app/routes/referrals.py exists and exports bp = Blueprint(...).")
 
         if cookie_mode and origins == "*":
             hints.append("COOKIE_MODE is enabled but CORS origins are '*'. Use explicit origins when cookies are used.")
@@ -243,59 +241,13 @@ def create_app() -> Flask:
         if cookie_mode and (isinstance(origins, list) and not origins):
             hints.append("COOKIE_MODE is enabled but parsed origins list is empty. Set CORS_ORIGINS to your frontend URL(s).")
 
-        if not (os.getenv("SUPABASE_URL") or "").strip():
-            hints.append("SUPABASE_URL is missing -> Supabase RPC/table calls will fail.")
-        if not (os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY") or "").strip():
-            hints.append("Supabase service key is missing -> RPC/table calls may fail.")
-
-        if not (os.getenv("PAYSTACK_WEBHOOK_SECRET") or "").strip():
-            hints.append("PAYSTACK_WEBHOOK_SECRET is missing. Paystack signature verification will fail for /api/billing/webhook.")
-
-        if not (os.getenv("SEED_TAX_TOKEN") or "").strip():
-            hints.append("SEED_TAX_TOKEN is missing. Protected seed endpoint will reject requests if token check is enabled in dev_tools.py.")
-
-        env_view = {
-            "ADMIN_KEY_SET": bool((os.getenv("ADMIN_KEY") or "").strip()),
-            "API_PREFIX": api_prefix,
-            "COOKIE_MODE": cookie_mode,
-            "CORS_ORIGINS_MODE": ("*" if origins == "*" else "list"),
-            "ENABLE_DEBUG_ROUTES": _safe_get_env_bool("ENABLE_DEBUG_ROUTES"),
-            "STRICT_BLUEPRINTS": strict,
-            "SUPABASE_URL_SET": bool((os.getenv("SUPABASE_URL") or "").strip()),
-            "SUPABASE_KEY_SET": bool((os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY") or "").strip()),
-            "SUPPORTS_CREDENTIALS": supports_credentials,
-            "WEB_AUTH_ENABLED": _safe_get_env_bool("WEB_AUTH_ENABLED"),
-            "SEED_TAX_TOKEN_SET": bool((os.getenv("SEED_TAX_TOKEN") or "").strip()),
-        }
-
-        return jsonify({"ok": True, "request_id": _rid(), "env": env_view, "hints": hints}), 200
-
-    @app.route(f"{api_prefix}/<path:_any>", methods=["OPTIONS"])
-    def _api_preflight(_any: str):
-        return ("", 204)
-
-    @app.errorhandler(Exception)
-    def _handle_any_error(e: Exception):
-        status = getattr(e, "code", 500)
-        msg = str(e) or type(e).__name__
-
-        out: Dict[str, Any] = {
-            "ok": False,
-            "request_id": _rid(),
-            "error": type(e).__name__,
-            "message": msg[:800],
-        }
-
-        if _debug_enabled():
-            import traceback as _tb
-
-            out["debug"] = {
-                "path": request.path,
-                "method": request.method,
-                "content_type": request.content_type,
+        return jsonify(
+            {
+                "ok": True,
+                "request_id": _rid(),
+                "boot": boot,
+                "hints": hints,
             }
-            out["traceback"] = _tb.format_exc(limit=60)
-
-        return jsonify(out), status
+        ), 200
 
     return app
