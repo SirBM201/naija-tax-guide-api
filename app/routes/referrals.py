@@ -106,3 +106,4 @@ def referral_payouts():
             "debug": {"auth": debug},
         }
     ), 200
+
