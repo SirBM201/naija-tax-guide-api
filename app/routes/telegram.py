@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import inspect
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from flask import Blueprint, jsonify, request
 
@@ -19,11 +19,33 @@ def _clip(value: Any, limit: int = 260) -> str:
 
 
 def _build_ask_payload(*, account_id: str, tg_user_id: str, text: str) -> Dict[str, Any]:
+    """
+    Build a broad alias-rich payload so Telegram can survive ask_service naming drift.
+
+    Reason:
+    - web and telegram entrypoints have diverged a few times
+    - ask_guarded signature may expect question/query/text/message or other keyword names
+    - we inspect the signature later and pass only supported kwargs
+    """
+    clean_text = (text or "").strip()
     return {
+        # canonical identity
         "account_id": account_id,
+        # channel metadata
         "provider": "tg",
+        "channel": "tg",
+        "platform": "telegram",
+        "source": "telegram",
         "provider_user_id": tg_user_id,
-        "question": text,
+        "channel_user_id": tg_user_id,
+        # question aliases
+        "question": clean_text,
+        "query": clean_text,
+        "text": clean_text,
+        "message": clean_text,
+        "user_message": clean_text,
+        "user_query": clean_text,
+        # common optional fields
         "lang": "en",
         "mode": "text",
     }
@@ -31,13 +53,8 @@ def _build_ask_payload(*, account_id: str, tg_user_id: str, text: str) -> Dict[s
 
 def _call_ask_guarded(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Failure-tolerant adapter for ask_guarded.
-
-    Current failure exposed by Telegram:
-        TypeError: ask_guarded() missing 1 required keyword-only argument: 'account_id'
-
-    So Telegram must call ask_guarded with keyword arguments, not a positional dict.
-    This adapter inspects the signature and passes only supported keyword args.
+    Inspect ask_guarded and call it with keyword args only.
+    This avoids positional-call failures and helps expose the next mismatch clearly.
     """
     try:
         sig = inspect.signature(ask_guarded)
@@ -53,30 +70,40 @@ def _call_ask_guarded(payload: Dict[str, Any]) -> Dict[str, Any]:
             )
         }
 
-        filtered_kwargs = {k: v for k, v in payload.items() if k in accepted_names}
+        filtered_kwargs = {k: v for k, v in payload.items() if has_var_kwargs or k in accepted_names}
 
-        required_missing = []
+        missing_required = []
         for p in params:
             if p.kind in (
                 inspect.Parameter.POSITIONAL_OR_KEYWORD,
                 inspect.Parameter.KEYWORD_ONLY,
             ):
                 if p.default is inspect._empty and p.name not in filtered_kwargs:
-                    required_missing.append(p.name)
+                    missing_required.append(p.name)
 
-        if required_missing and not has_var_kwargs:
+        if missing_required:
             return {
                 "ok": False,
                 "error": "ask_guarded_signature_mismatch",
-                "root_cause": f"Missing required ask_guarded args: {', '.join(required_missing)}",
-                "fix": "Pass all required keyword arguments expected by app.services.ask_service.ask_guarded.",
+                "root_cause": f"Missing required ask_guarded args: {', '.join(missing_required)}",
+                "fix": "Align Telegram payload keys with app.services.ask_service.ask_guarded signature.",
                 "details": {
                     "accepted_names": sorted(list(accepted_names)),
                     "payload_keys": sorted(list(payload.keys())),
                 },
             }
 
-        return ask_guarded(**filtered_kwargs)
+        resp = ask_guarded(**filtered_kwargs)
+        if isinstance(resp, dict):
+            return resp
+
+        return {
+            "ok": False,
+            "error": "ask_guarded_invalid_response",
+            "root_cause": f"ask_guarded returned non-dict response: {type(resp).__name__}",
+            "fix": "Ensure ask_guarded returns a dict with answer/message metadata.",
+            "details": {"response_type": str(type(resp))},
+        }
     except Exception as e:
         return {
             "ok": False,
@@ -211,15 +238,6 @@ def tg_webhook():
 
     payload = _build_ask_payload(account_id=account_id, tg_user_id=tg_user_id, text=text)
     resp = _call_ask_guarded(payload)
-
-    if not isinstance(resp, dict):
-        send_telegram_text(
-            chat_id,
-            "❌ Ask flow failed.\n"
-            f"Reason: invalid_response\nDetails: {_clip(type(resp).__name__)}\n"
-            "Fix: Ensure ask_guarded returns a dict like the web ask route.",
-        )
-        return jsonify({"ok": False, "stage": "ask_invalid_response", "response_type": str(type(resp))}), 200
 
     if not resp.get("ok") and not (resp.get("answer") or resp.get("message")):
         send_telegram_text(
