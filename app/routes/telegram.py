@@ -10,6 +10,36 @@ from app.services.outbound_service import send_telegram_text
 bp = Blueprint("telegram", __name__)
 
 
+def _clip(value: object, n: int = 220) -> str:
+    s = str(value or "").strip()
+    if not s:
+        return "n/a"
+    return s if len(s) <= n else s[:n] + "..."
+
+
+def _build_link_failure_text(attempt: dict) -> str:
+    reason = _clip(attempt.get("error") or "unknown_error", 120)
+
+    details = (
+        attempt.get("root_cause")
+        or attempt.get("reason")
+        or ((attempt.get("details") or {}).get("provider_user_id") if isinstance(attempt.get("details"), dict) else None)
+        or ((attempt.get("details") or {}).get("row_id") if isinstance(attempt.get("details"), dict) else None)
+        or ((attempt.get("debug") or {}).get("error") if isinstance(attempt.get("debug"), dict) else None)
+        or "n/a"
+    )
+
+    fix = attempt.get("fix") or ""
+    fix_line = f"\nFix: {_clip(fix, 160)}" if fix else ""
+
+    return (
+        "❌ Link failed.\n"
+        f"Reason: {reason}\n"
+        f"Details: {_clip(details, 180)}"
+        f"{fix_line}"
+    )
+
+
 @bp.post("/telegram/webhook")
 def tg_webhook():
     """
@@ -26,28 +56,28 @@ def tg_webhook():
 
     chat = msg.get("chat") or {}
     chat_id = chat.get("id")
-
     text = (msg.get("text") or "").strip()
 
     user = msg.get("from") or {}
     tg_user_id = str(user.get("id") or "").strip()
-    display_name = " ".join(
-        [x for x in [user.get("first_name"), user.get("last_name")] if x]
-    ) or None
+    display_name = " ".join([x for x in [user.get("first_name"), user.get("last_name")] if x]) or None
 
     if not tg_user_id or not chat_id:
         return jsonify({"ok": True, "ignored": True})
 
-    upsert_account(
+    shell = upsert_account(
         provider="tg",
         provider_user_id=tg_user_id,
         display_name=display_name,
         phone=None,
     )
+    if not shell.get("ok"):
+        send_telegram_text(chat_id, _build_link_failure_text(shell))
+        return jsonify({"ok": True, "error": "shell_upsert_failed", "details": shell})
 
     lk = lookup_account(provider="tg", provider_user_id=tg_user_id)
     if not lk.get("ok"):
-        send_telegram_text(chat_id, "System error. Please try again.")
+        send_telegram_text(chat_id, _build_link_failure_text(lk))
         return jsonify({"ok": True, "error": "lookup_failed", "details": lk})
 
     if not lk.get("linked"):
@@ -73,24 +103,11 @@ def tg_webhook():
                         "linked": True,
                         "linked_now": True,
                         "account_id": attempt.get("auth_user_id"),
-                        "attempt": attempt,
                     }
                 )
 
-            send_telegram_text(
-                chat_id,
-                "❌ Link failed.\n"
-                f"Reason: {attempt.get('error') or 'unknown_error'}\n"
-                f"Details: {attempt.get('reason') or 'n/a'}",
-            )
-            return jsonify(
-                {
-                    "ok": True,
-                    "linked": False,
-                    "linked_now": False,
-                    "attempt": attempt,
-                }
-            )
+            send_telegram_text(chat_id, _build_link_failure_text(attempt))
+            return jsonify({"ok": True, "linked": False, "link_attempt": attempt})
 
         send_telegram_text(
             chat_id,
