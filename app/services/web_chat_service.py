@@ -41,7 +41,6 @@ def create_session(account_id: str, title: str) -> Dict[str, Any]:
 
 
 def get_messages(account_id: str, session_id: str) -> List[Dict[str, Any]]:
-    # enforce ownership
     s = (
         supabase.table("web_chat_sessions")
         .select("id")
@@ -80,7 +79,6 @@ def _append_message(account_id: str, session_id: str, role: str, content: str) -
 
 
 def send_message(account_id: str, session_id: str, text: str) -> Dict[str, Any]:
-    # enforce ownership
     s = (
         supabase.table("web_chat_sessions")
         .select("id")
@@ -90,14 +88,11 @@ def send_message(account_id: str, session_id: str, text: str) -> Dict[str, Any]:
         .execute()
     )
     if not (s.data or []):
-        # create session automatically if missing (optional behavior)
         new_s = create_session(account_id, title="New chat")
         session_id = new_s["id"]
 
-    # store user message
     _append_message(account_id, session_id, "user", text)
 
-    # build lightweight context from last 12 messages
     history = (
         supabase.table("web_chat_messages")
         .select("role, content")
@@ -112,7 +107,7 @@ def send_message(account_id: str, session_id: str, text: str) -> Dict[str, Any]:
     context_lines = []
     for m in history:
         role = m.get("role")
-        content = (m.get("content") or "").strip()
+        content = str(m.get("content") or "").strip()
         if not content:
             continue
         prefix = "User" if role == "user" else "Assistant"
@@ -120,23 +115,27 @@ def send_message(account_id: str, session_id: str, text: str) -> Dict[str, Any]:
 
     combined = "\n".join(context_lines).strip()
 
-    # reuse your guarded ask pipeline (cache, policy, etc.)
-    payload = {
-        "account_id": account_id,
-        "question": combined,   # conversation as a single prompt
-        "source": "web_chat",
-    }
+    result = ask_guarded(
+        account_id=str(account_id or "").strip(),
+        question=combined,
+        lang="en",
+        channel="web_chat",
+    )
 
-    result, status = ask_guarded(payload)
-    if status != 200:
-        # store failure as assistant message (so UI shows something)
-        msg = result.get("error") or "Unable to answer right now."
-        _append_message(account_id, session_id, "assistant", msg)
-        return {"session_id": session_id, "answer": msg, "raw": result}
+    if not result.get("ok"):
+        return {
+            "ok": False,
+            "error": result.get("error") or "ask_failed",
+            "details": result,
+            "session_id": session_id,
+        }
 
-    answer = result.get("answer") or result.get("message") or ""
-    answer = str(answer).strip() or "Okay."
-
+    answer = str(result.get("answer") or "").strip()
     _append_message(account_id, session_id, "assistant", answer)
 
-    return {"session_id": session_id, "answer": answer, "raw": result}
+    return {
+        "ok": True,
+        "session_id": session_id,
+        "answer": answer,
+        "ask": result,
+    }
