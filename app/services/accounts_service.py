@@ -1,5 +1,26 @@
 from __future__ import annotations
 
+"""
+ACCOUNTS SERVICE (CANONICAL, FAILURE-EXPOSING)
+
+Canonical identity rule:
+- account_id = accounts.account_id (app identity)
+- id         = accounts.id         (row PK only)
+
+This version fixes Supabase v2 chaining issues by NOT using:
+    upsert(...).select(...)
+
+Instead it:
+1. performs write
+2. reads back explicitly with a follow-up select
+
+Main guarantees:
+- upsert_account / ensure_account_id / lookup_account / upsert_account_link always return accounts.account_id
+- auto-repair bridge: if accounts.account_id is NULL, set it to accounts.id
+- schema-safe selects: never select a column that may not exist
+- strong failure exposers: error + root_cause + fix + details + debug
+"""
+
 from typing import Optional, Dict, Any, Tuple, List
 from datetime import datetime, timezone
 import uuid
@@ -50,6 +71,7 @@ def _is_uuid(value: str) -> bool:
 
 
 def _has_column(table: str, col: str) -> bool:
+    """Best-effort existence check; never throws."""
     try:
         _sb().table(table).select(col).limit(1).execute()
         return True
@@ -60,7 +82,10 @@ def _has_column(table: str, col: str) -> bool:
 def _safe_debug_meta() -> Dict[str, Any]:
     if not _debug_enabled():
         return {}
-    return {"tables": {"accounts": "accounts"}, "env": (os.getenv("ENV", "prod") or "prod").lower()}
+    return {
+        "tables": {"accounts": "accounts"},
+        "env": (os.getenv("ENV", "prod") or "prod").lower(),
+    }
 
 
 def _select_cols_existing(table: str, cols: List[str]) -> str:
@@ -164,9 +189,9 @@ def _repair_account_id_if_needed(row: Dict[str, Any]) -> Tuple[Optional[str], Op
 
 
 # ---------------------------------------------------------
-# Low-level row helpers
+# Read-back helpers
 # ---------------------------------------------------------
-def _find_account_row(provider: str, provider_user_id: str, select_cols: str) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+def _read_account_by_provider_user(provider: str, provider_user_id: str, select_cols: str) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     try:
         res = (
             _sb()
@@ -182,63 +207,17 @@ def _find_account_row(provider: str, provider_user_id: str, select_cols: str) ->
             "ok": False,
             "error": "db_error",
             "root_cause": f"{type(e).__name__}: {_clip(str(e))}",
-            "fix": "Check accounts table access and schema.",
-            "details": {"provider": provider, "provider_user_id": provider_user_id, "select": select_cols},
+            "fix": "Check accounts table accessibility and schema.",
+            "details": {
+                "provider": provider,
+                "provider_user_id": provider_user_id,
+                "select": select_cols,
+                "stage": "read_back_by_provider_user",
+            },
             "debug": _safe_debug_meta(),
         }
 
     row = (getattr(res, "data", None) or [None])[0] or None
-    return row, None
-
-
-def _insert_account_row(payload: Dict[str, Any], select_cols: str) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
-    try:
-        res = _sb().table("accounts").insert(payload).select(select_cols).execute()
-    except Exception as e:
-        return None, {
-            "ok": False,
-            "error": "db_error",
-            "root_cause": f"{type(e).__name__}: {_clip(str(e))}",
-            "fix": "Check accounts insert permissions and required columns.",
-            "details": {"payload_keys": sorted(list(payload.keys())), "select": select_cols},
-            "debug": _safe_debug_meta(),
-        }
-
-    row = (getattr(res, "data", None) or [None])[0] or None
-    if not row:
-        return None, {
-            "ok": False,
-            "error": "db_error",
-            "root_cause": "insert returned no row",
-            "fix": "Ensure Supabase returns representation rows.",
-            "debug": _safe_debug_meta(),
-        }
-    return row, None
-
-
-def _update_account_row(row_id: str, patch: Dict[str, Any], select_cols: str) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
-    try:
-        res = _sb().table("accounts").update(patch).eq("id", row_id).select(select_cols).execute()
-    except Exception as e:
-        return None, {
-            "ok": False,
-            "error": "db_error",
-            "root_cause": f"{type(e).__name__}: {_clip(str(e))}",
-            "fix": "Check accounts update permissions and row constraints.",
-            "details": {"row_id": row_id, "patch_keys": sorted(list(patch.keys())), "select": select_cols},
-            "debug": _safe_debug_meta(),
-        }
-
-    row = (getattr(res, "data", None) or [None])[0] or None
-    if not row:
-        return None, {
-            "ok": False,
-            "error": "db_error",
-            "root_cause": "update returned no row",
-            "fix": "Ensure the target row exists and Supabase returns representation rows.",
-            "details": {"row_id": row_id},
-            "debug": _safe_debug_meta(),
-        }
     return row, None
 
 
@@ -259,41 +238,50 @@ def upsert_account(
     if err:
         return {"ok": False, "error": err}
 
-    select_cols = _select_cols_existing(
-        "accounts",
-        ["id", "account_id", "provider", "provider_user_id", "auth_user_id", "display_name", "phone", "phone_e164", "updated_at", "created_at"],
-    )
-
-    existing, existing_err = _find_account_row(provider, provider_user_id, select_cols)
-    if existing_err:
-        return existing_err
-
     payload: Dict[str, Any] = {
         "provider": provider,
         "provider_user_id": provider_user_id,
         "updated_at": _now_iso(),
     }
+
     if display_name is not None and _has_column("accounts", "display_name"):
         payload["display_name"] = display_name
+
     if phone is not None:
         if _has_column("accounts", "phone"):
             payload["phone"] = phone
         if _has_column("accounts", "phone_e164"):
             payload["phone_e164"] = phone
 
-    if existing and existing.get("id"):
-        row, row_err = _update_account_row(str(existing["id"]), payload, select_cols)
-    else:
-        insert_payload: Dict[str, Any] = {
-            "id": str(uuid.uuid4()),
-            "account_id": None,
-            "created_at": _now_iso(),
-            **payload,
-        }
-        row, row_err = _insert_account_row(insert_payload, select_cols)
+    select_cols = _select_cols_existing(
+        "accounts",
+        ["id", "account_id", "provider", "provider_user_id", "auth_user_id", "display_name", "phone", "phone_e164", "updated_at", "created_at"],
+    )
 
-    if row_err:
-        return row_err
+    try:
+        _sb().table("accounts").upsert(payload, on_conflict="provider,provider_user_id").execute()
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": "db_error",
+            "root_cause": f"{type(e).__name__}: {_clip(str(e))}",
+            "fix": "Check accounts RLS and ensure unique constraint exists on (provider, provider_user_id).",
+            "details": {"provider": provider, "provider_user_id": provider_user_id, "stage": "upsert_write"},
+            "debug": _safe_debug_meta(),
+        }
+
+    row, read_err = _read_account_by_provider_user(provider, provider_user_id, select_cols)
+    if read_err:
+        return read_err
+    if not row:
+        return {
+            "ok": False,
+            "error": "db_error",
+            "root_cause": "upsert write succeeded but read-back returned no row",
+            "fix": "Check accounts RLS/select permissions and confirm the row really exists after upsert.",
+            "details": {"provider": provider, "provider_user_id": provider_user_id, "stage": "upsert_readback"},
+            "debug": _safe_debug_meta(),
+        }
 
     account_id, err_obj = _repair_account_id_if_needed(row)
     if err_obj:
@@ -315,9 +303,9 @@ def lookup_account(*, provider: str, provider_user_id: str) -> Dict[str, Any]:
         ["id", "account_id", "provider", "provider_user_id", "auth_user_id", "display_name", "phone", "phone_e164", "updated_at", "created_at"],
     )
 
-    row, row_err = _find_account_row(provider, provider_user_id, select_cols)
-    if row_err:
-        return row_err
+    row, read_err = _read_account_by_provider_user(provider, provider_user_id, select_cols)
+    if read_err:
+        return read_err
 
     if not row:
         return {"ok": True, "found": False, "linked": False, "auth_user_id": None, "account_id": None, "account": None}
@@ -357,56 +345,55 @@ def upsert_account_link(
     if not _is_uuid(auth_user_id):
         return {"ok": False, "error": "auth_user_id must be a valid uuid"}
 
+    existing = lookup_account(provider=provider, provider_user_id=provider_user_id)
+    if existing.get("ok") and existing.get("found"):
+        old = (existing.get("auth_user_id") or "").strip()
+        if old and old != auth_user_id:
+            return {"ok": False, "error": "This channel is already linked to another account.", "reason": "channel_already_linked"}
+
+    payload: Dict[str, Any] = {
+        "provider": provider,
+        "provider_user_id": provider_user_id,
+        "auth_user_id": auth_user_id,
+        "updated_at": _now_iso(),
+    }
+    if display_name is not None and _has_column("accounts", "display_name"):
+        payload["display_name"] = display_name
+    if phone is not None:
+        if _has_column("accounts", "phone"):
+            payload["phone"] = phone
+        if _has_column("accounts", "phone_e164"):
+            payload["phone_e164"] = phone
+
     select_cols = _select_cols_existing(
         "accounts",
         ["id", "account_id", "provider", "provider_user_id", "auth_user_id", "display_name", "phone", "phone_e164", "updated_at", "created_at"],
     )
 
-    existing, existing_err = _find_account_row(provider, provider_user_id, select_cols)
-    if existing_err:
-        return existing_err
-
-    if existing:
-        old = str(existing.get("auth_user_id") or "").strip()
-        if old and old != auth_user_id:
-            return {"ok": False, "error": "This channel is already linked to another account.", "reason": "channel_already_linked"}
-
-        patch: Dict[str, Any] = {
-            "auth_user_id": auth_user_id,
-            "updated_at": _now_iso(),
+    try:
+        _sb().table("accounts").upsert(payload, on_conflict="provider,provider_user_id").execute()
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": "db_error",
+            "root_cause": f"{type(e).__name__}: {_clip(str(e))}",
+            "fix": "Check accounts RLS and unique constraint on (provider,provider_user_id).",
+            "details": {"provider": provider, "provider_user_id": provider_user_id, "stage": "link_write"},
+            "debug": _safe_debug_meta(),
         }
-        if display_name is not None and _has_column("accounts", "display_name"):
-            patch["display_name"] = display_name
-        if phone is not None:
-            if _has_column("accounts", "phone"):
-                patch["phone"] = phone
-            if _has_column("accounts", "phone_e164"):
-                patch["phone_e164"] = phone
 
-        row, row_err = _update_account_row(str(existing.get("id")), patch, select_cols)
-        if row_err:
-            return row_err
-    else:
-        insert_payload: Dict[str, Any] = {
-            "id": str(uuid.uuid4()),
-            "account_id": None,
-            "provider": provider,
-            "provider_user_id": provider_user_id,
-            "auth_user_id": auth_user_id,
-            "created_at": _now_iso(),
-            "updated_at": _now_iso(),
+    row, read_err = _read_account_by_provider_user(provider, provider_user_id, select_cols)
+    if read_err:
+        return read_err
+    if not row:
+        return {
+            "ok": False,
+            "error": "db_error",
+            "root_cause": "link write succeeded but read-back returned no row",
+            "fix": "Check accounts select permissions and verify row visibility after upsert.",
+            "details": {"provider": provider, "provider_user_id": provider_user_id, "stage": "link_readback"},
+            "debug": _safe_debug_meta(),
         }
-        if display_name is not None and _has_column("accounts", "display_name"):
-            insert_payload["display_name"] = display_name
-        if phone is not None:
-            if _has_column("accounts", "phone"):
-                insert_payload["phone"] = phone
-            if _has_column("accounts", "phone_e164"):
-                insert_payload["phone_e164"] = phone
-
-        row, row_err = _insert_account_row(insert_payload, select_cols)
-        if row_err:
-            return row_err
 
     account_id, err_obj = _repair_account_id_if_needed(row)
     if err_obj:
@@ -436,9 +423,14 @@ def ensure_account_id(
 
 
 # ---------------------------------------------------------
-# Optional: plan helper
+# Optional: plan helper (kept for compatibility)
 # ---------------------------------------------------------
 def _plan_from_subscriptions_table(auth_user_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """
+    NOTE:
+      This function expects subscriptions keyed by auth_user_id (legacy).
+      Keep as-is, but downstream should use canonical account_id for app-level joins.
+    """
     try:
         res = (
             _sb()
