@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import inspect
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from flask import Blueprint, jsonify, request
 
@@ -18,8 +18,9 @@ def _clip(value: Any, limit: int = 260) -> str:
     return text if len(text) <= limit else text[:limit] + "…"
 
 
-def _build_ask_payload(*, tg_user_id: str, text: str) -> Dict[str, Any]:
+def _build_ask_payload(*, account_id: str, tg_user_id: str, text: str) -> Dict[str, Any]:
     return {
+        "account_id": account_id,
         "provider": "tg",
         "provider_user_id": tg_user_id,
         "question": text,
@@ -32,14 +33,11 @@ def _call_ask_guarded(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     Failure-tolerant adapter for ask_guarded.
 
-    Your logs proved that this code path is wrong:
-        ask_guarded(payload)
+    Current failure exposed by Telegram:
+        TypeError: ask_guarded() missing 1 required keyword-only argument: 'account_id'
 
-    because current ask_guarded does NOT accept one positional dict.
-
-    This adapter supports both common styles safely:
-    1) ask_guarded(**kwargs)
-    2) ask_guarded(payload)   (only if the function really expects one argument)
+    So Telegram must call ask_guarded with keyword arguments, not a positional dict.
+    This adapter inspects the signature and passes only supported keyword args.
     """
     try:
         sig = inspect.signature(ask_guarded)
@@ -57,29 +55,28 @@ def _call_ask_guarded(payload: Dict[str, Any]) -> Dict[str, Any]:
 
         filtered_kwargs = {k: v for k, v in payload.items() if k in accepted_names}
 
-        # Preferred path: keyword call
-        if has_var_kwargs or filtered_kwargs:
-            return ask_guarded(**filtered_kwargs)
-
-        # Legacy/single-arg path only when signature really expects exactly one argument
-        positional_params = [
-            p
-            for p in params
+        required_missing = []
+        for p in params:
             if p.kind in (
-                inspect.Parameter.POSITIONAL_ONLY,
                 inspect.Parameter.POSITIONAL_OR_KEYWORD,
-            )
-        ]
-        if len(positional_params) == 1:
-            return ask_guarded(payload)
+                inspect.Parameter.KEYWORD_ONLY,
+            ):
+                if p.default is inspect._empty and p.name not in filtered_kwargs:
+                    required_missing.append(p.name)
 
-        return {
-            "ok": False,
-            "error": "ask_guarded_signature_mismatch",
-            "root_cause": f"Unsupported ask_guarded signature: {sig}",
-            "fix": "Update telegram route adapter or align ask_guarded signature with web ask flow.",
-            "details": {"payload_keys": list(payload.keys())},
-        }
+        if required_missing and not has_var_kwargs:
+            return {
+                "ok": False,
+                "error": "ask_guarded_signature_mismatch",
+                "root_cause": f"Missing required ask_guarded args: {', '.join(required_missing)}",
+                "fix": "Pass all required keyword arguments expected by app.services.ask_service.ask_guarded.",
+                "details": {
+                    "accepted_names": sorted(list(accepted_names)),
+                    "payload_keys": sorted(list(payload.keys())),
+                },
+            }
+
+        return ask_guarded(**filtered_kwargs)
     except Exception as e:
         return {
             "ok": False,
@@ -166,7 +163,8 @@ def tg_webhook():
                         "ok": True,
                         "linked": True,
                         "linked_now": True,
-                        "account_id": attempt.get("auth_user_id"),
+                        "account_id": attempt.get("account_id"),
+                        "auth_user_id": attempt.get("auth_user_id"),
                     }
                 )
 
@@ -200,7 +198,18 @@ def tg_webhook():
         )
         return jsonify({"ok": True, "linked": True})
 
-    payload = _build_ask_payload(tg_user_id=tg_user_id, text=text)
+    account_id = str(lk.get("account_id") or "").strip()
+    if not account_id:
+        send_telegram_text(
+            chat_id,
+            "❌ Question processing failed.\n"
+            "Reason: missing_account_id\n"
+            "Details: Telegram channel is linked but no canonical account_id was returned.\n"
+            "Fix: Check accounts_service.lookup_account and accounts.account_id population.",
+        )
+        return jsonify({"ok": False, "stage": "missing_account_id", "lookup": lk}), 200
+
+    payload = _build_ask_payload(account_id=account_id, tg_user_id=tg_user_id, text=text)
     resp = _call_ask_guarded(payload)
 
     if not isinstance(resp, dict):
