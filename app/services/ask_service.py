@@ -22,7 +22,10 @@ from app.services.answer_composer import (
 from app.services.usage_guard_service import get_ai_usage_state
 from app.services.billing_guard_service import get_billing_state
 from app.services.ai_service import generate_grounded_answer
-from app.services.tax_grounding_service import build_grounded_answer, grounding_prompt_context
+from app.services.tax_grounding_service import (
+    build_grounded_answer,
+    grounding_prompt_context,
+)
 from app.services.response_refiner import refine_response
 from app.services.tax_rules.vat_rules import can_handle_vat_rule, resolve_vat_rule
 from app.services.tax_rules.paye_rules import can_handle_paye_rule, resolve_paye_rule
@@ -449,7 +452,10 @@ def _coerce_ask_inputs(args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Dict[st
         or payload.get("source")
         or "web"
     )
-    channel = CHANNEL_ALIASES.get(str(raw_channel or "").strip().lower(), str(raw_channel or "web").strip().lower())
+    channel = CHANNEL_ALIASES.get(
+        str(raw_channel or "").strip().lower(),
+        str(raw_channel or "web").strip().lower(),
+    )
 
     provider = str(payload.get("provider") or "").strip().lower()
     provider_user_id = str(
