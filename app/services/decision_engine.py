@@ -12,6 +12,7 @@ def decide_answer_mode(
     has_ai_credit: bool,
     monthly_ai_usage: int,
     monthly_ai_limit: int,
+    allow_direct_cache: bool = True,
 ) -> DecisionResult:
     best = ranked_candidates[0] if ranked_candidates else None
 
@@ -22,6 +23,7 @@ def decide_answer_mode(
         f"has_ai_credit={has_ai_credit}",
         f"monthly_ai_usage={monthly_ai_usage}",
         f"monthly_ai_limit={monthly_ai_limit}",
+        f"allow_direct_cache={allow_direct_cache}",
     ]
 
     if classification.requires_clarification:
@@ -38,16 +40,13 @@ def decide_answer_mode(
             reasons=reasons + ["intent=calculation"],
         )
 
-    # Only very strong candidates should be considered for direct cache.
-    # Final safety will still be enforced later by grounding/refiner.
-    if best and best.rank_score >= 85:
+    if best and best.rank_score >= 85 and allow_direct_cache:
         return DecisionResult(
             mode="direct_cache",
             best_candidate=best,
             reasons=reasons + [f"best_rank={best.rank_score}", "candidate_strong_enough_for_cache_review"],
         )
 
-    # Medium-quality candidate can be used as grounding basis if AI credits exist.
     if best and best.rank_score >= 70 and has_ai_credit:
         return DecisionResult(
             mode="grounded_synthesis",
@@ -55,9 +54,6 @@ def decide_answer_mode(
             reasons=reasons + [f"best_rank={best.rank_score}", "candidate_good_for_grounded_synthesis"],
         )
 
-    # IMPORTANT FIX:
-    # Do NOT auto-return cache just because credits are exhausted.
-    # If candidate is not strong enough for safe direct cache, return insufficient credits.
     if not has_ai_credit:
         return DecisionResult(
             mode="insufficient_credits_uncached",
