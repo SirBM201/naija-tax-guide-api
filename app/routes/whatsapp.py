@@ -1,27 +1,23 @@
-# app/routes/whatsapp.py
 from __future__ import annotations
 
+import logging
 import os
 import re
-import logging
-from flask import Blueprint, request, jsonify
 
-from app.services.accounts_service import upsert_account, lookup_account
+from flask import Blueprint, jsonify, request
+
 from app.core.supabase_client import supabase
+from app.services.accounts_service import lookup_account, upsert_account
 from app.services.ask_service import ask_guarded
 from app.services.outbound_service import send_whatsapp_text
 
 bp = Blueprint("whatsapp", __name__)
 
 WA_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "").strip()
-
 LINK_CODE_RE = re.compile(r"^[A-Z0-9]{8}$")
 
 
 def _extract_message(body: dict) -> tuple[str, str]:
-    """
-    Returns (from_phone, text). If no text message, returns ("","").
-    """
     entry = (body.get("entry") or [None])[0] or {}
     changes = (entry.get("changes") or [None])[0] or {}
     value = changes.get("value") or {}
@@ -30,18 +26,18 @@ def _extract_message(body: dict) -> tuple[str, str]:
         return "", ""
 
     msg = messages[0]
-    from_phone = (msg.get("from") or "").strip()
+    from_phone = str(msg.get("from") or "").strip()
 
     msg_type = msg.get("type")
     text = ""
     if msg_type == "text":
-        text = ((msg.get("text") or {}).get("body") or "").strip()
+        text = str((msg.get("text") or {}).get("body") or "").strip()
 
     return from_phone, text
 
 
 def _try_consume_link_code(provider_user_id: str, raw_text: str) -> dict:
-    code = (raw_text or "").strip().upper()
+    code = str(raw_text or "").strip().upper()
     if not LINK_CODE_RE.match(code):
         return {"ok": False, "reason": "not_a_code"}
 
@@ -84,12 +80,6 @@ def wa_webhook_verify():
 
 @bp.post("/whatsapp/webhook")
 def wa_webhook_receive():
-    """
-    Flow:
-    - Upsert shell account (provider=wa)
-    - If not linked: accept 8-char code and link OR instruct
-    - If linked: treat message as a question -> ask_guarded -> send answer
-    """
     body = request.get_json(silent=True) or {}
 
     try:
@@ -97,7 +87,6 @@ def wa_webhook_receive():
         if not from_phone:
             return jsonify({"ok": True, "ignored": True})
 
-        # ensure account exists
         upsert_account(provider="wa", provider_user_id=from_phone, display_name=None, phone=from_phone)
 
         lk = lookup_account(provider="wa", provider_user_id=from_phone)
@@ -105,7 +94,6 @@ def wa_webhook_receive():
             send_whatsapp_text(from_phone, "System error. Please try again.")
             return jsonify({"ok": True})
 
-        # Not linked yet -> try code
         if not lk.get("linked"):
             if text:
                 attempt = _try_consume_link_code(from_phone, text)
@@ -126,22 +114,23 @@ def wa_webhook_receive():
             )
             return jsonify({"ok": True, "linked": False})
 
-        # Linked -> answer questions
         if not text:
             send_whatsapp_text(from_phone, "Send your question as text and I will reply.")
             return jsonify({"ok": True, "linked": True, "ignored": True, "reason": "no_text"})
 
+        account_id = str(lk.get("account_id") or "").strip()
+        if not account_id:
+            send_whatsapp_text(from_phone, "System error. Your linked account could not be resolved.")
+            return jsonify({"ok": True, "linked": True, "ignored": True, "reason": "missing_account_id"})
+
         resp = ask_guarded(
-            {
-                "provider": "wa",
-                "provider_user_id": from_phone,
-                "question": text,
-                "lang": "en",
-                "mode": "text",
-            }
+            account_id=account_id,
+            question=text,
+            lang="en",
+            channel="whatsapp",
         )
 
-        answer = (resp.get("answer") or resp.get("message") or "").strip()
+        answer = str(resp.get("answer") or resp.get("message") or "").strip()
         if not answer:
             answer = "I couldn't process that right now. Please try again."
 
