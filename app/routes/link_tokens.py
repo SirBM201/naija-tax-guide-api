@@ -25,6 +25,7 @@ bp = Blueprint("link_tokens", __name__, url_prefix="/link")
 
 TOKEN_LENGTH = 8
 TOKEN_EXPIRY_MINUTES = 30
+SAFE_CODE_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
 
 
 def _utcnow() -> datetime:
@@ -52,8 +53,7 @@ def _normalize_provider(raw: str) -> str:
 
 
 def _generate_code(length: int = TOKEN_LENGTH) -> str:
-    alphabet = string.ascii_uppercase + string.digits
-    return "".join(secrets.choice(alphabet) for _ in range(length))
+    return "".join(secrets.choice(SAFE_CODE_ALPHABET) for _ in range(length))
 
 
 def _safe_iso_to_dt(value: Any) -> Optional[datetime]:
@@ -156,6 +156,7 @@ def generate_link_code():
     Important:
     - Uses authenticated web session identity from get_account_id_from_request(...)
     - Stores canonical account id into link_tokens.auth_user_id because that is the live schema
+    - Generates only non-ambiguous 8-character codes compatible with Telegram extractor
     """
     account_id, auth_dbg = _get_logged_in_account_id()
     if not account_id:
@@ -382,4 +383,3 @@ def consume_link_code():
             "provider_user_id": provider_user_id,
         }
     )
-    
