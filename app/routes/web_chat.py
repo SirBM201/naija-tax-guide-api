@@ -1,9 +1,9 @@
-# app/routes/web_chat.py
 from __future__ import annotations
 
-from flask import Blueprint, request, jsonify
-from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone
+from typing import Any, Dict, List
+
+from flask import Blueprint, request, jsonify
 
 from app.core.auth import require_web_auth
 from app.core.supabase_client import supabase
@@ -12,7 +12,7 @@ from app.services.ask_service import ask_guarded
 
 bp = Blueprint("web_chat", __name__)
 
-MAX_CONTEXT_MESSAGES = 12  # last N messages used as context
+MAX_CONTEXT_MESSAGES = 12
 
 
 def _now_iso() -> str:
@@ -20,7 +20,7 @@ def _now_iso() -> str:
 
 
 def _safe_text(v: Any, limit: int = 8000) -> str:
-    s = (v or "").strip()
+    s = str(v or "").strip()
     if len(s) > limit:
         s = s[:limit]
     return s
@@ -42,15 +42,12 @@ def _get_messages_for_context(session_id: str, account_id: str, limit: int) -> L
 
 
 def _build_context_text(messages: List[Dict[str, Any]], new_user_text: str) -> str:
-    """
-    We keep it simple: embed last messages as text for ask_ai() (which only accepts a string).
-    """
     lines: List[str] = []
     if messages:
         lines.append("Conversation so far:")
         for m in messages[-MAX_CONTEXT_MESSAGES:]:
-            role = (m.get("role") or "").strip().lower()
-            content = (m.get("content") or "").strip()
+            role = str(m.get("role") or "").strip().lower()
+            content = str(m.get("content") or "").strip()
             if not content:
                 continue
             if role == "assistant":
@@ -59,7 +56,7 @@ def _build_context_text(messages: List[Dict[str, Any]], new_user_text: str) -> s
                 lines.append(f"System: {content}")
             else:
                 lines.append(f"User: {content}")
-        lines.append("")  # blank line
+        lines.append("")
 
     lines.append("New user message:")
     lines.append(new_user_text)
@@ -153,12 +150,11 @@ def send_message(ctx, session_id: str):
     account_id = ctx["account_id"]
     body = request.get_json(silent=True) or {}
     text = _safe_text(body.get("content") or "", 6000)
-    lang = (body.get("lang") or "en").strip() or "en"
+    lang = str(body.get("lang") or "en").strip() or "en"
 
     if not text:
         return jsonify({"ok": False, "error": "missing_content"}), 400
 
-    # ensure session exists
     s = (
         supabase.table("web_chat_sessions")
         .select("id")
@@ -172,7 +168,6 @@ def send_message(ctx, session_id: str):
     if not s:
         return jsonify({"ok": False, "error": "session_not_found"}), 404
 
-    # store user message
     user_row = {
         "session_id": session_id,
         "account_id": account_id,
@@ -182,29 +177,21 @@ def send_message(ctx, session_id: str):
     }
     supabase.table("web_chat_messages").insert(user_row).execute()
 
-    # load context + ask
     prior = _get_messages_for_context(session_id, account_id, limit=MAX_CONTEXT_MESSAGES)
     prompt = _build_context_text(prior, text)
 
-    # IMPORTANT: uses your existing guarded ask flow (credits/caching internally),
-    # but DOES NOT expose credits to frontend.
     result = ask_guarded(
-        {
-            "account_id": account_id,
-            "provider": None,
-            "provider_user_id": None,
-            "question": prompt,
-            "lang": lang,
-        }
+        account_id=str(account_id or "").strip(),
+        question=prompt,
+        lang=lang,
+        channel="web_chat",
     )
 
     if not result.get("ok"):
-        # store error as assistant message (optional) or just return error
         return jsonify(result), 400
 
-    answer = (result.get("answer") or "").strip() or "..."
+    answer = str(result.get("answer") or "").strip() or "..."
 
-    # store assistant message
     asst_row = {
         "session_id": session_id,
         "account_id": account_id,
@@ -213,13 +200,6 @@ def send_message(ctx, session_id: str):
         "created_at": _now_iso(),
     }
     supabase.table("web_chat_messages").insert(asst_row).execute()
-
-    # bump updated_at
     supabase.table("web_chat_sessions").update({"updated_at": _now_iso()}).eq("id", session_id).execute()
 
-    return jsonify(
-        {
-            "ok": True,
-            "assistant": answer,
-        }
-    )
+    return jsonify({"ok": True, "assistant": answer})
