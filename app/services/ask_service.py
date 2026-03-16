@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from app.core.supabase_client import supabase
+from app.services.accounts_service import lookup_account
 from app.services.query_classifier import classify_query
 from app.services.semantic_cache_service import (
     retrieve_ranked_candidates,
@@ -27,6 +28,17 @@ from app.services.tax_rules.vat_rules import can_handle_vat_rule, resolve_vat_ru
 from app.services.tax_rules.paye_rules import can_handle_paye_rule, resolve_paye_rule
 from app.services.tax_intent_service import classify_tax_intent
 from app.services.tax_process_composer import try_compose
+
+
+CHANNEL_ALIASES = {
+    "wa": "whatsapp",
+    "whatsapp": "whatsapp",
+    "tg": "telegram",
+    "telegram": "telegram",
+    "web": "web",
+    "web_chat": "web_chat",
+    "chat": "web_chat",
+}
 
 
 def _truthy(v: str | None) -> bool:
@@ -119,37 +131,6 @@ def _resolve_rules(question: str, topic: str, intent_type: str) -> Optional[str]
         return resolve_paye_rule(question, intent_type)
 
     return None
-
-
-def _try_process_composer(question: str) -> Optional[Dict[str, Any]]:
-    """
-    Deterministic process routing layer.
-    Handles questions like:
-    - how do i pay tax
-    - how to register tin
-    - how to file tax
-    """
-    intent = classify_tax_intent(question)
-
-    if not intent:
-        return None
-
-    composed = try_compose(intent)
-
-    if not composed:
-        return None
-
-    answer = str(composed.get("answer") or "").strip()
-    if not answer:
-        return None
-
-    meta = composed.get("meta") or {}
-
-    return {
-        "answer": answer,
-        "meta": meta,
-        "intent": intent,
-    }
 
 
 def _filtered_debug(debug: Dict[str, Any]) -> Dict[str, Any]:
@@ -437,27 +418,191 @@ def _try_safe_candidate_answer(
     }
 
 
-def ask_guarded(
-    *,
-    account_id: str,
-    question: str,
-    lang: str = "en",
-    channel: str = "web",
-) -> Dict[str, Any]:
+def _coerce_ask_inputs(args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {}
+
+    if args:
+        first = args[0]
+        if isinstance(first, dict):
+            payload.update(first)
+        else:
+            payload["question"] = first
+
+    payload.update(kwargs)
+
+    question = (
+        payload.get("question")
+        or payload.get("query")
+        or payload.get("text")
+        or payload.get("message")
+        or payload.get("user_message")
+        or payload.get("user_query")
+        or ""
+    )
+
+    account_id = payload.get("account_id") or payload.get("acct_id") or payload.get("user_account_id") or ""
+
+    raw_channel = (
+        payload.get("channel")
+        or payload.get("provider")
+        or payload.get("platform")
+        or payload.get("source")
+        or "web"
+    )
+    channel = CHANNEL_ALIASES.get(str(raw_channel or "").strip().lower(), str(raw_channel or "web").strip().lower())
+
+    provider = str(payload.get("provider") or "").strip().lower()
+    provider_user_id = str(
+        payload.get("provider_user_id")
+        or payload.get("channel_user_id")
+        or payload.get("user_id")
+        or ""
+    ).strip()
+
+    return {
+        "account_id": str(account_id or "").strip(),
+        "question": str(question or "").strip(),
+        "lang": str(payload.get("lang") or "en").strip() or "en",
+        "channel": channel or "web",
+        "provider": provider,
+        "provider_user_id": provider_user_id,
+        "raw_payload": payload,
+    }
+
+
+def _resolve_account_id_for_channel(account_id: str, provider: str, provider_user_id: str) -> str:
+    if account_id:
+        return account_id
+
+    if not provider or not provider_user_id:
+        return ""
+
+    try:
+        lk = lookup_account(provider=provider, provider_user_id=provider_user_id)
+    except Exception:
+        return ""
+
+    if not isinstance(lk, dict) or not lk.get("ok"):
+        return ""
+
+    return str(lk.get("account_id") or "").strip()
+
+
+def _is_standalone_mode(channel: str) -> bool:
+    return channel in {"telegram", "whatsapp"}
+
+
+def _is_generic_process_question(question: str, classification) -> bool:
+    q = _normalize_text(question)
+    if not q:
+        return False
+
+    strong_starts = (
+        "how do i ",
+        "how to ",
+        "what is the process ",
+        "what is the procedure ",
+        "steps to ",
+        "process for ",
+        "procedure for ",
+    )
+    process_verbs = {
+        "file",
+        "filing",
+        "register",
+        "registration",
+        "remit",
+        "remittance",
+        "pay",
+        "payment",
+        "submit",
+        "obtain",
+        "get",
+    }
+    process_nouns = {
+        "tax",
+        "tin",
+        "vat",
+        "paye",
+        "return",
+        "returns",
+        "self assessment",
+        "tax return",
+    }
+
+    starts_like_process = any(q.startswith(x) for x in strong_starts)
+    tokens = set(_tokenize(q))
+    token_signal = bool(tokens.intersection(process_verbs)) and bool(tokens.intersection(process_nouns))
+    intent_signal = str(getattr(classification, "intent_type", "") or "").strip().lower() == "how_to"
+
+    return starts_like_process or (intent_signal and token_signal)
+
+
+def _try_process_composer(question: str) -> Optional[Dict[str, Any]]:
+    intent = classify_tax_intent(question)
+    if not intent:
+        return None
+
+    composed = try_compose(intent)
+    if not composed:
+        return None
+
+    answer = str(composed.get("answer") or "").strip()
+    if not answer:
+        return None
+
+    meta = composed.get("meta") or {}
+    return {
+        "answer": answer,
+        "meta": meta,
+        "intent": intent,
+    }
+
+
+def ask_guarded(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+    coerced = _coerce_ask_inputs(args, kwargs)
+
+    account_id = _resolve_account_id_for_channel(
+        coerced["account_id"],
+        coerced["provider"],
+        coerced["provider_user_id"],
+    )
+    question = coerced["question"]
+    lang = coerced["lang"]
+    channel = coerced["channel"]
+
+    if not account_id:
+        return {
+            "ok": False,
+            "error": "account_required",
+            "fix": "Pass account_id explicitly or provide a linked provider/provider_user_id pair.",
+        }
+
+    if not question:
+        return {
+            "ok": False,
+            "error": "question_required",
+            "fix": "Provide a non-empty question.",
+        }
+
     classification = classify_query(question, lang=lang)
     question_meta = _classification_to_meta(classification)
 
     usage_state = get_ai_usage_state(account_id)
     billing_state = get_billing_state(account_id)
     credits_available = bool(usage_state.get("has_ai_credit"))
+    standalone_mode = _is_standalone_mode(channel)
+    generic_process_question = _is_generic_process_question(question, classification)
 
     debug: Dict[str, Any] = {
+        "channel": channel,
+        "standalone_mode": standalone_mode,
+        "generic_process_question": generic_process_question,
         "classification": classification.__dict__,
         "billing_state": billing_state,
         "usage_state": usage_state,
     }
 
-    # Step 1: clarification gate
     temp_ranked = retrieve_ranked_candidates(classification)
     temp_decision = decide_answer_mode(
         classification,
@@ -465,6 +610,7 @@ def ask_guarded(
         has_ai_credit=credits_available,
         monthly_ai_usage=int(usage_state["monthly_ai_usage"]),
         monthly_ai_limit=int(usage_state["monthly_ai_limit"]),
+        allow_direct_cache=not generic_process_question,
     )
 
     debug["initial_decision"] = {
@@ -477,14 +623,12 @@ def ask_guarded(
         res = compose_clarification(debug=_filtered_debug(debug))
         return res.__dict__
 
-    # Step 2: deterministic tax rules (VAT/PAYE)
     rule_answer = _resolve_rules(question, classification.topic, classification.intent_type)
     if rule_answer:
         debug["final_path"] = "rules_engine"
         res = compose_rules_engine_answer(rule_answer, debug=_filtered_debug(debug))
         return res.__dict__
 
-    # Step 3: deterministic process composers (TIN / tax payment / tax filing)
     process_result = _try_process_composer(question)
     if process_result:
         debug["process_composer"] = {
@@ -492,14 +636,12 @@ def ask_guarded(
             "meta": process_result.get("meta"),
         }
         debug["final_path"] = "process_composer"
-
         res = compose_rules_engine_answer(
             process_result.get("answer", ""),
             debug=_filtered_debug(debug),
         )
         return res.__dict__
 
-    # Step 4: official tax knowledge retrieval
     tax_matches = _retrieve_tax_knowledge_matches(question, classification)
     debug["tax_matches"] = tax_matches
     debug["tax_candidates"] = [
@@ -522,7 +664,6 @@ def ask_guarded(
 
     if best_tax_match and int(best_tax_match.get("score") or 0) >= tax_direct_threshold:
         tax_candidate = _tax_match_to_candidate(best_tax_match)
-
         safe_tax = _try_safe_candidate_answer(
             candidate=tax_candidate,
             question_meta=question_meta,
@@ -535,16 +676,15 @@ def ask_guarded(
         )
         debug["tax_direct_threshold"] = tax_direct_threshold
         debug["best_tax_score"] = best_tax_match.get("score")
-        debug["final_path"] = "tax_kb_direct"
 
         if safe_tax and safe_tax.get("allowed"):
+            debug["final_path"] = "tax_kb_direct"
             res = compose_rules_engine_answer(
                 safe_tax.get("answer", ""),
                 debug=_filtered_debug(debug),
             )
             return res.__dict__
 
-    # Step 5: semantic cache retrieval
     ranked = temp_ranked
     decision = decide_answer_mode(
         classification,
@@ -552,6 +692,7 @@ def ask_guarded(
         has_ai_credit=credits_available,
         monthly_ai_usage=int(usage_state["monthly_ai_usage"]),
         monthly_ai_limit=int(usage_state["monthly_ai_limit"]),
+        allow_direct_cache=not generic_process_question,
     )
 
     debug["decision"] = {
@@ -560,7 +701,6 @@ def ask_guarded(
     }
 
     best_candidate = decision.best_candidate or (ranked[0] if ranked else None)
-
     safe_candidate = _try_safe_candidate_answer(
         candidate=best_candidate,
         question_meta=question_meta,
@@ -571,7 +711,7 @@ def ask_guarded(
         debug["candidate_grounding"] = safe_candidate.get("grounded")
         debug["candidate_refiner"] = safe_candidate.get("refined")
 
-        if safe_candidate.get("allowed"):
+        if safe_candidate.get("allowed") and decision.mode == "direct_cache":
             debug["final_path"] = "direct_cache"
             res = compose_direct_cache_answer(
                 best_candidate,
@@ -580,15 +720,12 @@ def ask_guarded(
             )
             return res.__dict__
 
-    # Step 6: if no AI credit, stop after deterministic + tax direct + cache attempts
     if decision.mode == "insufficient_credits_uncached" or not credits_available:
         debug["final_path"] = "insufficient_uncached"
         res = compose_insufficient_uncached(debug=_filtered_debug(debug))
         return res.__dict__
 
-    # Step 7: grounded AI synthesis using official tax KB + cache evidence
     grounded_candidates = [_candidate_to_dict(c) for c in ranked[:3]]
-
     grounding_context_parts: List[str] = []
 
     tax_grounding = _build_tax_grounding_context(
@@ -604,7 +741,6 @@ def ask_guarded(
             candidate=grounded_candidates[0],
             composed_answer=grounded_candidates[0].get("answer"),
         )
-
         grounded_preview_dict = (
             grounded_preview.__dict__ if hasattr(grounded_preview, "__dict__") else dict(grounded_preview)
         )
