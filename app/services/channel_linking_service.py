@@ -62,7 +62,7 @@ def consume_and_link(
     if not provider_user_id:
         return {"ok": False, "error": "provider_user_id_required"}
 
-    sb = supabase()
+    sb = supabase
 
     token = None
 
