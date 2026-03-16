@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import List
 
 from app.schemas.ask_models import QueryClassification, RetrievalCandidate
@@ -14,7 +15,7 @@ def _intent_compatible(query_intent: str, cand_intent: str) -> bool:
 
     compatible = {
         "definition": {"definition", "general"},
-        "how_to": {"how_to"},
+        "how_to": {"how_to", "general"},
         "deduction": {"deduction", "general"},
         "calculation": {"calculation"},
         "advanced_advisory": {"advanced_advisory"},
@@ -42,6 +43,25 @@ def _passes_filters(query: QueryClassification, cand: RetrievalCandidate) -> boo
     return True
 
 
+def _looks_like_scenario_example(text: str) -> bool:
+    s = str(text or "").strip().lower()
+    if not s:
+        return False
+
+    patterns = [
+        r"\bfor example\b",
+        r"\bexample\b",
+        r"\bscenario\b",
+        r"\bif you earned\b",
+        r"\bif a taxpayer\b",
+        r"\bjune income\b",
+        r"\bkano\b",
+        r"\b₦|\$",
+        r"\b\d{4,}\b",
+    ]
+    return any(re.search(p, s) for p in patterns)
+
+
 def _score(query: QueryClassification, cand: RetrievalCandidate) -> float:
     score = 0.0
 
@@ -61,6 +81,12 @@ def _score(query: QueryClassification, cand: RetrievalCandidate) -> float:
     score += float(cand.trust_score or 0) * 20
     score += float(cand.source_authority_score or 0) * 10
     score += float(cand.similarity or 0) * 15
+
+    if query.intent_type == "how_to" and _looks_like_scenario_example(cand.answer):
+        score -= 20
+
+    if query.intent_type == "how_to" and cand.intent_type == "general":
+        score -= 5
 
     return score
 
