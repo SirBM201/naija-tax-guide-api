@@ -1,92 +1,80 @@
-# app/services/tax_process_composer.py
 from __future__ import annotations
 
-from typing import Dict
+import re
+from typing import Dict, Optional
 
-
-def compose_tax_payment_process() -> Dict:
-    answer = """
-To pay tax in Nigeria, follow these steps:
-
-1. Determine the type of tax you are paying  
-   - Personal Income Tax  
-   - Value Added Tax (VAT)  
-   - Withholding Tax  
-   - Company Income Tax  
-
-2. Obtain or confirm your Tax Identification Number (TIN).
-
-3. File the relevant tax return if required.
-
-4. Generate a payment reference through the tax authority system.
-
-5. Pay through an approved channel such as:
-   - Remita platform
-   - Bank branch
-   - Official tax authority portal
-
-6. Keep the payment receipt and filing confirmation.
-
-For federal taxes, payment is usually processed through the Federal Inland Revenue Service (FIRS).  
-For personal income tax, payment may be handled by your State Internal Revenue Service.
-
-If you tell me the type of tax you want to pay, I can guide you step-by-step.
-""".strip()
-
-    return {
-        "answer": answer,
-        "meta": {
-            "intent_type": "tax_payment_process",
-            "answer_mode": "process",
-            "source_type": "tax_kb",
-            "source_label": "Nigerian Tax Payment Process",
-            "grounded": True,
-        },
-    }
-
-
-def compose_tin_registration() -> Dict:
-    answer = """
-To obtain a Tax Identification Number (TIN) in Nigeria:
-
-1. Visit the Federal Inland Revenue Service (FIRS) office or approved registration portal.
-
-2. Provide required details:
-   - Name
-   - Address
-   - Phone number
-   - Business information (if applicable)
-
-3. Submit identification documents such as:
-   - National ID
-   - International passport
-   - Business registration documents (for companies)
-
-4. Your TIN will be generated and linked to your tax profile.
-
-TIN is required for most tax filings and payments in Nigeria.
-""".strip()
-
-    return {
-        "answer": answer,
-        "meta": {
-            "intent_type": "tin_registration",
-            "answer_mode": "process",
-            "source_type": "tax_kb",
-            "source_label": "TIN Registration Process",
-            "grounded": True,
-        },
-    }
-
-
-PROCESS_MAP = {
-    "tax_payment_process": compose_tax_payment_process,
-    "tin_registration": compose_tin_registration,
+PATTERNS = {
+    "tin_registration": [
+        r"\b(tin|tax identification number)\b",
+        r"\b(register|get|obtain|apply for).{0,20}\btin\b",
+    ],
+    "tax_filing_process": [
+        r"\b(how do i|how to|steps to|process for|procedure for).{0,25}\b(file|filing|submit|lodge)\b.{0,20}\b(tax|return|returns)\b",
+        r"\b(file|filing|submit|lodge)\b.{0,20}\b(my )?(tax|return|returns)\b",
+        r"\bself assessment\b.{0,20}\b(file|filing|submit|return)\b",
+    ],
+    "vat_filing_process": [
+        r"\b(how do i|how to|steps to|process for|procedure for).{0,25}\b(file|submit|remit|pay)\b.{0,20}\bvat\b",
+        r"\bvat\b.{0,20}\b(file|submit|remit|payment|return)\b",
+    ],
+    "paye_remittance_process": [
+        r"\b(how do i|how to|steps to|process for|procedure for).{0,25}\b(remit|pay|file|submit)\b.{0,20}\bpaye\b",
+        r"\bpaye\b.{0,20}\b(remit|remittance|pay|file|submit)\b",
+    ],
+    "tax_payment_process": [
+        r"\b(how do i|how to|steps to|process for|procedure for).{0,25}\b(pay|payment|remit|remittance)\b.{0,20}\b(tax|taxes)\b",
+        r"\bpay tax\b",
+        r"\btax payment\b",
+        r"\bremita tax\b",
+    ],
+    "freelancer_tax_obligation": [
+        r"\bfreelancer(s)?\b.{0,20}\bpay tax\b",
+        r"\bself employed tax nigeria\b",
+        r"\bdo freelancers pay tax\b",
+    ],
+    "record_keeping": [
+        r"\bkeep records\b",
+        r"\btax records\b",
+        r"\baccounting records\b",
+        r"\brecord keeping\b",
+    ],
+    "vat_definition": [
+        r"\bwhat is vat\b",
+        r"\bdefine vat\b",
+    ],
+    "vat_rate": [
+        r"\bvat rate\b",
+        r"\bhow much is vat\b",
+        r"\bvat percentage\b",
+    ],
+    "paye_definition": [
+        r"\bwhat is paye\b",
+        r"\bdefine paye\b",
+    ],
 }
 
 
-def try_compose(intent: str):
-    fn = PROCESS_MAP.get(intent)
-    if not fn:
+def _normalize(text: str) -> str:
+    text = str(text or "").strip().lower()
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def classify_tax_intent(question: str) -> Optional[str]:
+    q = _normalize(question)
+    if not q:
         return None
-    return fn()
+
+    for intent, patterns in PATTERNS.items():
+        for pattern in patterns:
+            if re.search(pattern, q):
+                return intent
+
+    return None
+
+
+def build_intent_meta(intent: Optional[str]) -> Dict:
+    return {
+        "intent_type": intent,
+        "grounded": bool(intent),
+    }
