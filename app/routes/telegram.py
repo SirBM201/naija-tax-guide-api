@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import inspect
+from typing import Any, Dict
+
 from flask import Blueprint, jsonify, request
 
 from app.services.accounts_service import lookup_account, upsert_account
@@ -10,34 +13,81 @@ from app.services.outbound_service import send_telegram_text
 bp = Blueprint("telegram", __name__)
 
 
-def _clip(value: object, n: int = 220) -> str:
-    s = str(value or "").strip()
-    if not s:
-        return "n/a"
-    return s if len(s) <= n else s[:n] + "..."
+def _clip(value: Any, limit: int = 260) -> str:
+    text = str(value or "")
+    return text if len(text) <= limit else text[:limit] + "…"
 
 
-def _build_link_failure_text(attempt: dict) -> str:
-    reason = _clip(attempt.get("error") or "unknown_error", 120)
+def _build_ask_payload(*, tg_user_id: str, text: str) -> Dict[str, Any]:
+    return {
+        "provider": "tg",
+        "provider_user_id": tg_user_id,
+        "question": text,
+        "lang": "en",
+        "mode": "text",
+    }
 
-    details = (
-        attempt.get("root_cause")
-        or attempt.get("reason")
-        or ((attempt.get("details") or {}).get("provider_user_id") if isinstance(attempt.get("details"), dict) else None)
-        or ((attempt.get("details") or {}).get("row_id") if isinstance(attempt.get("details"), dict) else None)
-        or ((attempt.get("debug") or {}).get("error") if isinstance(attempt.get("debug"), dict) else None)
-        or "n/a"
-    )
 
-    fix = attempt.get("fix") or ""
-    fix_line = f"\nFix: {_clip(fix, 160)}" if fix else ""
+def _call_ask_guarded(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Failure-tolerant adapter for ask_guarded.
 
-    return (
-        "❌ Link failed.\n"
-        f"Reason: {reason}\n"
-        f"Details: {_clip(details, 180)}"
-        f"{fix_line}"
-    )
+    Your logs proved that this code path is wrong:
+        ask_guarded(payload)
+
+    because current ask_guarded does NOT accept one positional dict.
+
+    This adapter supports both common styles safely:
+    1) ask_guarded(**kwargs)
+    2) ask_guarded(payload)   (only if the function really expects one argument)
+    """
+    try:
+        sig = inspect.signature(ask_guarded)
+        params = list(sig.parameters.values())
+
+        has_var_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
+        accepted_names = {
+            p.name
+            for p in params
+            if p.kind in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            )
+        }
+
+        filtered_kwargs = {k: v for k, v in payload.items() if k in accepted_names}
+
+        # Preferred path: keyword call
+        if has_var_kwargs or filtered_kwargs:
+            return ask_guarded(**filtered_kwargs)
+
+        # Legacy/single-arg path only when signature really expects exactly one argument
+        positional_params = [
+            p
+            for p in params
+            if p.kind in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            )
+        ]
+        if len(positional_params) == 1:
+            return ask_guarded(payload)
+
+        return {
+            "ok": False,
+            "error": "ask_guarded_signature_mismatch",
+            "root_cause": f"Unsupported ask_guarded signature: {sig}",
+            "fix": "Update telegram route adapter or align ask_guarded signature with web ask flow.",
+            "details": {"payload_keys": list(payload.keys())},
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": "ask_guarded_failed",
+            "root_cause": f"{type(e).__name__}: {_clip(e)}",
+            "fix": "Check app.services.ask_service.ask_guarded expected signature and internal dependencies.",
+            "details": {"payload": payload},
+        }
 
 
 @bp.post("/telegram/webhook")
@@ -60,7 +110,9 @@ def tg_webhook():
 
     user = msg.get("from") or {}
     tg_user_id = str(user.get("id") or "").strip()
-    display_name = " ".join([x for x in [user.get("first_name"), user.get("last_name")] if x]) or None
+    display_name = " ".join(
+        [x for x in [user.get("first_name"), user.get("last_name")] if x]
+    ) or None
 
     if not tg_user_id or not chat_id:
         return jsonify({"ok": True, "ignored": True})
@@ -72,13 +124,25 @@ def tg_webhook():
         phone=None,
     )
     if not shell.get("ok"):
-        send_telegram_text(chat_id, _build_link_failure_text(shell))
-        return jsonify({"ok": True, "error": "shell_upsert_failed", "details": shell})
+        send_telegram_text(
+            chat_id,
+            "❌ Telegram shell account setup failed.\n"
+            f"Reason: {shell.get('error', 'unknown_error')}\n"
+            f"Details: {_clip(shell.get('root_cause') or shell.get('details') or 'n/a')}\n"
+            f"Fix: {_clip(shell.get('fix') or 'Check backend account setup.')}",
+        )
+        return jsonify({"ok": False, "stage": "upsert_shell", "details": shell}), 200
 
     lk = lookup_account(provider="tg", provider_user_id=tg_user_id)
     if not lk.get("ok"):
-        send_telegram_text(chat_id, _build_link_failure_text(lk))
-        return jsonify({"ok": True, "error": "lookup_failed", "details": lk})
+        send_telegram_text(
+            chat_id,
+            "❌ Telegram account lookup failed.\n"
+            f"Reason: {lk.get('error', 'lookup_failed')}\n"
+            f"Details: {_clip(lk.get('root_cause') or lk.get('details') or 'n/a')}\n"
+            f"Fix: {_clip(lk.get('fix') or 'Check accounts table access.')}",
+        )
+        return jsonify({"ok": False, "stage": "lookup_account", "details": lk}), 200
 
     if not lk.get("linked"):
         code = extract_code(text)
@@ -106,8 +170,14 @@ def tg_webhook():
                     }
                 )
 
-            send_telegram_text(chat_id, _build_link_failure_text(attempt))
-            return jsonify({"ok": True, "linked": False, "link_attempt": attempt})
+            send_telegram_text(
+                chat_id,
+                "❌ Link failed.\n"
+                f"Reason: {attempt.get('error', 'unknown_error')}\n"
+                f"Details: {_clip(attempt.get('root_cause') or attempt.get('details') or 'n/a')}\n"
+                f"Fix: {_clip(attempt.get('fix') or 'Check link token flow and accounts link update.')}",
+            )
+            return jsonify({"ok": True, "linked": False, "link_attempt": attempt}), 200
 
         send_telegram_text(
             chat_id,
@@ -130,15 +200,27 @@ def tg_webhook():
         )
         return jsonify({"ok": True, "linked": True})
 
-    resp = ask_guarded(
-        {
-            "provider": "tg",
-            "provider_user_id": tg_user_id,
-            "question": text,
-            "lang": "en",
-            "mode": "text",
-        }
-    )
+    payload = _build_ask_payload(tg_user_id=tg_user_id, text=text)
+    resp = _call_ask_guarded(payload)
+
+    if not isinstance(resp, dict):
+        send_telegram_text(
+            chat_id,
+            "❌ Ask flow failed.\n"
+            f"Reason: invalid_response\nDetails: {_clip(type(resp).__name__)}\n"
+            "Fix: Ensure ask_guarded returns a dict like the web ask route.",
+        )
+        return jsonify({"ok": False, "stage": "ask_invalid_response", "response_type": str(type(resp))}), 200
+
+    if not resp.get("ok") and not (resp.get("answer") or resp.get("message")):
+        send_telegram_text(
+            chat_id,
+            "❌ Question processing failed.\n"
+            f"Reason: {resp.get('error', 'unknown_error')}\n"
+            f"Details: {_clip(resp.get('root_cause') or resp.get('details') or 'n/a')}\n"
+            f"Fix: {_clip(resp.get('fix') or 'Check ask_guarded integration and backend AI flow.')}",
+        )
+        return jsonify({"ok": False, "stage": "ask_failed", "details": resp}), 200
 
     answer = (resp.get("answer") or resp.get("message") or "").strip()
     if not answer:
