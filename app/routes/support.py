@@ -1,505 +1,533 @@
-"use client";
+from __future__ import annotations
 
-import React, { useEffect, useMemo, useState } from "react";
-import { useRouter } from "next/navigation";
-import { useAuth } from "@/lib/auth";
-import AppShell, {
-  shellButtonPrimary,
-  shellButtonSecondary,
-} from "@/components/app-shell";
-import WorkspaceSectionCard from "@/components/workspace-section-card";
-import {
-  Banner,
-  MetricCard,
-  appInputStyle,
-  appSelectStyle,
-  appTextareaStyle,
-  formatDate,
-} from "@/components/ui";
-import { CardsGrid, SectionStack } from "@/components/page-layout";
-import { useWorkspaceState } from "@/hooks/useWorkspaceState";
-import { buildWorkspaceAlerts } from "@/lib/workspace-alerts";
+import os
+import uuid
+from typing import Any, Dict, Optional, Tuple
 
-type SupportFormState = {
-  category: string;
-  priority: string;
-  subject: string;
-  message: string;
-};
+from flask import Blueprint, jsonify, request
 
-type LatestTicket = {
-  ticket_id: string;
-  status: string;
-  category: string;
-  priority: string;
-  subject: string;
-  created_at?: string;
-  updated_at?: string;
-};
+from app.core.mailer import send_mail
+from app.core.supabase_client import supabase
+from app.services.web_auth_service import get_account_id_from_request
 
-function safeText(value: unknown, fallback = "—"): string {
-  const text =
-    typeof value === "string"
-      ? value.trim()
-      : value == null
-      ? ""
-      : String(value).trim();
-  return text || fallback;
-}
+bp = Blueprint("support", __name__)
 
-function truthyValue(value: unknown): boolean {
-  if (typeof value === "boolean") return value;
-  if (typeof value === "number") return value > 0;
-  if (typeof value === "string") {
-    const raw = value.trim().toLowerCase();
-    return ["1", "true", "yes", "active", "paid", "enabled", "linked"].includes(raw);
-  }
-  return false;
-}
 
-function infoBoxStyle(): React.CSSProperties {
-  return {
-    border: "1px solid var(--border)",
-    borderRadius: 18,
-    background: "var(--surface)",
-    padding: 16,
-    display: "grid",
-    gap: 6,
-  };
-}
+def _sb():
+    return supabase() if callable(supabase) else supabase
 
-function pageGridStyle(): React.CSSProperties {
-  return {
-    display: "grid",
-    gridTemplateColumns: "minmax(0, 1.45fr) minmax(320px, 0.95fr)",
-    gap: 18,
-    alignItems: "start",
-  };
-}
 
-function checklistStyle(): React.CSSProperties {
-  return {
-    display: "grid",
-    gap: 12,
-    color: "var(--text)",
-    fontSize: 15,
-    lineHeight: 1.8,
-  };
-}
+def _env(name: str, default: str = "") -> str:
+    return (os.getenv(name, default) or default).strip()
 
-export default function SupportPage() {
-  const router = useRouter();
-  const { user, token } = useAuth();
 
-  const {
-    profile,
-    usage,
-    subscription,
-    channelLinks,
-    billing,
-    credits,
-  } = useWorkspaceState();
+def _clip(v: Any, n: int = 400) -> str:
+    s = str(v or "")
+    return s if len(s) <= n else s[:n] + "...<truncated>"
 
-  const alerts = useMemo(
-    () =>
-      buildWorkspaceAlerts({
-        profile,
-        usage,
-        subscription,
-        channelLinks,
-        billing,
-        credits,
-      }),
-    [profile, usage, subscription, channelLinks, billing, credits]
-  );
 
-  const primaryAlert =
-    alerts.find(
-      (alert) =>
-        /billing|subscription|credit|channel|support|login/i.test(alert.title) ||
-        /billing|subscription|credit|channel|support|login/i.test(alert.subtitle)
-    ) || null;
+def _safe_json() -> Dict[str, Any]:
+    return request.get_json(silent=True) or {}
 
-  const accountEmail = safeText(
-    profile?.email || user?.email || billing?.checkout_email || "Not visible"
-  );
-  const accountName = safeText(
-    profile?.full_name || profile?.first_name || user?.email || "Workspace user"
-  );
-  const planName = safeText(
-    subscription?.plan_name ||
-      billing?.plan_name ||
-      subscription?.plan_code ||
-      billing?.plan_code ||
-      "No active plan"
-  );
-  const planStatus = safeText(subscription?.status || billing?.status || "Unknown");
-  const activeNow = truthyValue(
-    subscription?.active ||
-      billing?.active ||
-      planStatus.toLowerCase() === "active"
-  );
 
-  const creditBalance = Number(credits?.balance ?? 0);
+def _fail(
+    *,
+    error: str,
+    message: Optional[str] = None,
+    root_cause: Any = None,
+    extra: Optional[Dict[str, Any]] = None,
+    status: int = 400,
+):
+    out: Dict[str, Any] = {"ok": False, "error": error}
+    if message:
+        out["message"] = message
+    if root_cause is not None:
+        out["root_cause"] = root_cause
+    if extra:
+        out.update(extra)
+    return jsonify(out), status
 
-  const whatsappLinked = truthyValue(
-    channelLinks?.whatsapp_linked || channelLinks?.whatsapp?.linked
-  );
-  const telegramLinked = truthyValue(
-    channelLinks?.telegram_linked || channelLinks?.telegram?.linked
-  );
 
-  const channelState =
-    whatsappLinked && telegramLinked
-      ? "WhatsApp + Telegram linked"
-      : whatsappLinked
-      ? "WhatsApp linked"
-      : telegramLinked
-      ? "Telegram linked"
-      : "No linked channel";
+def _get_account_row(account_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    account_id = (account_id or "").strip()
+    if not account_id:
+        return None, {
+            "error": "account_id_required",
+            "root_cause": "missing_account_id",
+            "fix": "Authenticate first so canonical accounts.account_id can be resolved.",
+        }
 
-  const [form, setForm] = useState<SupportFormState>({
-    category: "general",
-    priority: "normal",
-    subject: "",
-    message: "",
-  });
+    try:
+        q = (
+            _sb()
+            .table("accounts")
+            .select(
+                "id,account_id,email,provider,provider_user_id,display_name,phone,phone_e164,created_at,updated_at"
+            )
+            .eq("account_id", account_id)
+            .limit(1)
+            .execute()
+        )
+        rows = getattr(q, "data", None) or []
+        if rows:
+            return rows[0], None
+    except Exception as e:
+        return None, {
+            "error": "account_lookup_failed",
+            "root_cause": f"lookup by account_id failed: {type(e).__name__}: {_clip(e)}",
+        }
 
-  const [notice, setNotice] = useState("");
-  const [error, setError] = useState("");
-  const [loadingLatest, setLoadingLatest] = useState(false);
-  const [submitting, setSubmitting] = useState(false);
-  const [latestTicket, setLatestTicket] = useState<LatestTicket | null>(null);
+    try:
+        q = (
+            _sb()
+            .table("accounts")
+            .select(
+                "id,account_id,email,provider,provider_user_id,display_name,phone,phone_e164,created_at,updated_at"
+            )
+            .eq("id", account_id)
+            .limit(1)
+            .execute()
+        )
+        rows = getattr(q, "data", None) or []
+        if rows:
+            return rows[0], None
+    except Exception as e:
+        return None, {
+            "error": "account_lookup_failed",
+            "root_cause": f"lookup by id failed: {type(e).__name__}: {_clip(e)}",
+        }
 
-  function setField<K extends keyof SupportFormState>(key: K, value: SupportFormState[K]) {
-    setForm((prev) => ({ ...prev, [key]: value }));
-    setNotice("");
-    setError("");
-  }
-
-  async function loadLatestTicket() {
-    if (!token) {
-      setLatestTicket(null);
-      return;
+    return None, {
+        "error": "account_not_found",
+        "root_cause": "no accounts row matched provided account_id",
     }
 
-    setLoadingLatest(true);
-    try {
-      const response = await fetch("/api/web/support/latest", {
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
-        cache: "no-store",
-      });
 
-      const data = await response.json().catch(() => ({}));
+def _best_contact_email(account: Optional[Dict[str, Any]], submitted_email: str) -> str:
+    submitted_email = (submitted_email or "").strip().lower()
+    if "@" in submitted_email:
+        return submitted_email
 
-      if (response.ok && data?.ok && data?.ticket) {
-        setLatestTicket(data.ticket as LatestTicket);
-      } else {
-        setLatestTicket(null);
-      }
-    } catch {
-      setLatestTicket(null);
-    } finally {
-      setLoadingLatest(false);
+    account = account or {}
+    email = (account.get("email") or "").strip().lower()
+    if "@" in email:
+        return email
+
+    provider = (account.get("provider") or "").strip().lower()
+    provider_user_id = (account.get("provider_user_id") or "").strip().lower()
+    if provider == "web" and "@" in provider_user_id:
+        return provider_user_id
+
+    return ""
+
+
+def _support_to_email() -> str:
+    return (
+        _env("SUPPORT_TO_EMAIL")
+        or _env("SUPPORT_EMAIL")
+        or _env("MAIL_FROM_EMAIL")
+        or _env("SMTP_FROM")
+        or _env("MAIL_USER")
+        or _env("SMTP_USER")
+    )
+
+
+def _support_from_name() -> str:
+    return _env("SUPPORT_FROM_NAME", "Naija Tax Guide Support")
+
+
+def _build_support_subject(issue_type: str, priority: str, subject: str, account_id: str) -> str:
+    issue_type = (issue_type or "general").strip()
+    priority = (priority or "normal").strip().upper()
+    subject = (subject or "").strip()
+    if not subject:
+        subject = "Support request"
+    return f"[Naija Tax Guide][{priority}][{issue_type}] {subject} | acct:{account_id}"
+
+
+def _build_support_text(
+    *,
+    account_id: str,
+    account: Optional[Dict[str, Any]],
+    full_name: str,
+    contact_email: str,
+    issue_type: str,
+    priority: str,
+    channel: str,
+    subject: str,
+    message: str,
+    plan_name: str = "",
+    credit_balance: Any = 0,
+    channel_state: str = "",
+) -> str:
+    account = account or {}
+    lines = [
+        "Naija Tax Guide Support Request",
+        "",
+        f"Ticket Account ID: {account_id}",
+        f"Display Name: {(account.get('display_name') or full_name or '').strip() or '—'}",
+        f"Account Email: {(account.get('email') or '').strip() or '—'}",
+        f"Submitted Contact Email: {contact_email or '—'}",
+        f"Provider: {(account.get('provider') or '').strip() or '—'}",
+        f"Provider User ID: {(account.get('provider_user_id') or '').strip() or '—'}",
+        f"Issue Type: {issue_type or '—'}",
+        f"Priority: {priority or '—'}",
+        f"Channel: {channel or '—'}",
+        f"Visible Plan: {plan_name or '—'}",
+        f"Visible Credits: {credit_balance}",
+        f"Visible Channel State: {channel_state or '—'}",
+        f"Subject: {subject or '—'}",
+        "",
+        "Message:",
+        message or "—",
+    ]
+    return "\n".join(lines).strip()
+
+
+def _build_support_html(
+    *,
+    account_id: str,
+    account: Optional[Dict[str, Any]],
+    full_name: str,
+    contact_email: str,
+    issue_type: str,
+    priority: str,
+    channel: str,
+    subject: str,
+    message: str,
+    plan_name: str = "",
+    credit_balance: Any = 0,
+    channel_state: str = "",
+) -> str:
+    account = account or {}
+    safe_message = (
+        (message or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("\n", "<br>")
+    )
+
+    def cell(v: Any) -> str:
+        s = str(v or "—")
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    return f"""
+    <div style="font-family:Arial,sans-serif;max-width:760px;margin:auto;color:#111;">
+      <h2 style="margin-bottom:8px;">{cell(_support_from_name())}</h2>
+      <p style="margin-top:0;color:#555;">New support request submitted from the Naija Tax Guide workspace.</p>
+
+      <table style="border-collapse:collapse;width:100%;margin-top:16px;">
+        <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Account ID</td><td style="padding:8px;border:1px solid #ddd;">{cell(account_id)}</td></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Display Name</td><td style="padding:8px;border:1px solid #ddd;">{cell((account.get('display_name') or full_name or '').strip() or '—')}</td></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Account Email</td><td style="padding:8px;border:1px solid #ddd;">{cell(account.get('email'))}</td></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Submitted Contact Email</td><td style="padding:8px;border:1px solid #ddd;">{cell(contact_email)}</td></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Provider</td><td style="padding:8px;border:1px solid #ddd;">{cell(account.get('provider'))}</td></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Provider User ID</td><td style="padding:8px;border:1px solid #ddd;">{cell(account.get('provider_user_id'))}</td></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Issue Type</td><td style="padding:8px;border:1px solid #ddd;">{cell(issue_type)}</td></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Priority</td><td style="padding:8px;border:1px solid #ddd;">{cell(priority)}</td></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Channel</td><td style="padding:8px;border:1px solid #ddd;">{cell(channel)}</td></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Visible Plan</td><td style="padding:8px;border:1px solid #ddd;">{cell(plan_name)}</td></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Visible Credits</td><td style="padding:8px;border:1px solid #ddd;">{cell(credit_balance)}</td></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Visible Channel State</td><td style="padding:8px;border:1px solid #ddd;">{cell(channel_state)}</td></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd;font-weight:bold;">Subject</td><td style="padding:8px;border:1px solid #ddd;">{cell(subject)}</td></tr>
+      </table>
+
+      <div style="margin-top:20px;padding:16px;border:1px solid #ddd;border-radius:8px;background:#fafafa;">
+        <div style="font-weight:bold;margin-bottom:8px;">Message</div>
+        <div style="line-height:1.7;">{safe_message or '—'}</div>
+      </div>
+    </div>
+    """.strip()
+
+
+def _ticket_id() -> str:
+    return f"NTG-{str(uuid.uuid4()).split('-')[0].upper()}"
+
+
+def _insert_ticket(record: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    try:
+        res = (
+            _sb()
+            .table("support_tickets")
+            .insert(record)
+            .execute()
+        )
+        rows = getattr(res, "data", None) or []
+        if rows:
+            return rows[0], None
+        return None, {
+            "error": "ticket_insert_failed",
+            "root_cause": "insert returned no rows",
+        }
+    except Exception as e:
+        return None, {
+            "error": "ticket_insert_failed",
+            "root_cause": f"{type(e).__name__}: {_clip(e)}",
+        }
+
+
+def _latest_ticket_for_account(account_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    try:
+        res = (
+            _sb()
+            .table("support_tickets")
+            .select(
+                "ticket_id,account_id,account_email,account_name,category,priority,subject,message,plan_name,credit_balance,channel_state,status,created_at,updated_at"
+            )
+            .eq("account_id", account_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = getattr(res, "data", None) or []
+        if rows:
+            return rows[0], None
+        return None, None
+    except Exception as e:
+        return None, {
+            "error": "latest_ticket_lookup_failed",
+            "root_cause": f"{type(e).__name__}: {_clip(e)}",
+        }
+
+
+@bp.get("/support/health")
+def support_health():
+    to_email = _support_to_email()
+    return (
+        jsonify(
+            {
+                "ok": True,
+                "route_group": "support",
+                "mail_ready": bool(to_email),
+                "support_to_email": to_email or None,
+            }
+        ),
+        200,
+    )
+
+
+@bp.get("/support/latest")
+def support_latest():
+    account_id, auth_debug = get_account_id_from_request(request)
+    if not account_id:
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "unauthorized",
+                    "debug": auth_debug,
+                }
+            ),
+            401,
+        )
+
+    ticket, lookup_err = _latest_ticket_for_account(account_id)
+    if lookup_err:
+        return _fail(
+            error=lookup_err.get("error") or "latest_ticket_lookup_failed",
+            root_cause=lookup_err.get("root_cause"),
+            status=500,
+        )
+
+    return (
+        jsonify(
+            {
+                "ok": True,
+                "ticket": ticket,
+                "debug": {"auth": auth_debug},
+            }
+        ),
+        200,
+    )
+
+
+@bp.post("/support")
+def submit_support():
+    account_id, auth_debug = get_account_id_from_request(request)
+    if not account_id:
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "unauthorized",
+                    "debug": auth_debug,
+                }
+            ),
+            401,
+        )
+
+    body = _safe_json()
+
+    full_name = (body.get("fullName") or body.get("full_name") or body.get("account_name") or "").strip()
+    contact_email = (body.get("contactEmail") or body.get("contact_email") or body.get("account_email") or "").strip().lower()
+    issue_type = (body.get("issueType") or body.get("issue_type") or body.get("category") or "general").strip().lower()
+    priority = (body.get("priority") or "normal").strip().lower()
+    channel = (body.get("channel") or "web").strip().lower()
+    subject = (body.get("subject") or "").strip()
+    message = (body.get("message") or "").strip()
+    plan_name = (body.get("planName") or body.get("plan_name") or "").strip()
+    credit_balance = body.get("creditBalance") or body.get("credit_balance") or 0
+    channel_state = (body.get("channelState") or body.get("channel_state") or "").strip()
+
+    if not subject:
+        return _fail(
+            error="subject_required",
+            message="Support subject is required.",
+            status=400,
+        )
+
+    if not message:
+        return _fail(
+            error="message_required",
+            message="Support message is required.",
+            status=400,
+        )
+
+    if len(message) < 10:
+        return _fail(
+            error="message_too_short",
+            message="Support message is too short.",
+            extra={"min_length": 10},
+            status=400,
+        )
+
+    account, acct_err = _get_account_row(account_id)
+    if acct_err:
+        return _fail(
+            error=acct_err.get("error") or "account_lookup_failed",
+            root_cause=acct_err.get("root_cause"),
+            extra={"fix": acct_err.get("fix")},
+            status=400,
+        )
+
+    resolved_contact_email = _best_contact_email(account, contact_email)
+    if not resolved_contact_email:
+        return _fail(
+            error="contact_email_required",
+            message="A valid support contact email is required.",
+            root_cause="No valid submitted or account-linked email address was found.",
+            extra={
+                "fix": "Submit contactEmail from the frontend or ensure accounts.email is populated.",
+                "account_id": account_id,
+            },
+            status=400,
+        )
+
+    support_to = _support_to_email()
+    if not support_to:
+        return _fail(
+            error="support_email_not_configured",
+            message="Support inbox is not configured on the backend.",
+            root_cause="SUPPORT_TO_EMAIL / SUPPORT_EMAIL / MAIL_FROM_EMAIL is missing.",
+            extra={
+                "fix": "Set SUPPORT_TO_EMAIL in backend environment variables.",
+            },
+            status=500,
+        )
+
+    final_subject = _build_support_subject(
+        issue_type=issue_type,
+        priority=priority,
+        subject=subject,
+        account_id=account_id,
+    )
+
+    ticket_id = _ticket_id()
+
+    text_body = _build_support_text(
+        account_id=account_id,
+        account=account,
+        full_name=full_name,
+        contact_email=resolved_contact_email,
+        issue_type=issue_type,
+        priority=priority,
+        channel=channel,
+        subject=subject,
+        message=message,
+        plan_name=plan_name,
+        credit_balance=credit_balance,
+        channel_state=channel_state,
+    )
+
+    html_body = _build_support_html(
+        account_id=account_id,
+        account=account,
+        full_name=full_name,
+        contact_email=resolved_contact_email,
+        issue_type=issue_type,
+        priority=priority,
+        channel=channel,
+        subject=subject,
+        message=message,
+        plan_name=plan_name,
+        credit_balance=credit_balance,
+        channel_state=channel_state,
+    )
+
+    ticket_record = {
+        "ticket_id": ticket_id,
+        "account_id": account_id,
+        "account_email": resolved_contact_email,
+        "account_name": (account.get("display_name") or full_name or "").strip() or None,
+        "category": issue_type,
+        "priority": priority,
+        "subject": subject,
+        "message": message,
+        "plan_name": plan_name or None,
+        "credit_balance": int(credit_balance or 0),
+        "channel_state": channel_state or None,
+        "status": "open",
     }
-  }
 
-  useEffect(() => {
-    loadLatestTicket();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [token]);
+    saved_ticket, insert_err = _insert_ticket(ticket_record)
+    if insert_err:
+        return _fail(
+            error=insert_err.get("error") or "ticket_insert_failed",
+            message="Support request could not be stored.",
+            root_cause=insert_err.get("root_cause"),
+            status=500,
+        )
 
-  async function handleSubmit() {
-    if (!token) {
-      setError("You must be logged in before submitting a support request.");
-      return;
-    }
+    mail_res = send_mail(
+        to=support_to,
+        subject=final_subject,
+        text=text_body,
+        html=html_body,
+        reply_to=resolved_contact_email,
+        debug=True,
+    )
 
-    if (!form.subject.trim() || !form.message.trim()) {
-      setError("Please provide both a support subject and a clear description of the issue.");
-      setNotice("");
-      return;
-    }
+    if not mail_res.get("ok"):
+        return _fail(
+            error=mail_res.get("error") or "support_send_failed",
+            message="Support request was stored but email delivery failed.",
+            root_cause=mail_res.get("message") or mail_res.get("root_cause"),
+            extra={
+                "mail_debug": mail_res.get("debug"),
+                "account_id": account_id,
+                "ticket": saved_ticket,
+            },
+            status=502,
+        )
 
-    setSubmitting(true);
-    setNotice("");
-    setError("");
-
-    try {
-      const response = await fetch("/api/web/support", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({
-          fullName: accountName,
-          contactEmail: accountEmail === "Not visible" ? "" : accountEmail,
-          issueType: form.category,
-          priority: form.priority,
-          channel: "web",
-          subject: form.subject.trim(),
-          message: form.message.trim(),
-          planName: planName,
-          creditBalance: creditBalance,
-          channelState: channelState,
-        }),
-      });
-
-      const data = await response.json().catch(() => ({}));
-
-      if (!response.ok || !data?.ok) {
-        throw new Error(data?.message || data?.error || "Support request could not be submitted.");
-      }
-
-      setNotice(
-        `Support request submitted successfully. Ticket ID: ${data?.ticket?.ticket_id || "Not shown"}`
-      );
-
-      setForm({
-        category: "general",
-        priority: "normal",
-        subject: "",
-        message: "",
-      });
-
-      await loadLatestTicket();
-    } catch (err: any) {
-      setError(err?.message || "Support request could not be submitted.");
-    } finally {
-      setSubmitting(false);
-    }
-  }
-
-  function handleClear() {
-    setForm({
-      category: "general",
-      priority: "normal",
-      subject: "",
-      message: "",
-    });
-    setNotice("");
-    setError("");
-  }
-
-  return (
-    <AppShell
-      title="Support"
-      subtitle="Report billing, credits, linking, login, or technical issues from one clear support center."
-      actions={
-        <>
-          <button onClick={() => router.push("/help")} style={shellButtonPrimary()}>
-            Open Help
-          </button>
-          <button onClick={() => router.push("/dashboard")} style={shellButtonSecondary()}>
-            Back to Dashboard
-          </button>
-        </>
-      }
-    >
-      <SectionStack>
-        {primaryAlert ? (
-          <Banner
-            tone={primaryAlert.tone}
-            title={primaryAlert.title}
-            subtitle={primaryAlert.subtitle}
-          />
-        ) : null}
-
-        {notice ? (
-          <Banner tone="good" title="Support request submitted" subtitle={notice} />
-        ) : null}
-
-        {error ? (
-          <Banner tone="danger" title="Support request issue" subtitle={error} />
-        ) : null}
-
-        <WorkspaceSectionCard
-          title="Support center"
-          subtitle="Use this page to submit a clear support request together with the visible account context that may help review it faster."
-        >
-          <div style={pageGridStyle()}>
-            <div style={{ display: "grid", gap: 18 }}>
-              <div style={infoBoxStyle()}>
-                <div style={{ fontSize: 18, fontWeight: 900, color: "var(--text)" }}>
-                  Open a support request
-                </div>
-                <div style={{ color: "var(--text-muted)", lineHeight: 1.7 }}>
-                  Choose the issue type, set the priority, and explain clearly what happened.
-                </div>
-              </div>
-
-              <div style={{ display: "grid", gap: 14 }}>
-                <select
-                  value={form.category}
-                  onChange={(event) => setField("category", event.target.value)}
-                  style={appSelectStyle()}
-                >
-                  <option value="general">Issue type: General support</option>
-                  <option value="billing">Issue type: Billing or subscription</option>
-                  <option value="credits">Issue type: Credits or access</option>
-                  <option value="channels">Issue type: WhatsApp or Telegram linking</option>
-                  <option value="login">Issue type: Login or authentication</option>
-                  <option value="technical">Issue type: Technical issue</option>
-                </select>
-
-                <select
-                  value={form.priority}
-                  onChange={(event) => setField("priority", event.target.value)}
-                  style={appSelectStyle()}
-                >
-                  <option value="normal">Priority: Normal</option>
-                  <option value="high">Priority: High</option>
-                  <option value="urgent">Priority: Urgent</option>
-                </select>
-
-                <input
-                  value={form.subject}
-                  onChange={(event) => setField("subject", event.target.value)}
-                  placeholder="Support subject"
-                  style={appInputStyle()}
-                />
-
-                <textarea
-                  value={form.message}
-                  onChange={(event) => setField("message", event.target.value)}
-                  placeholder="Describe the issue clearly. Include what happened, what you expected, and what you already checked."
-                  rows={9}
-                  style={appTextareaStyle()}
-                />
-
-                <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
-                  <button
-                    onClick={handleSubmit}
-                    disabled={submitting}
-                    style={{
-                      ...shellButtonPrimary(),
-                      opacity: submitting ? 0.7 : 1,
-                      cursor: submitting ? "not-allowed" : "pointer",
-                    }}
-                  >
-                    {submitting ? "Submitting..." : "Submit Support Request"}
-                  </button>
-
-                  <button onClick={handleClear} style={shellButtonSecondary()}>
-                    Clear Form
-                  </button>
-                </div>
-              </div>
-            </div>
-
-            <div style={{ display: "grid", gap: 18 }}>
-              <div style={infoBoxStyle()}>
-                <div style={{ fontSize: 18, fontWeight: 900, color: "var(--text)" }}>
-                  Visible account context
-                </div>
-                <div style={{ color: "var(--text-muted)", lineHeight: 1.7 }}>
-                  This summary helps support understand the likely source of the issue without needing unrelated dashboard details.
-                </div>
-              </div>
-
-              <CardsGrid min={220}>
-                <MetricCard
-                  label="Account Email"
-                  value={accountEmail}
-                  helper="Visible email currently associated with the workspace."
-                />
-                <MetricCard
-                  label="Current Plan"
-                  value={planName}
-                  tone={activeNow ? "good" : "warn"}
-                  helper={`Status: ${planStatus}`}
-                />
-                <MetricCard
-                  label="Credits"
-                  value={String(creditBalance)}
-                  tone={creditBalance > 0 ? "good" : "warn"}
-                  helper="Visible AI credit balance at the time of review."
-                />
-                <MetricCard
-                  label="Channel State"
-                  value={channelState}
-                  helper="Visible WhatsApp and Telegram linking state."
-                />
-              </CardsGrid>
-
-              <div style={infoBoxStyle()}>
-                <div style={{ fontSize: 18, fontWeight: 900, color: "var(--text)" }}>
-                  Latest ticket
-                </div>
-                <div style={{ color: "var(--text-muted)", lineHeight: 1.7 }}>
-                  The most recent support request saved for this account.
-                </div>
-              </div>
-
-              {loadingLatest ? (
-                <Banner tone="default" title="Loading latest ticket" subtitle="Please wait..." />
-              ) : latestTicket ? (
-                <CardsGrid min={220}>
-                  <MetricCard
-                    label="Ticket ID"
-                    value={latestTicket.ticket_id}
-                    helper="Latest saved support ticket reference."
-                  />
-                  <MetricCard
-                    label="Status"
-                    value={latestTicket.status}
-                    tone={latestTicket.status.toLowerCase() === "open" ? "warn" : "good"}
-                    helper="Current saved support request state."
-                  />
-                  <MetricCard
-                    label="Last Updated"
-                    value={latestTicket.updated_at ? formatDate(latestTicket.updated_at) : "Not shown"}
-                    helper="Latest saved update time."
-                  />
-                  <MetricCard
-                    label="Issue Type"
-                    value={latestTicket.category}
-                    helper="Category attached to the latest saved request."
-                  />
-                </CardsGrid>
-              ) : (
-                <Banner
-                  tone="default"
-                  title="No ticket yet"
-                  subtitle="Your latest saved support ticket will appear here after submission."
-                />
-              )}
-            </div>
-          </div>
-        </WorkspaceSectionCard>
-
-        <WorkspaceSectionCard
-          title="Before submitting"
-          subtitle="Only the most relevant checks before you open a support request."
-        >
-          <div
-            style={{
-              display: "grid",
-              gap: 12,
-              color: "var(--text)",
-              fontSize: 15,
-              lineHeight: 1.8,
-            }}
-          >
-            <div style={infoBoxStyle()}>
-              Check Billing if the issue is about subscription status, renewal, or plan access.
-            </div>
-            <div style={infoBoxStyle()}>
-              Check Credits if the assistant stops answering or access feels unexpectedly limited.
-            </div>
-            <div style={infoBoxStyle()}>
-              Check Channels if the issue involves WhatsApp or Telegram linking behavior.
-            </div>
-            <div style={infoBoxStyle()}>
-              Use Help first if you are unsure whether the issue is billing, credits, channels, or normal app behavior.
-            </div>
-          </div>
-        </WorkspaceSectionCard>
-      </SectionStack>
-    </AppShell>
-  );
-}
-
+    return (
+        jsonify(
+            {
+                "ok": True,
+                "message": "Support request submitted successfully.",
+                "account_id": account_id,
+                "ticket": saved_ticket,
+                "delivery": {
+                    "to": support_to,
+                    "reply_to": resolved_contact_email,
+                    "provider": mail_res.get("provider"),
+                    "mode": mail_res.get("mode"),
+                },
+                "debug": {
+                    "auth": auth_debug,
+                },
+            }
+        ),
+        200,
+    )
