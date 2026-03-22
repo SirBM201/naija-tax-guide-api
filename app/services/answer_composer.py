@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -17,11 +18,76 @@ class AskExecutionResult:
     error: Optional[str] = None
 
 
+_INTERNAL_PATTERNS = [
+    r"(?im)^grounded basis:.*?$",
+    r"(?im)^grounding context:.*?$",
+    r"(?im)^grounding summary:.*?$",
+    r"(?im)^strict rules:.*?$",
+    r"(?im)^question classification:.*?$",
+    r"(?im)^candidate\s+\d+:.*?$",
+    r"(?im)^evidence:.*?$",
+    r"(?im)^debug:.*?$",
+    r"(?im)^system prompt:.*?$",
+    r"(?im)^prompt:.*?$",
+    r"(?im)^match_type:.*?$",
+    r"(?im)^similarity:.*?$",
+    r"(?im)^trust_score:.*?$",
+    r"(?im)^authority_score:.*?$",
+    r"(?im)^source_authority_score:.*?$",
+    r"(?im)^rank_score:.*?$",
+    r"(?im)^review_status:.*?$",
+    r"(?im)^topic:.*?$",
+    r"(?im)^intent_type:.*?$",
+    r"(?im)^jurisdiction:.*?$",
+    r"(?im)^complexity:.*?$",
+    r"(?im)^risk_level:.*?$",
+    r"(?im)^source id:.*?$",
+    r"(?im)^source title:.*?$",
+    r"(?im)^chunk id:.*?$",
+]
+
+_PROVIDER_ERROR_PATTERNS = [
+    r"incorrect api key provided",
+    r"invalid_api_key",
+    r"openai",
+    r"sk-proj-",
+    r"status:\s*401",
+    r"error code:\s*401",
+    r"invalid_request_error",
+    r"api key",
+]
+
+_GENERIC_BAD_RESPONSE_PATTERNS = [
+    r"ai temporarily unavailable",
+    r"no evidence provided",
+    r"you are answering as",
+    r"based on the strongest available",
+    r"best supported answer",
+]
+
+
 def _safe_str(value: Any) -> str:
     return str(value or "").strip()
 
 
-def _candidate_meta(candidate: RetrievalCandidate) -> Dict[str, Any]:
+def _candidate_meta(candidate: Any) -> Dict[str, Any]:
+    if isinstance(candidate, dict):
+        return {
+            "candidate_id": candidate.get("candidate_id"),
+            "canonical_key": candidate.get("canonical_key"),
+            "topic": candidate.get("topic"),
+            "intent_type": candidate.get("intent_type"),
+            "jurisdiction": candidate.get("jurisdiction"),
+            "lang": candidate.get("lang"),
+            "trust_score": candidate.get("trust_score"),
+            "source_authority_score": candidate.get("source_authority_score"),
+            "similarity": candidate.get("similarity"),
+            "match_type": candidate.get("match_type"),
+            "rank_score": candidate.get("rank_score"),
+            "review_status": candidate.get("review_status"),
+            "source_title": candidate.get("source_title"),
+        }
+
     return {
         "candidate_id": candidate.candidate_id,
         "canonical_key": candidate.canonical_key,
@@ -42,31 +108,27 @@ def _clean_lines(text: str) -> List[str]:
     raw = _safe_str(text)
     if not raw:
         return []
+
     lines = [ln.rstrip() for ln in raw.splitlines()]
     cleaned: List[str] = []
     blank_streak = 0
+
     for line in lines:
         if not line.strip():
             blank_streak += 1
             if blank_streak <= 1:
                 cleaned.append("")
             continue
+
         blank_streak = 0
         cleaned.append(line.strip())
+
     while cleaned and not cleaned[0]:
         cleaned.pop(0)
     while cleaned and not cleaned[-1]:
         cleaned.pop()
+
     return cleaned
-
-
-def _extract_source_tail(lines: List[str]) -> tuple[List[str], Optional[str]]:
-    if not lines:
-        return lines, None
-    last = lines[-1].strip()
-    if last.lower().startswith("source:"):
-        return lines[:-1], last
-    return lines, None
 
 
 def _ensure_sentence(text: str) -> str:
@@ -78,134 +140,268 @@ def _ensure_sentence(text: str) -> str:
     return text + "."
 
 
+def _extract_source_tail(lines: List[str]) -> tuple[List[str], Optional[str]]:
+    if not lines:
+        return lines, None
+
+    last = lines[-1].strip()
+    if last.lower().startswith("source:"):
+        return lines[:-1], last
+
+    return lines, None
+
+
+def _sanitize_answer_text(text: str) -> str:
+    cleaned = _safe_str(text)
+    if not cleaned:
+        return ""
+
+    for pattern in _INTERNAL_PATTERNS:
+        cleaned = re.sub(pattern, "", cleaned)
+
+    lines = _clean_lines(cleaned)
+    filtered: List[str] = []
+
+    for line in lines:
+        lower = line.strip().lower()
+
+        if any(marker in lower for marker in _PROVIDER_ERROR_PATTERNS):
+            continue
+
+        if any(marker in lower for marker in _GENERIC_BAD_RESPONSE_PATTERNS):
+            continue
+
+        if lower.startswith("- ") and any(
+            bad in lower
+            for bad in [
+                "topic:",
+                "intent_type:",
+                "jurisdiction:",
+                "trust_score:",
+                "similarity:",
+                "match_type:",
+                "authority_score:",
+                "review_status:",
+                "grounded:",
+                "grounding_mode:",
+                "confidence:",
+            ]
+        ):
+            continue
+
+        filtered.append(line)
+
+    return "\n".join(_clean_lines("\n".join(filtered))).strip()
+
+
+def looks_like_internal_or_broken_answer(text: str) -> bool:
+    raw = _safe_str(text).lower()
+    if not raw:
+        return True
+
+    bad_signals = [
+        "candidate 1",
+        "candidate 2",
+        "candidate 3",
+        "grounded basis",
+        "grounding context",
+        "grounding summary",
+        "strict rules",
+        "question classification",
+        "trust_score",
+        "similarity",
+        "match_type",
+        "invalid_api_key",
+        "incorrect api key provided",
+        "sk-proj-",
+        "you are answering as",
+        "no evidence provided",
+    ]
+
+    return any(signal in raw for signal in bad_signals)
+
+
 def _split_intro_and_steps(lines: List[str]) -> tuple[List[str], List[str]]:
     intro: List[str] = []
     steps: List[str] = []
+
     for line in lines:
         stripped = line.strip()
-        if stripped[:2].isdigit() or stripped.startswith(("1.", "2.", "3.", "4.", "5.", "6.", "7.", "8.", "9.")):
+        if re.match(r"^\d+[.)]\s+", stripped):
+            steps.append(stripped)
+        elif steps and stripped:
             steps.append(stripped)
         else:
-            if steps:
-                steps.append(stripped)
-            else:
-                intro.append(stripped)
+            intro.append(stripped)
+
     return intro, steps
 
 
 def _format_definition(text: str) -> str:
-    lines = _clean_lines(text)
+    lines = _clean_lines(_sanitize_answer_text(text))
     lines, source_tail = _extract_source_tail(lines)
+
     if not lines:
-        return "I could not find a reliable definition for that yet."
+        return "I do not yet have enough reliable guidance in the system to define that properly."
 
     first = _ensure_sentence(lines[0])
     rest = [ln for ln in lines[1:] if ln]
 
-    parts = [f"Direct answer: {first}"]
+    parts = [first]
     if rest:
-        parts.append("Explanation:\n" + "\n".join(rest))
+        parts.append("\n".join(rest))
     if source_tail:
         parts.append(source_tail)
-    return "\n\n".join(parts)
+
+    return "\n\n".join(parts).strip()
 
 
 def _format_procedure(text: str) -> str:
-    lines = _clean_lines(text)
+    lines = _clean_lines(_sanitize_answer_text(text))
     lines, source_tail = _extract_source_tail(lines)
-    intro, steps = _split_intro_and_steps(lines)
 
+    if not lines:
+        return "I do not yet have enough reliable guidance in the system to give the correct procedure."
+
+    intro, steps = _split_intro_and_steps(lines)
     parts: List[str] = []
+
     if intro:
-        parts.append("Direct answer:\n" + "\n".join(intro[:2]))
+        parts.append("\n".join(intro[:2]))
+
     if steps:
         parts.append("Steps:\n" + "\n".join(steps))
-    elif lines:
-        parts.append("Steps:\n1. " + "\n".join(lines))
+    elif len(lines) > 1:
+        numbered = [f"{i+1}. {line}" for i, line in enumerate(lines[1:])]
+        parts = [_ensure_sentence(lines[0]), "Steps:\n" + "\n".join(numbered)]
+    else:
+        parts = [_ensure_sentence(lines[0])]
+
     if source_tail:
         parts.append(source_tail)
+
     return "\n\n".join(parts).strip()
 
 
 def _format_obligation(text: str) -> str:
-    lines = _clean_lines(text)
+    lines = _clean_lines(_sanitize_answer_text(text))
     lines, source_tail = _extract_source_tail(lines)
+
     if not lines:
-        return "I need a little more detail to confirm whether it applies to you."
+        return "I need a little more detail before I can confirm whether this applies."
 
     decision = _ensure_sentence(lines[0])
     rest = [ln for ln in lines[1:] if ln]
-    parts = [f"Short answer: {decision}"]
+
+    parts = [decision]
     if rest:
-        parts.append("Why this applies:\n" + "\n".join(rest))
+        parts.append("\n".join(rest))
     if source_tail:
         parts.append(source_tail)
-    return "\n\n".join(parts)
+
+    return "\n\n".join(parts).strip()
 
 
 def _format_calculation(text: str) -> str:
-    lines = _clean_lines(text)
+    lines = _clean_lines(_sanitize_answer_text(text))
     lines, source_tail = _extract_source_tail(lines)
+
     if not lines:
-        return "I could not confirm the exact rate, deadline, or penalty from reliable material."
+        return "I do not yet have enough reliable guidance in the system to confirm the exact rate, deadline, or penalty."
+
     lead = _ensure_sentence(lines[0])
     rest = [ln for ln in lines[1:] if ln]
-    parts = [f"Direct answer: {lead}"]
+
+    parts = [lead]
     if rest:
-        parts.append("Basis:\n" + "\n".join(rest))
+        parts.append("\n".join(rest))
     if source_tail:
         parts.append(source_tail)
-    return "\n\n".join(parts)
+
+    return "\n\n".join(parts).strip()
 
 
 def _format_deduction(text: str) -> str:
-    lines = _clean_lines(text)
+    lines = _clean_lines(_sanitize_answer_text(text))
     lines, source_tail = _extract_source_tail(lines)
+
     if not lines:
-        return "I need a little more detail about the expense before I can answer safely."
+        return "I need a little more detail about that expense before I can answer safely."
+
     lead = _ensure_sentence(lines[0])
     rest = [ln for ln in lines[1:] if ln]
-    parts = [f"Short answer: {lead}"]
+
+    parts = [lead]
     if rest:
-        parts.append("Conditions and notes:\n" + "\n".join(rest))
+        parts.append("\n".join(rest))
     if source_tail:
         parts.append(source_tail)
-    return "\n\n".join(parts)
+
+    return "\n\n".join(parts).strip()
 
 
 def _format_general(text: str) -> str:
-    lines = _clean_lines(text)
+    cleaned = _sanitize_answer_text(text)
+    lines = _clean_lines(cleaned)
+
     if not lines:
-        return "I could not prepare a reliable answer yet."
-    return "\n".join(lines)
+        return "I do not yet have enough reliable guidance in the system to answer that accurately."
+
+    lines, source_tail = _extract_source_tail(lines)
+    first = _ensure_sentence(lines[0])
+    rest = [ln for ln in lines[1:] if ln]
+
+    parts = [first]
+    if rest:
+        parts.append("\n".join(rest))
+    if source_tail:
+        parts.append(source_tail)
+
+    return "\n\n".join(parts).strip()
 
 
 def render_answer(answer_text: str, *, question_meta: Optional[Dict[str, Any]] = None) -> str:
     intent_type = _safe_str((question_meta or {}).get("intent_type")).lower()
+    topic = _safe_str((question_meta or {}).get("topic")).lower()
+    sanitized = _sanitize_answer_text(answer_text)
+
+    if looks_like_internal_or_broken_answer(sanitized):
+        return "I do not yet have enough reliable guidance in the system to answer that accurately."
 
     if intent_type == "definition":
-        return _format_definition(answer_text)
+        return _format_definition(sanitized)
+
     if intent_type in {"procedure", "how_to"}:
-        return _format_procedure(answer_text)
-    if intent_type == "obligation":
-        return _format_obligation(answer_text)
+        return _format_procedure(sanitized)
+
+    if intent_type in {"obligation", "eligibility"}:
+        return _format_obligation(sanitized)
+
     if intent_type == "calculation":
-        return _format_calculation(answer_text)
+        return _format_calculation(sanitized)
+
     if intent_type == "deduction":
-        return _format_deduction(answer_text)
-    return _format_general(answer_text)
+        return _format_deduction(sanitized)
+
+    if topic in {"penalty", "rate", "deadline"}:
+        return _format_calculation(sanitized)
+
+    return _format_general(sanitized)
 
 
 def compose_direct_cache_answer(
-    candidate: RetrievalCandidate,
+    candidate: Any,
     *,
     answer_text: Optional[str] = None,
     debug: Optional[Dict[str, Any]] = None,
     question_meta: Optional[Dict[str, Any]] = None,
 ) -> AskExecutionResult:
+    raw_answer = _safe_str(answer_text or (candidate.get("answer") if isinstance(candidate, dict) else candidate.answer))
+    rendered = render_answer(raw_answer, question_meta=question_meta)
+
     return AskExecutionResult(
         ok=True,
-        answer=render_answer(_safe_str(answer_text or candidate.answer), question_meta=question_meta),
+        answer=rendered,
         source="cache",
         needs_credit=False,
         debug=debug or {},
@@ -223,9 +419,11 @@ def compose_ai_answer(
     debug: Optional[Dict[str, Any]] = None,
     question_meta: Optional[Dict[str, Any]] = None,
 ) -> AskExecutionResult:
+    rendered = render_answer(_safe_str(answer_text), question_meta=question_meta)
+
     return AskExecutionResult(
         ok=True,
-        answer=render_answer(_safe_str(answer_text), question_meta=question_meta),
+        answer=rendered,
         source="ai",
         needs_credit=False,
         debug=debug or {},
@@ -286,9 +484,11 @@ def compose_rules_engine_answer(
     debug: Optional[Dict[str, Any]] = None,
     question_meta: Optional[Dict[str, Any]] = None,
 ) -> AskExecutionResult:
+    rendered = render_answer(_safe_str(answer_text), question_meta=question_meta)
+
     return AskExecutionResult(
         ok=True,
-        answer=render_answer(_safe_str(answer_text), question_meta=question_meta),
+        answer=rendered,
         source="rules_engine",
         needs_credit=False,
         debug=debug or {},
