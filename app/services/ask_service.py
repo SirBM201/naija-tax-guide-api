@@ -45,6 +45,30 @@ CHANNEL_ALIASES = {
     "chat": "web_chat",
 }
 
+TOPIC_ALIASES = {
+    "vat": {"vat", "value_added_tax", "value added tax"},
+    "value_added_tax": {"vat", "value_added_tax", "value added tax"},
+    "paye": {"paye", "personal_income_tax", "personal income tax", "pay as you earn"},
+    "personal_income_tax": {"paye", "personal_income_tax", "personal income tax", "pay as you earn"},
+    "withholding_tax": {"withholding_tax", "withholding tax", "wht"},
+    "company_income_tax": {"company_income_tax", "company income tax", "cit"},
+    "freelancer": {"freelancer", "self_employed", "self employed", "sole proprietor"},
+    "self_employed": {"freelancer", "self_employed", "self employed", "sole proprietor"},
+}
+
+INTENT_ALIASES = {
+    "guidance": {"guidance", "general", "obligation", "compliance"},
+    "obligation": {"guidance", "general", "obligation", "compliance"},
+    "general": {"guidance", "general", "obligation"},
+    "definition": {"definition", "general"},
+    "rate": {"rate", "definition", "general"},
+    "procedure": {"procedure", "how_to", "how to", "filing", "registration"},
+    "how_to": {"procedure", "how_to", "how to", "filing", "registration"},
+    "calculation": {"calculation", "computation"},
+    "computation": {"calculation", "computation"},
+    "exemption": {"exemption", "definition", "guidance"},
+}
+
 
 def _truthy(v: str | None) -> bool:
     return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
@@ -67,11 +91,11 @@ def _tax_kb_enabled() -> bool:
 
 
 def _tax_kb_direct_threshold() -> int:
-    return _env_int("TAX_KB_DIRECT_THRESHOLD", 60)
+    return _env_int("TAX_KB_DIRECT_THRESHOLD", 45)
 
 
 def _tax_kb_result_limit() -> int:
-    return _env_int("TAX_KB_RESULT_LIMIT", 3)
+    return _env_int("TAX_KB_RESULT_LIMIT", 5)
 
 
 def _sb():
@@ -116,15 +140,59 @@ def _candidate_to_dict(c) -> Dict[str, Any]:
     }
 
 
-def _classification_to_meta(classification) -> Dict[str, Any]:
+def _infer_topic_from_question(question: str, fallback: str = "general") -> str:
+    q = _normalize_text(question)
+
+    if any(x in q for x in ["vat", "value added tax", "value_added_tax"]):
+        return "vat"
+    if any(x in q for x in ["paye", "pay as you earn", "personal income tax"]):
+        return "paye"
+    if any(x in q for x in ["withholding tax", "wht"]):
+        return "withholding_tax"
+    if any(x in q for x in ["company income tax", "cit"]):
+        return "company_income_tax"
+    if any(x in q for x in ["freelancer", "self employed", "sole proprietor"]):
+        return "freelancer"
+
+    return str(fallback or "general").strip().lower()
+
+
+def _infer_intent_from_question(question: str, fallback: str = "general") -> str:
+    q = _normalize_text(question)
+
+    if q.startswith("what is ") or q.startswith("define "):
+        return "definition"
+    if q.startswith("how do i ") or q.startswith("how to ") or "process" in q or "procedure" in q:
+        return "procedure"
+    if any(x in q for x in ["rate", "percentage"]):
+        return "rate"
+    if any(x in q for x in ["exempt", "exemption", "zero rated", "zero rated"]):
+        return "exemption"
+    if any(x in q for x in ["calculate", "computation", "compute"]):
+        return "calculation"
+    if any(x in q for x in ["do i need", "must i", "am i required", "should i charge"]):
+        return "obligation"
+
+    return str(fallback or "general").strip().lower()
+
+
+def _classification_to_meta(classification, question: str = "") -> Dict[str, Any]:
+    raw_topic = str(getattr(classification, "topic", "") or "").strip().lower()
+    raw_intent = str(getattr(classification, "intent_type", "") or "").strip().lower()
+
+    normalized_topic = _infer_topic_from_question(question, raw_topic or "general")
+    normalized_intent = _infer_intent_from_question(question, raw_intent or "general")
+
     return {
-        "topic": classification.topic,
-        "intent_type": classification.intent_type,
-        "jurisdiction": classification.jurisdiction or "nigeria",
+        "topic": normalized_topic,
+        "intent_type": normalized_intent,
+        "jurisdiction": (classification.jurisdiction or "nigeria"),
         "complexity": classification.complexity,
         "risk_level": classification.risk_level,
         "normalized_question": classification.normalized_question,
         "canonical_key": classification.canonical_key,
+        "classifier_topic": raw_topic,
+        "classifier_intent_type": raw_intent,
     }
 
 
@@ -144,27 +212,49 @@ def _filtered_debug(debug: Dict[str, Any]) -> Dict[str, Any]:
     return {}
 
 
-def _topic_matches(classification, row: Dict[str, Any]) -> bool:
+def _topic_matches(question_meta: Dict[str, Any], row: Dict[str, Any], question: str) -> bool:
     row_topic = str(row.get("topic") or "").strip().lower()
-    cls_topic = str(classification.topic or "").strip().lower()
-    return bool(row_topic and cls_topic and row_topic == cls_topic)
+    meta_topic = str(question_meta.get("topic") or "").strip().lower()
+    inferred_topic = _infer_topic_from_question(question, meta_topic or "general")
+
+    if not row_topic:
+        return False
+
+    if row_topic == meta_topic or row_topic == inferred_topic:
+        return True
+
+    row_aliases = TOPIC_ALIASES.get(row_topic, {row_topic})
+    meta_aliases = TOPIC_ALIASES.get(meta_topic, {meta_topic}) | TOPIC_ALIASES.get(inferred_topic, {inferred_topic})
+
+    return bool(row_aliases.intersection(meta_aliases))
 
 
-def _intent_matches(classification, row: Dict[str, Any]) -> bool:
+def _intent_matches(question_meta: Dict[str, Any], row: Dict[str, Any], question: str) -> bool:
     row_intent = str(row.get("intent_type") or "").strip().lower()
-    cls_intent = str(classification.intent_type or "").strip().lower()
-    return bool(row_intent and cls_intent and row_intent == cls_intent)
+    meta_intent = str(question_meta.get("intent_type") or "").strip().lower()
+    inferred_intent = _infer_intent_from_question(question, meta_intent or "general")
+
+    if not row_intent:
+        return False
+
+    if row_intent == meta_intent or row_intent == inferred_intent:
+        return True
+
+    row_aliases = INTENT_ALIASES.get(row_intent, {row_intent})
+    meta_aliases = INTENT_ALIASES.get(meta_intent, {meta_intent}) | INTENT_ALIASES.get(inferred_intent, {inferred_intent})
+
+    return bool(row_aliases.intersection(meta_aliases))
 
 
-def _jurisdiction_matches(classification, row: Dict[str, Any]) -> bool:
+def _jurisdiction_matches(question_meta: Dict[str, Any], row: Dict[str, Any]) -> bool:
     row_j = str(row.get("jurisdiction") or "").strip().lower()
-    cls_j = str(classification.jurisdiction or "nigeria").strip().lower()
+    meta_j = str(question_meta.get("jurisdiction") or "nigeria").strip().lower()
     if not row_j:
         return True
-    return row_j == cls_j
+    return row_j == meta_j
 
 
-def _score_tax_chunk(question: str, classification, row: Dict[str, Any]) -> Dict[str, Any]:
+def _score_tax_chunk(question: str, question_meta: Dict[str, Any], row: Dict[str, Any]) -> Dict[str, Any]:
     score = 0
     reasons: List[str] = []
 
@@ -185,6 +275,7 @@ def _score_tax_chunk(question: str, classification, row: Dict[str, Any]) -> Dict
     searchable_text = " ".join(
         [
             str(row.get("topic") or ""),
+            str(row.get("subtopic") or ""),
             str(row.get("intent_type") or ""),
             summary,
             text_content,
@@ -194,28 +285,29 @@ def _score_tax_chunk(question: str, classification, row: Dict[str, Any]) -> Dict
     normalized_searchable = _normalize_text(searchable_text)
     searchable_tokens = set(_tokenize(searchable_text))
 
-    if _topic_matches(classification, row):
-        score += 35
-        reasons.append("topic_match:+35")
+    if _topic_matches(question_meta, row, question):
+        score += 40
+        reasons.append("topic_match:+40")
 
-    if _intent_matches(classification, row):
-        score += 18
-        reasons.append("intent_match:+18")
+    if _intent_matches(question_meta, row, question):
+        score += 15
+        reasons.append("intent_match:+15")
 
-    if _jurisdiction_matches(classification, row):
-        reasons.append("jurisdiction_ok")
+    if _jurisdiction_matches(question_meta, row):
+        score += 5
+        reasons.append("jurisdiction_match:+5")
 
     summary_norm = _normalize_text(summary)
     if summary_norm:
         if summary_norm in normalized_question or normalized_question in summary_norm:
-            score += 20
-            reasons.append("summary_match:+20")
+            score += 18
+            reasons.append("summary_phrase_match:+18")
         else:
             summary_tokens = set(_tokenize(summary))
             overlap = len(q_tokens.intersection(summary_tokens))
             if overlap >= 2:
-                score += 20
-                reasons.append("summary_overlap:+20")
+                score += min(15, overlap * 4)
+                reasons.append(f"summary_overlap:+{min(15, overlap * 4)}")
 
     keyword_hits = 0
     for kw in keywords:
@@ -223,18 +315,36 @@ def _score_tax_chunk(question: str, classification, row: Dict[str, Any]) -> Dict
         if kw_norm and kw_norm in normalized_question:
             keyword_hits += 1
     if keyword_hits > 0:
-        score += 8
-        reasons.append(f"keyword_match:+8 ({keyword_hits} hits)")
+        bonus = min(15, keyword_hits * 5)
+        score += bonus
+        reasons.append(f"keyword_match:+{bonus}")
 
     overlap_tokens = len(q_tokens.intersection(searchable_tokens))
     if overlap_tokens > 0:
-        overlap_bonus = min(overlap_tokens * 3, 15)
+        overlap_bonus = min(overlap_tokens * 3, 18)
         score += overlap_bonus
         reasons.append(f"token_overlap:+{overlap_bonus}")
 
     if normalized_question and normalized_question in normalized_searchable:
+        score += 8
+        reasons.append("full_phrase_hit:+8")
+
+    source_priority = row.get("source_priority")
+    try:
+        source_priority = int(source_priority) if source_priority is not None else 100
+    except Exception:
+        source_priority = 100
+
+    if source_priority <= 10:
         score += 6
-        reasons.append("phrase_hit:+6")
+        reasons.append("high_priority_source:+6")
+    elif source_priority <= 25:
+        score += 3
+        reasons.append("good_priority_source:+3")
+
+    if bool(row.get("is_current", True)):
+        score += 4
+        reasons.append("is_current:+4")
 
     score = min(score, 100)
 
@@ -245,14 +355,18 @@ def _score_tax_chunk(question: str, classification, row: Dict[str, Any]) -> Dict
     }
 
 
-def _fetch_tax_kb_rows(limit: int = 200) -> List[Dict[str, Any]]:
+def _fetch_tax_kb_rows(limit: int = 300) -> List[Dict[str, Any]]:
     try:
         client = _sb()
         response = (
             client.table("tax_source_chunks")
             .select(
-                "chunk_id, source_id, topic, intent_type, jurisdiction, text_content, summary, keywords"
+                "chunk_id, source_id, topic, subtopic, intent_type, risk_level, jurisdiction, "
+                "text_content, summary, keywords, approved, effective_from, effective_to, "
+                "law_version, is_current, source_priority"
             )
+            .eq("approved", True)
+            .order("source_priority", desc=False)
             .limit(limit)
             .execute()
         )
@@ -278,7 +392,7 @@ def _fetch_source_titles() -> Dict[str, str]:
         return {}
 
 
-def _retrieve_tax_knowledge_matches(question: str, classification) -> List[Dict[str, Any]]:
+def _retrieve_tax_knowledge_matches(question: str, question_meta: Dict[str, Any]) -> List[Dict[str, Any]]:
     if not _tax_kb_enabled():
         return []
 
@@ -290,10 +404,10 @@ def _retrieve_tax_knowledge_matches(question: str, classification) -> List[Dict[
     scored: List[Dict[str, Any]] = []
 
     for row in rows:
-        if not _jurisdiction_matches(classification, row):
+        if not _jurisdiction_matches(question_meta, row):
             continue
 
-        score_info = _score_tax_chunk(question, classification, row)
+        score_info = _score_tax_chunk(question, question_meta, row)
         if score_info["score"] <= 0:
             continue
 
@@ -305,11 +419,17 @@ def _retrieve_tax_knowledge_matches(question: str, classification) -> List[Dict[
                 str(row.get("source_id") or "Official Tax Source"),
             ),
             "topic": row.get("topic"),
+            "subtopic": row.get("subtopic"),
             "intent_type": row.get("intent_type"),
             "jurisdiction": row.get("jurisdiction") or "nigeria",
             "text_content": row.get("text_content") or "",
             "summary": row.get("summary") or "",
             "keywords": row.get("keywords") or [],
+            "effective_from": row.get("effective_from"),
+            "effective_to": row.get("effective_to"),
+            "law_version": row.get("law_version"),
+            "is_current": row.get("is_current", True),
+            "source_priority": row.get("source_priority", 100),
             "score": score_info["score"],
             "score_reasons": score_info["reasons"],
             "matched_keywords": score_info["matched_keywords"],
@@ -317,7 +437,14 @@ def _retrieve_tax_knowledge_matches(question: str, classification) -> List[Dict[
         }
         scored.append(enriched)
 
-    scored.sort(key=lambda x: x["score"], reverse=True)
+    scored.sort(
+        key=lambda x: (
+            int(x.get("score") or 0),
+            1 if bool(x.get("is_current", True)) else 0,
+            -int(x.get("source_priority") or 100),
+        ),
+        reverse=True,
+    )
     return scored[: _tax_kb_result_limit()]
 
 
@@ -374,7 +501,10 @@ def _build_tax_grounding_context(
         lines.append(f"Source Title: {match.get('source_title')}")
         lines.append(f"Chunk ID: {match.get('chunk_id')}")
         lines.append(f"Topic: {match.get('topic')}")
+        lines.append(f"Subtopic: {match.get('subtopic')}")
         lines.append(f"Intent: {match.get('intent_type')}")
+        lines.append(f"Law Version: {match.get('law_version')}")
+        lines.append(f"Effective From: {match.get('effective_from')}")
         lines.append(f"Summary: {match.get('summary')}")
         lines.append(f"Text: {match.get('text_content')}")
         lines.append("")
@@ -512,7 +642,7 @@ def _is_standalone_mode(channel: str) -> bool:
     return channel in {"telegram", "whatsapp"}
 
 
-def _is_generic_process_question(question: str, classification) -> bool:
+def _is_generic_process_question(question: str, question_meta: Dict[str, Any]) -> bool:
     q = _normalize_text(question)
     if not q:
         return False
@@ -553,7 +683,7 @@ def _is_generic_process_question(question: str, classification) -> bool:
     starts_like_process = any(q.startswith(x) for x in strong_starts)
     tokens = set(_tokenize(q))
     token_signal = bool(tokens.intersection(process_verbs)) and bool(tokens.intersection(process_nouns))
-    intent_signal = str(getattr(classification, "intent_type", "") or "").strip().lower() == "procedure"
+    intent_signal = str(question_meta.get("intent_type") or "").strip().lower() == "procedure"
 
     return starts_like_process or (intent_signal and token_signal)
 
@@ -648,19 +778,20 @@ def ask_guarded(*args: Any, **kwargs: Any) -> Dict[str, Any]:
         }
 
     classification = classify_query(question, lang=lang)
-    question_meta = _classification_to_meta(classification)
+    question_meta = _classification_to_meta(classification, question=question)
 
     usage_state = get_ai_usage_state(account_id)
     billing_state = get_billing_state(account_id)
     credits_available = bool(usage_state.get("has_ai_credit"))
     standalone_mode = _is_standalone_mode(channel)
-    generic_process_question = _is_generic_process_question(question, classification)
+    generic_process_question = _is_generic_process_question(question, question_meta)
 
     debug: Dict[str, Any] = {
         "channel": channel,
         "standalone_mode": standalone_mode,
         "generic_process_question": generic_process_question,
         "classification": classification.__dict__,
+        "question_meta": question_meta,
         "billing_state": billing_state,
         "usage_state": usage_state,
     }
@@ -681,11 +812,11 @@ def ask_guarded(*args: Any, **kwargs: Any) -> Dict[str, Any]:
     }
     debug["ranked_candidates"] = ranked_debug_dump(temp_ranked[:5])
 
-    if temp_decision.mode == "clarification":
+    if classification.requires_clarification:
         res = compose_clarification(question_meta=question_meta, debug=_filtered_debug(debug))
         return res.__dict__
 
-    rule_answer = _resolve_rules(question, classification.topic, classification.intent_type)
+    rule_answer = _resolve_rules(question, question_meta["topic"], question_meta["intent_type"])
     if rule_answer:
         debug["final_path"] = "rules_engine"
         res = compose_rules_engine_answer(rule_answer, question_meta=question_meta, debug=_filtered_debug(debug))
@@ -710,7 +841,7 @@ def ask_guarded(*args: Any, **kwargs: Any) -> Dict[str, Any]:
         )
         return res.__dict__
 
-    tax_matches = _retrieve_tax_knowledge_matches(question, classification)
+    tax_matches = _retrieve_tax_knowledge_matches(question, question_meta)
     debug["tax_matches"] = tax_matches
     debug["tax_candidates"] = [
         {
@@ -718,11 +849,14 @@ def ask_guarded(*args: Any, **kwargs: Any) -> Dict[str, Any]:
             "source_id": m.get("source_id"),
             "source_title": m.get("source_title"),
             "topic": m.get("topic"),
+            "subtopic": m.get("subtopic"),
             "intent_type": m.get("intent_type"),
             "score": m.get("score"),
             "summary": m.get("summary"),
             "matched_keywords": m.get("matched_keywords"),
             "score_reasons": m.get("score_reasons"),
+            "law_version": m.get("law_version"),
+            "effective_from": m.get("effective_from"),
         }
         for m in tax_matches
     ]
