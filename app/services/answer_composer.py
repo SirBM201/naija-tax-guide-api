@@ -4,8 +4,6 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from app.schemas.ask_models import RetrievalCandidate
-
 
 @dataclass
 class AskExecutionResult:
@@ -18,52 +16,66 @@ class AskExecutionResult:
     error: Optional[str] = None
 
 
-_INTERNAL_PATTERNS = [
-    r"(?im)^grounded basis:.*?$",
-    r"(?im)^grounding context:.*?$",
-    r"(?im)^grounding summary:.*?$",
-    r"(?im)^strict rules:.*?$",
-    r"(?im)^question classification:.*?$",
-    r"(?im)^candidate\s+\d+:.*?$",
-    r"(?im)^evidence:.*?$",
-    r"(?im)^debug:.*?$",
-    r"(?im)^system prompt:.*?$",
-    r"(?im)^prompt:.*?$",
-    r"(?im)^match_type:.*?$",
-    r"(?im)^similarity:.*?$",
-    r"(?im)^trust_score:.*?$",
-    r"(?im)^authority_score:.*?$",
-    r"(?im)^source_authority_score:.*?$",
-    r"(?im)^rank_score:.*?$",
-    r"(?im)^review_status:.*?$",
-    r"(?im)^topic:.*?$",
-    r"(?im)^intent_type:.*?$",
-    r"(?im)^jurisdiction:.*?$",
-    r"(?im)^complexity:.*?$",
-    r"(?im)^risk_level:.*?$",
-    r"(?im)^source id:.*?$",
-    r"(?im)^source title:.*?$",
-    r"(?im)^chunk id:.*?$",
+_INTERNAL_HEADER_PATTERNS = [
+    r"(?im)^grounded basis:\s*$",
+    r"(?im)^grounding context:\s*$",
+    r"(?im)^grounding summary:\s*$",
+    r"(?im)^strict rules:\s*$",
+    r"(?im)^question classification:\s*$",
+    r"(?im)^evidence:\s*$",
+    r"(?im)^debug:\s*$",
+    r"(?im)^system prompt:\s*$",
+    r"(?im)^prompt:\s*$",
+]
+
+_INTERNAL_FIELD_LINE_PATTERNS = [
+    r"(?im)^-?\s*topic:\s*.*$",
+    r"(?im)^-?\s*intent_type:\s*.*$",
+    r"(?im)^-?\s*jurisdiction:\s*.*$",
+    r"(?im)^-?\s*complexity:\s*.*$",
+    r"(?im)^-?\s*risk_level:\s*.*$",
+    r"(?im)^-?\s*trust_score:\s*.*$",
+    r"(?im)^-?\s*similarity:\s*.*$",
+    r"(?im)^-?\s*match_type:\s*.*$",
+    r"(?im)^-?\s*authority_score:\s*.*$",
+    r"(?im)^-?\s*source_authority_score:\s*.*$",
+    r"(?im)^-?\s*rank_score:\s*.*$",
+    r"(?im)^-?\s*review_status:\s*.*$",
+    r"(?im)^-?\s*grounded:\s*.*$",
+    r"(?im)^-?\s*grounding_mode:\s*.*$",
+    r"(?im)^-?\s*confidence:\s*.*$",
+    r"(?im)^source id:\s*.*$",
+    r"(?im)^source title:\s*.*$",
+    r"(?im)^chunk id:\s*.*$",
 ]
 
 _PROVIDER_ERROR_PATTERNS = [
     r"incorrect api key provided",
     r"invalid_api_key",
-    r"openai",
     r"sk-proj-",
     r"status:\s*401",
     r"error code:\s*401",
     r"invalid_request_error",
-    r"api key",
+    r"\bopenai\b",
+    r"\bapi key\b",
 ]
 
-_GENERIC_BAD_RESPONSE_PATTERNS = [
-    r"ai temporarily unavailable",
-    r"no evidence provided",
-    r"you are answering as",
-    r"based on the strongest available",
-    r"best supported answer",
+_CLEAR_INTERNAL_MARKERS = [
+    "candidate 1",
+    "candidate 2",
+    "candidate 3",
+    "grounded basis",
+    "grounding context",
+    "grounding summary",
+    "strict rules",
+    "question classification",
+    "you are answering as",
+    "best supported answer",
+    "based on the strongest available",
+    "no evidence provided",
 ]
+
+_SOURCE_PREFIX_RE = re.compile(r"(?im)^source:\s*")
 
 
 def _safe_str(value: Any) -> str:
@@ -89,18 +101,18 @@ def _candidate_meta(candidate: Any) -> Dict[str, Any]:
         }
 
     return {
-        "candidate_id": candidate.candidate_id,
-        "canonical_key": candidate.canonical_key,
-        "topic": candidate.topic,
-        "intent_type": candidate.intent_type,
-        "jurisdiction": candidate.jurisdiction,
-        "lang": candidate.lang,
-        "trust_score": candidate.trust_score,
-        "source_authority_score": candidate.source_authority_score,
-        "similarity": candidate.similarity,
-        "match_type": candidate.match_type,
-        "rank_score": candidate.rank_score,
-        "review_status": candidate.review_status,
+        "candidate_id": getattr(candidate, "candidate_id", None),
+        "canonical_key": getattr(candidate, "canonical_key", None),
+        "topic": getattr(candidate, "topic", None),
+        "intent_type": getattr(candidate, "intent_type", None),
+        "jurisdiction": getattr(candidate, "jurisdiction", None),
+        "lang": getattr(candidate, "lang", None),
+        "trust_score": getattr(candidate, "trust_score", None),
+        "source_authority_score": getattr(candidate, "source_authority_score", None),
+        "similarity": getattr(candidate, "similarity", None),
+        "match_type": getattr(candidate, "match_type", None),
+        "rank_score": getattr(candidate, "rank_score", None),
+        "review_status": getattr(candidate, "review_status", None),
     }
 
 
@@ -114,14 +126,15 @@ def _clean_lines(text: str) -> List[str]:
     blank_streak = 0
 
     for line in lines:
-        if not line.strip():
+        stripped = line.strip()
+        if not stripped:
             blank_streak += 1
             if blank_streak <= 1:
                 cleaned.append("")
             continue
 
         blank_streak = 0
-        cleaned.append(line.strip())
+        cleaned.append(stripped)
 
     while cleaned and not cleaned[0]:
         cleaned.pop(0)
@@ -145,48 +158,54 @@ def _extract_source_tail(lines: List[str]) -> tuple[List[str], Optional[str]]:
         return lines, None
 
     last = lines[-1].strip()
-    if last.lower().startswith("source:"):
+    if _SOURCE_PREFIX_RE.match(last):
         return lines[:-1], last
 
     return lines, None
 
 
-def _sanitize_answer_text(text: str) -> str:
+def _remove_known_internal_sections(text: str) -> str:
     cleaned = _safe_str(text)
     if not cleaned:
         return ""
 
-    for pattern in _INTERNAL_PATTERNS:
+    for pattern in _INTERNAL_HEADER_PATTERNS:
         cleaned = re.sub(pattern, "", cleaned)
+
+    for pattern in _INTERNAL_FIELD_LINE_PATTERNS:
+        cleaned = re.sub(pattern, "", cleaned)
+
+    return cleaned.strip()
+
+
+def _sanitize_answer_text(text: str) -> str:
+    cleaned = _remove_known_internal_sections(text)
+    if not cleaned:
+        return ""
 
     lines = _clean_lines(cleaned)
     filtered: List[str] = []
 
     for line in lines:
-        lower = line.strip().lower()
+        lower = line.lower().strip()
 
-        if any(marker in lower for marker in _PROVIDER_ERROR_PATTERNS):
+        if any(re.search(pattern, lower, flags=re.I) for pattern in _PROVIDER_ERROR_PATTERNS):
             continue
 
-        if any(marker in lower for marker in _GENERIC_BAD_RESPONSE_PATTERNS):
+        if lower.startswith("candidate ") and lower.endswith(":"):
             continue
 
-        if lower.startswith("- ") and any(
-            bad in lower
-            for bad in [
-                "topic:",
-                "intent_type:",
-                "jurisdiction:",
-                "trust_score:",
-                "similarity:",
-                "match_type:",
-                "authority_score:",
-                "review_status:",
-                "grounded:",
-                "grounding_mode:",
-                "confidence:",
-            ]
-        ):
+        if lower in {
+            "grounded basis:",
+            "grounding context:",
+            "grounding summary:",
+            "strict rules:",
+            "question classification:",
+            "evidence:",
+            "debug:",
+            "system prompt:",
+            "prompt:",
+        }:
             continue
 
         filtered.append(line)
@@ -194,31 +213,49 @@ def _sanitize_answer_text(text: str) -> str:
     return "\n".join(_clean_lines("\n".join(filtered))).strip()
 
 
-def looks_like_internal_or_broken_answer(text: str) -> bool:
+def _count_internal_markers(text: str) -> int:
     raw = _safe_str(text).lower()
+    if not raw:
+        return 0
+
+    count = 0
+    for marker in _CLEAR_INTERNAL_MARKERS:
+        if marker in raw:
+            count += 1
+    return count
+
+
+def _has_provider_error(text: str) -> bool:
+    raw = _safe_str(text)
+    if not raw:
+        return False
+    return any(re.search(pattern, raw, flags=re.I) for pattern in _PROVIDER_ERROR_PATTERNS)
+
+
+def looks_like_internal_or_broken_answer(text: str) -> bool:
+    raw = _safe_str(text)
     if not raw:
         return True
 
-    bad_signals = [
-        "candidate 1",
-        "candidate 2",
-        "candidate 3",
-        "grounded basis",
-        "grounding context",
-        "grounding summary",
-        "strict rules",
-        "question classification",
-        "trust_score",
-        "similarity",
-        "match_type",
-        "invalid_api_key",
-        "incorrect api key provided",
-        "sk-proj-",
-        "you are answering as",
-        "no evidence provided",
-    ]
+    lower = raw.lower()
 
-    return any(signal in raw for signal in bad_signals)
+    if _has_provider_error(raw):
+        return True
+
+    marker_count = _count_internal_markers(lower)
+    if marker_count >= 2:
+        return True
+
+    if "candidate 1" in lower and "candidate 2" in lower:
+        return True
+
+    if "trust_score" in lower and "similarity" in lower:
+        return True
+
+    if "grounding context" in lower and "strict rules" in lower:
+        return True
+
+    return False
 
 
 def _split_intro_and_steps(lines: List[str]) -> tuple[List[str], List[str]]:
@@ -237,12 +274,16 @@ def _split_intro_and_steps(lines: List[str]) -> tuple[List[str], List[str]]:
     return intro, steps
 
 
+def _fallback_unknown() -> str:
+    return "I do not yet have enough reliable guidance in the system to answer that accurately."
+
+
 def _format_definition(text: str) -> str:
     lines = _clean_lines(_sanitize_answer_text(text))
     lines, source_tail = _extract_source_tail(lines)
 
     if not lines:
-        return "I do not yet have enough reliable guidance in the system to define that properly."
+        return _fallback_unknown()
 
     first = _ensure_sentence(lines[0])
     rest = [ln for ln in lines[1:] if ln]
@@ -261,7 +302,7 @@ def _format_procedure(text: str) -> str:
     lines, source_tail = _extract_source_tail(lines)
 
     if not lines:
-        return "I do not yet have enough reliable guidance in the system to give the correct procedure."
+        return _fallback_unknown()
 
     intro, steps = _split_intro_and_steps(lines)
     parts: List[str] = []
@@ -272,7 +313,7 @@ def _format_procedure(text: str) -> str:
     if steps:
         parts.append("Steps:\n" + "\n".join(steps))
     elif len(lines) > 1:
-        numbered = [f"{i+1}. {line}" for i, line in enumerate(lines[1:])]
+        numbered = [f"{i + 1}. {line}" for i, line in enumerate(lines[1:])]
         parts = [_ensure_sentence(lines[0]), "Steps:\n" + "\n".join(numbered)]
     else:
         parts = [_ensure_sentence(lines[0])]
@@ -288,7 +329,7 @@ def _format_obligation(text: str) -> str:
     lines, source_tail = _extract_source_tail(lines)
 
     if not lines:
-        return "I need a little more detail before I can confirm whether this applies."
+        return _fallback_unknown()
 
     decision = _ensure_sentence(lines[0])
     rest = [ln for ln in lines[1:] if ln]
@@ -307,7 +348,7 @@ def _format_calculation(text: str) -> str:
     lines, source_tail = _extract_source_tail(lines)
 
     if not lines:
-        return "I do not yet have enough reliable guidance in the system to confirm the exact rate, deadline, or penalty."
+        return _fallback_unknown()
 
     lead = _ensure_sentence(lines[0])
     rest = [ln for ln in lines[1:] if ln]
@@ -326,7 +367,7 @@ def _format_deduction(text: str) -> str:
     lines, source_tail = _extract_source_tail(lines)
 
     if not lines:
-        return "I need a little more detail about that expense before I can answer safely."
+        return _fallback_unknown()
 
     lead = _ensure_sentence(lines[0])
     rest = [ln for ln in lines[1:] if ln]
@@ -345,7 +386,7 @@ def _format_general(text: str) -> str:
     lines = _clean_lines(cleaned)
 
     if not lines:
-        return "I do not yet have enough reliable guidance in the system to answer that accurately."
+        return _fallback_unknown()
 
     lines, source_tail = _extract_source_tail(lines)
     first = _ensure_sentence(lines[0])
@@ -363,10 +404,18 @@ def _format_general(text: str) -> str:
 def render_answer(answer_text: str, *, question_meta: Optional[Dict[str, Any]] = None) -> str:
     intent_type = _safe_str((question_meta or {}).get("intent_type")).lower()
     topic = _safe_str((question_meta or {}).get("topic")).lower()
-    sanitized = _sanitize_answer_text(answer_text)
 
-    if looks_like_internal_or_broken_answer(sanitized):
-        return "I do not yet have enough reliable guidance in the system to answer that accurately."
+    raw = _safe_str(answer_text)
+    sanitized = _sanitize_answer_text(raw)
+
+    if not sanitized:
+        return _fallback_unknown()
+
+    if looks_like_internal_or_broken_answer(raw) and not sanitized:
+        return _fallback_unknown()
+
+    if looks_like_internal_or_broken_answer(raw) and len(_clean_lines(sanitized)) <= 1:
+        return _fallback_unknown()
 
     if intent_type == "definition":
         return _format_definition(sanitized)
@@ -377,7 +426,7 @@ def render_answer(answer_text: str, *, question_meta: Optional[Dict[str, Any]] =
     if intent_type in {"obligation", "eligibility"}:
         return _format_obligation(sanitized)
 
-    if intent_type == "calculation":
+    if intent_type in {"calculation", "computation"}:
         return _format_calculation(sanitized)
 
     if intent_type == "deduction":
@@ -396,7 +445,9 @@ def compose_direct_cache_answer(
     debug: Optional[Dict[str, Any]] = None,
     question_meta: Optional[Dict[str, Any]] = None,
 ) -> AskExecutionResult:
-    raw_answer = _safe_str(answer_text or (candidate.get("answer") if isinstance(candidate, dict) else candidate.answer))
+    raw_answer = _safe_str(
+        answer_text or (candidate.get("answer") if isinstance(candidate, dict) else getattr(candidate, "answer", ""))
+    )
     rendered = render_answer(raw_answer, question_meta=question_meta)
 
     return AskExecutionResult(
