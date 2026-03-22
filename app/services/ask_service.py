@@ -539,7 +539,7 @@ def _is_generic_process_question(question: str, classification) -> bool:
     starts_like_process = any(q.startswith(x) for x in strong_starts)
     tokens = set(_tokenize(q))
     token_signal = bool(tokens.intersection(process_verbs)) and bool(tokens.intersection(process_nouns))
-    intent_signal = str(getattr(classification, "intent_type", "") or "").strip().lower() == "how_to"
+    intent_signal = str(getattr(classification, "intent_type", "") or "").strip().lower() == "procedure"
 
     return starts_like_process or (intent_signal and token_signal)
 
@@ -626,13 +626,13 @@ def ask_guarded(*args: Any, **kwargs: Any) -> Dict[str, Any]:
     debug["ranked_candidates"] = ranked_debug_dump(temp_ranked[:5])
 
     if temp_decision.mode == "clarification":
-        res = compose_clarification(debug=_filtered_debug(debug))
+        res = compose_clarification(question_meta=question_meta, debug=_filtered_debug(debug))
         return res.__dict__
 
     rule_answer = _resolve_rules(question, classification.topic, classification.intent_type)
     if rule_answer:
         debug["final_path"] = "rules_engine"
-        res = compose_rules_engine_answer(rule_answer, debug=_filtered_debug(debug))
+        res = compose_rules_engine_answer(rule_answer, question_meta=question_meta, debug=_filtered_debug(debug))
         return res.__dict__
 
     process_result = _try_process_composer(question)
@@ -642,8 +642,13 @@ def ask_guarded(*args: Any, **kwargs: Any) -> Dict[str, Any]:
             "meta": process_result.get("meta"),
         }
         debug["final_path"] = "process_composer"
+        process_question_meta = dict(question_meta)
+        process_meta = process_result.get("meta") or {}
+        if process_meta.get("intent_type"):
+            process_question_meta["intent_type"] = process_meta.get("intent_type")
         res = compose_rules_engine_answer(
             process_result.get("answer", ""),
+            question_meta=process_question_meta,
             debug=_filtered_debug(debug),
         )
         return res.__dict__
@@ -685,8 +690,11 @@ def ask_guarded(*args: Any, **kwargs: Any) -> Dict[str, Any]:
 
         if safe_tax and safe_tax.get("allowed"):
             debug["final_path"] = "tax_kb_direct"
+            tax_question_meta = dict(question_meta)
+            tax_question_meta["intent_type"] = best_tax_match.get("intent_type") or question_meta.get("intent_type")
             res = compose_rules_engine_answer(
                 safe_tax.get("answer", ""),
+                question_meta=tax_question_meta,
                 debug=_filtered_debug(debug),
             )
             return res.__dict__
@@ -722,13 +730,14 @@ def ask_guarded(*args: Any, **kwargs: Any) -> Dict[str, Any]:
             res = compose_direct_cache_answer(
                 best_candidate,
                 answer_text=safe_candidate.get("answer"),
+                question_meta=question_meta,
                 debug=_filtered_debug(debug),
             )
             return res.__dict__
 
     if decision.mode == "insufficient_credits_uncached" or not credits_available:
         debug["final_path"] = "insufficient_uncached"
-        res = compose_insufficient_uncached(debug=_filtered_debug(debug))
+        res = compose_insufficient_uncached(question_meta=question_meta, debug=_filtered_debug(debug))
         return res.__dict__
 
     grounded_candidates = [_candidate_to_dict(c) for c in ranked[:3]]
@@ -770,5 +779,5 @@ def ask_guarded(*args: Any, **kwargs: Any) -> Dict[str, Any]:
         grounding_context=grounding_context,
     )
 
-    res = compose_ai_answer(answer_text, debug=_filtered_debug(debug))
+    res = compose_ai_answer(answer_text, question_meta=question_meta, debug=_filtered_debug(debug))
     return res.__dict__
