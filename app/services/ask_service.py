@@ -18,6 +18,8 @@ from app.services.answer_composer import (
     compose_direct_cache_answer,
     compose_insufficient_uncached,
     compose_rules_engine_answer,
+    looks_like_internal_or_broken_answer,
+    render_answer,
 )
 from app.services.usage_guard_service import get_ai_usage_state
 from app.services.billing_guard_service import get_billing_state
@@ -172,6 +174,7 @@ def _score_tax_chunk(question: str, classification, row: Dict[str, Any]) -> Dict
     summary = str(row.get("summary") or "")
     text_content = str(row.get("text_content") or "")
     keywords_raw = row.get("keywords") or []
+
     if isinstance(keywords_raw, str):
         keywords = [k.strip() for k in keywords_raw.split(",") if k.strip()]
     elif isinstance(keywords_raw, list):
@@ -405,19 +408,30 @@ def _try_safe_candidate_answer(
         credits_available=credits_available,
     )
 
+    fallback_answer = str(candidate_dict.get("answer") or "").strip()
+    rendered_fallback = render_answer(fallback_answer, question_meta=question_meta)
+
     if refined.get("allowed"):
-        fallback_answer = candidate_dict.get("answer") or ""
+        answer = str(refined.get("answer") or fallback_answer).strip()
+        rendered = render_answer(answer, question_meta=question_meta)
+
+        if looks_like_internal_or_broken_answer(rendered):
+            rendered = rendered_fallback
+
         return {
             "allowed": True,
-            "answer": str(refined.get("answer") or fallback_answer).strip(),
+            "answer": rendered,
             "grounded": grounded_result,
             "refined": refined,
+            "raw_fallback_answer": fallback_answer,
         }
 
     return {
         "allowed": False,
+        "answer": rendered_fallback if rendered_fallback else "",
         "grounded": grounded_result,
         "refined": refined,
+        "raw_fallback_answer": fallback_answer,
     }
 
 
@@ -565,6 +579,48 @@ def _try_process_composer(question: str) -> Optional[Dict[str, Any]]:
     }
 
 
+def _looks_like_provider_failure(text: str) -> bool:
+    raw = str(text or "").lower()
+    bad_markers = [
+        "incorrect api key provided",
+        "invalid_api_key",
+        "sk-proj-",
+        "status: 401",
+        "error code: 401",
+        "invalid_request_error",
+        "openai",
+        "api key",
+        "temporarily unavailable",
+    ]
+    return any(marker in raw for marker in bad_markers)
+
+
+def _best_safe_fallback_answer(
+    *,
+    question_meta: Dict[str, Any],
+    tax_matches: List[Dict[str, Any]],
+    safe_candidate: Optional[Dict[str, Any]],
+) -> Optional[str]:
+    if tax_matches:
+        best_tax_candidate = _tax_match_to_candidate(tax_matches[0])
+        text = str(best_tax_candidate.get("answer") or "").strip()
+        rendered = render_answer(text, question_meta=question_meta)
+        if rendered and not looks_like_internal_or_broken_answer(rendered):
+            return rendered
+
+    if safe_candidate:
+        answer = str(safe_candidate.get("answer") or "").strip()
+        if answer and not looks_like_internal_or_broken_answer(answer):
+            return answer
+
+        raw_fallback = str(safe_candidate.get("raw_fallback_answer") or "").strip()
+        rendered = render_answer(raw_fallback, question_meta=question_meta)
+        if rendered and not looks_like_internal_or_broken_answer(rendered):
+            return rendered
+
+    return None
+
+
 def ask_guarded(*args: Any, **kwargs: Any) -> Dict[str, Any]:
     coerced = _coerce_ask_inputs(args, kwargs)
 
@@ -646,6 +702,7 @@ def ask_guarded(*args: Any, **kwargs: Any) -> Dict[str, Any]:
         process_meta = process_result.get("meta") or {}
         if process_meta.get("intent_type"):
             process_question_meta["intent_type"] = process_meta.get("intent_type")
+
         res = compose_rules_engine_answer(
             process_result.get("answer", ""),
             question_meta=process_question_meta,
@@ -688,12 +745,13 @@ def ask_guarded(*args: Any, **kwargs: Any) -> Dict[str, Any]:
         debug["tax_direct_threshold"] = tax_direct_threshold
         debug["best_tax_score"] = best_tax_match.get("score")
 
-        if safe_tax and safe_tax.get("allowed"):
+        if safe_tax and safe_tax.get("allowed") and safe_tax.get("answer"):
             debug["final_path"] = "tax_kb_direct"
             tax_question_meta = dict(question_meta)
             tax_question_meta["intent_type"] = best_tax_match.get("intent_type") or question_meta.get("intent_type")
-            res = compose_rules_engine_answer(
-                safe_tax.get("answer", ""),
+            res = compose_direct_cache_answer(
+                tax_candidate,
+                answer_text=safe_tax.get("answer", ""),
                 question_meta=tax_question_meta,
                 debug=_filtered_debug(debug),
             )
@@ -736,6 +794,22 @@ def ask_guarded(*args: Any, **kwargs: Any) -> Dict[str, Any]:
             return res.__dict__
 
     if decision.mode == "insufficient_credits_uncached" or not credits_available:
+        fallback_answer = _best_safe_fallback_answer(
+            question_meta=question_meta,
+            tax_matches=tax_matches,
+            safe_candidate=safe_candidate,
+        )
+
+        if fallback_answer:
+            debug["final_path"] = "safe_grounded_fallback_without_ai"
+            res = compose_direct_cache_answer(
+                best_candidate or {},
+                answer_text=fallback_answer,
+                question_meta=question_meta,
+                debug=_filtered_debug(debug),
+            )
+            return res.__dict__
+
         debug["final_path"] = "insufficient_uncached"
         res = compose_insufficient_uncached(question_meta=question_meta, debug=_filtered_debug(debug))
         return res.__dict__
@@ -778,6 +852,48 @@ def ask_guarded(*args: Any, **kwargs: Any) -> Dict[str, Any]:
         candidates=grounded_candidates,
         grounding_context=grounding_context,
     )
+
+    if _looks_like_provider_failure(answer_text) or looks_like_internal_or_broken_answer(answer_text):
+        fallback_answer = _best_safe_fallback_answer(
+            question_meta=question_meta,
+            tax_matches=tax_matches,
+            safe_candidate=safe_candidate,
+        )
+
+        if fallback_answer:
+            debug["final_path"] = "safe_grounded_fallback_after_ai_failure"
+            res = compose_direct_cache_answer(
+                best_candidate or {},
+                answer_text=fallback_answer,
+                question_meta=question_meta,
+                debug=_filtered_debug(debug),
+            )
+            return res.__dict__
+
+        graceful = (
+            "I do not yet have enough reliable guidance in the system to answer that accurately. "
+            "If you tell me whether this relates to personal income tax, PAYE, VAT, withholding tax, or company tax, "
+            "I can guide you more precisely."
+        )
+        res = compose_ai_answer(graceful, question_meta=question_meta, debug=_filtered_debug(debug))
+        return res.__dict__
+
+    rendered_ai = render_answer(answer_text, question_meta=question_meta)
+    if looks_like_internal_or_broken_answer(rendered_ai):
+        fallback_answer = _best_safe_fallback_answer(
+            question_meta=question_meta,
+            tax_matches=tax_matches,
+            safe_candidate=safe_candidate,
+        )
+        if fallback_answer:
+            debug["final_path"] = "safe_grounded_fallback_after_bad_ai_render"
+            res = compose_direct_cache_answer(
+                best_candidate or {},
+                answer_text=fallback_answer,
+                question_meta=question_meta,
+                debug=_filtered_debug(debug),
+            )
+            return res.__dict__
 
     res = compose_ai_answer(answer_text, question_meta=question_meta, debug=_filtered_debug(debug))
     return res.__dict__
