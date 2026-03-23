@@ -105,7 +105,10 @@ def request_otp():
     delivery: Dict[str, Any] = {"mode": "email", "sent": False}
 
     if otp_plain:
+        print("[web_auth.request_otp] about_to_send_email", flush=True)
         mail_res = send_otp_email(contact, otp_plain)
+        print(f"[web_auth.request_otp] mail_result={mail_res}", flush=True)
+
         if mail_res.get("ok"):
             delivery["sent"] = True
             delivery["provider"] = "smtp"
@@ -114,6 +117,24 @@ def request_otp():
             delivery["error"] = mail_res.get("error") or "email_send_failed"
             delivery["root_cause"] = mail_res.get("root_cause")
             delivery["debug"] = mail_res.get("debug")
+
+            out = {
+                "ok": False,
+                "error": "otp_email_send_failed",
+                "message": "OTP was generated but email delivery failed.",
+                "contact": r.get("contact"),
+                "purpose": r.get("purpose"),
+                "expires_at": r.get("expires_at"),
+                "delivery": delivery,
+                "debug": r.get("debug", {}),
+            }
+
+            if _dev_return_plain_otp() and otp_plain:
+                out["otp"] = otp_plain
+
+            resp = make_response(jsonify(out), 502)
+            resp.headers["Cache-Control"] = "no-store"
+            return resp
 
     out = {
         "ok": True,
@@ -242,4 +263,3 @@ def logout():
     resp.delete_cookie(WEB_AUTH_COOKIE_NAME, path="/", domain=domain)
 
     return resp
-
