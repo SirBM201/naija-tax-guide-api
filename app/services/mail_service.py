@@ -13,6 +13,9 @@ def _truthy(v: str | None) -> bool:
     return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+# ---------------------------------------------------------
+# ENV CONFIG (MAIL_* primary; SMTP_* fallback)
+# ---------------------------------------------------------
 MAIL_ENABLED = _truthy(os.getenv("MAIL_ENABLED", "0"))
 
 MAIL_HOST = (os.getenv("MAIL_HOST") or os.getenv("SMTP_HOST") or "").strip()
@@ -28,9 +31,7 @@ MAIL_USE_SSL = _truthy(os.getenv("MAIL_USE_SSL", "0"))
 MAIL_USE_TLS = _truthy(os.getenv("MAIL_USE_TLS", "1"))
 
 DEFAULT_OTP_SUBJECT = (os.getenv("WEB_OTP_EMAIL_SUBJECT") or "Your NaijaTax Guide OTP").strip()
-
-# Fail fast so frontend does not timeout first
-SMTP_TIMEOUT = int((os.getenv("MAIL_TIMEOUT_SECONDS") or "8").strip() or "8")
+SMTP_TIMEOUT_SECONDS = int((os.getenv("MAIL_TIMEOUT_SECONDS") or "8").strip() or "8")
 
 
 def _smtp_config_snapshot(to_email: str) -> Dict[str, Any]:
@@ -40,11 +41,10 @@ def _smtp_config_snapshot(to_email: str) -> Dict[str, Any]:
         "port": MAIL_PORT,
         "use_ssl": MAIL_USE_SSL,
         "use_tls": MAIL_USE_TLS,
-        "timeout": SMTP_TIMEOUT,
+        "timeout": SMTP_TIMEOUT_SECONDS,
         "user_present": bool(MAIL_USER),
         "pass_present": bool(MAIL_PASS),
-        "from_email": MAIL_FROM_EMAIL,
-        "from_name": MAIL_FROM_NAME,
+        "from": f"{MAIL_FROM_NAME} <{MAIL_FROM_EMAIL}>",
         "to": to_email,
     }
 
@@ -56,6 +56,9 @@ def _log(stage: str, **kwargs: Any) -> None:
         pass
 
 
+# ---------------------------------------------------------
+# SEND EMAIL CORE
+# ---------------------------------------------------------
 def send_email(
     to_email: str,
     subject: str,
@@ -64,16 +67,10 @@ def send_email(
 ) -> Dict[str, Any]:
     """
     Sends transactional email via SMTP.
-    Returns:
-      {
-        "ok": bool,
-        "error"?: str,
-        "root_cause"?: str,
-        "debug"?: {...}
-      }
+    Returns a structured result:
+      { ok: bool, error?: str, root_cause?: str, debug?: {...} }
     """
     to_email = (to_email or "").strip().lower()
-
     if not to_email:
         return {"ok": False, "error": "to_email_required"}
 
@@ -100,34 +97,29 @@ def send_email(
         msg.attach(MIMEText(text_body, "plain", "utf-8"))
     msg.attach(MIMEText(html_body, "html", "utf-8"))
 
-    _log(
-        "prepare_send",
-        to=to_email,
-        subject=subject,
-        config=_smtp_config_snapshot(to_email),
-    )
+    _log("prepare_send", to=to_email, subject=subject, config=_smtp_config_snapshot(to_email))
 
     try:
         if MAIL_USE_SSL:
-            _log("connect_ssl_start", host=MAIL_HOST, port=MAIL_PORT, timeout=SMTP_TIMEOUT)
+            _log("connect_ssl_start", host=MAIL_HOST, port=MAIL_PORT, timeout=SMTP_TIMEOUT_SECONDS)
             context = ssl.create_default_context()
-            with smtplib.SMTP_SSL(MAIL_HOST, MAIL_PORT, timeout=SMTP_TIMEOUT, context=context) as server:
+            with smtplib.SMTP_SSL(
+                MAIL_HOST,
+                MAIL_PORT,
+                timeout=SMTP_TIMEOUT_SECONDS,
+                context=context,
+            ) as server:
                 _log("connect_ssl_ok")
                 server.login(MAIL_USER, MAIL_PASS)
                 _log("login_ok")
                 server.sendmail(MAIL_FROM_EMAIL, [to_email], msg.as_string())
                 _log("sendmail_ok")
         else:
-            _log("connect_start", host=MAIL_HOST, port=MAIL_PORT, timeout=SMTP_TIMEOUT)
-            with smtplib.SMTP(MAIL_HOST, MAIL_PORT, timeout=SMTP_TIMEOUT) as server:
+            _log("connect_start", host=MAIL_HOST, port=MAIL_PORT, timeout=SMTP_TIMEOUT_SECONDS)
+            with smtplib.SMTP(MAIL_HOST, MAIL_PORT, timeout=SMTP_TIMEOUT_SECONDS) as server:
                 _log("connect_ok")
-
-                # Helpful for troubleshooting
-                try:
-                    server.ehlo()
-                    _log("ehlo_ok")
-                except Exception as ehlo_err:
-                    _log("ehlo_failed", error=repr(ehlo_err))
+                server.ehlo()
+                _log("ehlo_ok")
 
                 if MAIL_USE_TLS:
                     _log("starttls_start")
@@ -145,10 +137,7 @@ def send_email(
                 server.sendmail(MAIL_FROM_EMAIL, [to_email], msg.as_string())
                 _log("sendmail_ok")
 
-        return {
-            "ok": True,
-            "debug": _smtp_config_snapshot(to_email),
-        }
+        return {"ok": True, "debug": _smtp_config_snapshot(to_email)}
 
     except smtplib.SMTPAuthenticationError as e:
         _log("smtp_auth_failed", error=repr(e))
@@ -158,19 +147,19 @@ def send_email(
             "root_cause": repr(e),
             "debug": _smtp_config_snapshot(to_email),
         }
-    except smtplib.SMTPServerDisconnected as e:
-        _log("smtp_server_disconnected", error=repr(e))
-        return {
-            "ok": False,
-            "error": "smtp_server_disconnected",
-            "root_cause": repr(e),
-            "debug": _smtp_config_snapshot(to_email),
-        }
     except smtplib.SMTPConnectError as e:
         _log("smtp_connect_failed", error=repr(e))
         return {
             "ok": False,
             "error": "smtp_connect_failed",
+            "root_cause": repr(e),
+            "debug": _smtp_config_snapshot(to_email),
+        }
+    except smtplib.SMTPServerDisconnected as e:
+        _log("smtp_server_disconnected", error=repr(e))
+        return {
+            "ok": False,
+            "error": "smtp_server_disconnected",
             "root_cause": repr(e),
             "debug": _smtp_config_snapshot(to_email),
         }
@@ -200,6 +189,9 @@ def send_email(
         }
 
 
+# ---------------------------------------------------------
+# OTP TEMPLATE
+# ---------------------------------------------------------
 def send_otp_email(to_email: str, otp_code: str) -> Dict[str, Any]:
     subject = DEFAULT_OTP_SUBJECT
 
