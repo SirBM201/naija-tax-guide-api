@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
@@ -7,6 +8,9 @@ from typing import Any, Dict, Optional
 from app.core.supabase_client import supabase
 from app.services.guest_access_service import get_referrer_account_id_from_code
 from app.services.paystack_service import initialize_transaction
+
+
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 def _sb():
@@ -23,6 +27,15 @@ def _clean(value: Any) -> str:
 
 def _make_reference(prefix: str = "NTGCH") -> str:
     return f"{prefix}-{uuid.uuid4().hex[:12].upper()}"
+
+
+def _is_real_email(email: str) -> bool:
+    raw = _clean(email).lower()
+    if not raw:
+        return False
+    if raw.endswith(".local"):
+        return False
+    return bool(EMAIL_RE.match(raw))
 
 
 def _safe_email_from_channel(
@@ -140,6 +153,67 @@ def get_plan_by_code(plan_code: str) -> Optional[Dict[str, Any]]:
     )
     rows = getattr(res, "data", None) or []
     return rows[0] if rows else None
+
+
+def update_account_email(
+    *,
+    account_id: str,
+    email: str,
+) -> Dict[str, Any]:
+    acct = _clean(account_id)
+    clean_email = _clean(email).lower()
+
+    if not acct:
+        return {
+            "ok": False,
+            "error": "account_id_required",
+            "where": "update_account_email",
+            "fix": "Pass a valid account_id.",
+        }
+
+    if not _is_real_email(clean_email):
+        return {
+            "ok": False,
+            "error": "invalid_email",
+            "where": "update_account_email",
+            "fix": "Pass a valid public email address such as name@gmail.com.",
+            "email": clean_email,
+        }
+
+    sb = _sb()
+    try:
+        updated = (
+            sb.table("accounts")
+            .update(
+                {
+                    "email": clean_email,
+                    "updated_at": _now_iso(),
+                }
+            )
+            .eq("account_id", acct)
+            .execute()
+        )
+        rows = getattr(updated, "data", None) or []
+        if not rows:
+            return {
+                "ok": False,
+                "error": "account_not_found",
+                "where": "update_account_email",
+                "fix": "Confirm the account_id exists before updating email.",
+                "account_id": acct,
+            }
+
+        return {
+            "ok": True,
+            "account": rows[0],
+        }
+    except Exception as e:
+        return _fail(
+            "accounts.update.email",
+            e,
+            "Check accounts table schema and whether email is writable.",
+            {"account_id": acct, "email": clean_email},
+        )
 
 
 def create_account_for_channel_identity(
@@ -558,13 +632,15 @@ def initialize_channel_subscription_context(
         except Exception:
             amount_kobo = 0
 
-        if not email:
+        if not _is_real_email(email):
             return {
                 "ok": False,
-                "error": "account_email_missing",
+                "error": "real_email_required",
                 "where": "initialize_channel_subscription_context",
-                "fix": "Ensure the canonical account has an email value before payment initialization.",
+                "fix": "Collect a valid public email from the user on WhatsApp/Telegram before starting payment, then update the account email.",
+                "next_step": "prompt_for_email",
                 "account_id": acct,
+                "current_email": email,
             }
 
         if amount_kobo <= 0:
