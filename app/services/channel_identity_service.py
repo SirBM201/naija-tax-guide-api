@@ -32,17 +32,33 @@ def _safe_email_from_channel(
     if not provider_id:
         return None
 
+    digits = "".join(ch for ch in provider_id if ch.isdigit())
+    if not digits:
+        return None
+
     if channel == "whatsapp":
-        digits = "".join(ch for ch in provider_id if ch.isdigit())
-        if digits:
-            return f"wa_{digits}@naijataxguide.local"
+        return f"wa_{digits}@naijataxguide.local"
 
     if channel == "telegram":
-        digits = "".join(ch for ch in provider_id if ch.isdigit())
-        if digits:
-            return f"tg_{digits}@naijataxguide.local"
+        return f"tg_{digits}@naijataxguide.local"
+
+    if channel == "web":
+        return f"web_{digits}@naijataxguide.local"
 
     return None
+
+
+def _fail(where: str, error: Any, fix: str, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    payload = {
+        "ok": False,
+        "error": "channel_identity_service_failed",
+        "where": where,
+        "root_cause": repr(error),
+        "fix": fix,
+    }
+    if extra:
+        payload.update(extra)
+    return payload
 
 
 def get_channel_identity(
@@ -121,61 +137,99 @@ def create_account_for_channel_identity(
     provider_id = _clean(provider_user_id)
     name = _clean(display_name) or None
     ref_code = _clean(referral_code) or None
-    referrer_account_id = get_referrer_account_id_from_code(ref_code) if ref_code else None
+
+    try:
+        referrer_account_id = get_referrer_account_id_from_code(ref_code) if ref_code else None
+    except Exception as e:
+        return _fail(
+            "get_referrer_account_id_from_code",
+            e,
+            "Confirm referral_profiles exists and referral_code/account_id columns are correct.",
+            {"referral_code": ref_code},
+        )
 
     pseudo_email = _safe_email_from_channel(
         channel_type=channel,
         provider_user_id=provider_id,
     )
 
-    payload = {
+    # Keep this payload minimal to avoid schema mismatches on accounts.
+    account_payload = {
         "provider": channel,
         "provider_user_id": provider_id,
         "email": pseudo_email,
-        "display_name": name,
-        "full_name": name,
-        "status": "active",
-        "created_at": _now_iso(),
-        "updated_at": _now_iso(),
     }
 
-    created = sb.table("accounts").insert(payload).execute()
-    rows = getattr(created, "data", None) or []
-    account = rows[0]
+    try:
+        created = sb.table("accounts").insert(account_payload).execute()
+        rows = getattr(created, "data", None) or []
+        if not rows:
+            return _fail(
+                "accounts.insert",
+                "No rows returned from accounts insert",
+                "Check accounts table defaults, RLS, and required columns.",
+                {"account_payload": account_payload},
+            )
+        account = rows[0]
+    except Exception as e:
+        return _fail(
+            "accounts.insert",
+            e,
+            "Check accounts schema. Required columns may differ from provider/provider_user_id/email only.",
+            {"account_payload": account_payload},
+        )
 
-    sb.table("channel_identities").insert(
-        {
-            "account_id": account["account_id"],
-            "channel_type": channel,
-            "provider_user_id": provider_id,
-            "is_verified": channel == "whatsapp",
-            "referral_code": ref_code,
-            "referrer_account_id": referrer_account_id,
-            "referral_locked": bool(referrer_account_id),
-            "first_seen_at": _now_iso(),
-            "last_seen_at": _now_iso(),
-            "metadata": {
-                "display_name": name,
-                "created_from": "channel_first_entry",
+    channel_identity_payload = {
+        "account_id": account["account_id"],
+        "channel_type": channel,
+        "provider_user_id": provider_id,
+        "is_verified": channel == "whatsapp",
+        "referral_code": ref_code,
+        "referrer_account_id": referrer_account_id,
+        "referral_locked": bool(referrer_account_id),
+        "first_seen_at": _now_iso(),
+        "last_seen_at": _now_iso(),
+        "metadata": {
+            "display_name": name,
+            "created_from": "channel_first_entry",
+        },
+    }
+
+    try:
+        sb.table("channel_identities").insert(channel_identity_payload).execute()
+    except Exception as e:
+        return _fail(
+            "channel_identities.insert",
+            e,
+            "Check channel_identities schema and unique constraints.",
+            {
+                "account_id": account.get("account_id"),
+                "channel_identity_payload": channel_identity_payload,
             },
-        }
-    ).execute()
+        )
 
     if referrer_account_id:
-        sb.table("referral_attributions").insert(
-            {
-                "account_id": account["account_id"],
-                "provisional_account_id": account["account_id"],
-                "referral_code": ref_code,
-                "referrer_account_id": referrer_account_id,
-                "capture_channel": channel,
-                "capture_url": None,
-                "is_locked": True,
-                "status": "linked",
-            }
-        ).execute()
+        referral_payload = {
+            "account_id": account["account_id"],
+            "provisional_account_id": account["account_id"],
+            "referral_code": ref_code,
+            "referrer_account_id": referrer_account_id,
+            "capture_channel": channel,
+            "capture_url": None,
+            "is_locked": True,
+            "status": "linked",
+        }
+        try:
+            sb.table("referral_attributions").insert(referral_payload).execute()
+        except Exception as e:
+            return _fail(
+                "referral_attributions.insert",
+                e,
+                "Check referral_attributions schema and whether account_id/provisional_account_id types match.",
+                {"referral_payload": referral_payload},
+            )
 
-    return account
+    return {"ok": True, "account": account}
 
 
 def create_or_update_channel_identity(
@@ -195,8 +249,15 @@ def create_or_update_channel_identity(
     ref_code = _clean(referral_code) or None
     guest_id = _clean(guest_session_id) or None
 
-    existing = get_channel_identity(channel_type=channel, provider_user_id=provider_id)
-    referrer_account_id = get_referrer_account_id_from_code(ref_code) if ref_code else None
+    try:
+        existing = get_channel_identity(channel_type=channel, provider_user_id=provider_id)
+        referrer_account_id = get_referrer_account_id_from_code(ref_code) if ref_code else None
+    except Exception as e:
+        return _fail(
+            "create_or_update_channel_identity.precheck",
+            e,
+            "Check channel_identities read path and referral lookup path.",
+        )
 
     payload = {
         "account_id": acct,
@@ -215,14 +276,22 @@ def create_or_update_channel_identity(
             payload["referrer_account_id"] = referrer_account_id
             payload["referral_locked"] = True
 
-        updated = (
-            sb.table("channel_identities")
-            .update(payload)
-            .eq("id", existing["id"])
-            .execute()
-        )
-        rows = getattr(updated, "data", None) or []
-        return rows[0] if rows else {**existing, **payload}
+        try:
+            updated = (
+                sb.table("channel_identities")
+                .update(payload)
+                .eq("id", existing["id"])
+                .execute()
+            )
+            rows = getattr(updated, "data", None) or []
+            return {"ok": True, "channel_identity": rows[0] if rows else {**existing, **payload}}
+        except Exception as e:
+            return _fail(
+                "channel_identities.update",
+                e,
+                "Check channel_identities schema and update permissions.",
+                {"payload": payload, "existing_id": existing.get("id")},
+            )
 
     if referrer_account_id:
         payload["referral_code"] = ref_code
@@ -232,9 +301,17 @@ def create_or_update_channel_identity(
     payload["first_seen_at"] = _now_iso()
     payload["is_verified"] = channel == "whatsapp"
 
-    created = sb.table("channel_identities").insert(payload).execute()
-    rows = getattr(created, "data", None) or []
-    return rows[0]
+    try:
+        created = sb.table("channel_identities").insert(payload).execute()
+        rows = getattr(created, "data", None) or []
+        return {"ok": True, "channel_identity": rows[0] if rows else payload}
+    except Exception as e:
+        return _fail(
+            "channel_identities.insert",
+            e,
+            "Check channel_identities schema and unique constraints.",
+            {"payload": payload},
+        )
 
 
 def _touch_channel_identity(
@@ -242,7 +319,7 @@ def _touch_channel_identity(
     identity: Dict[str, Any],
     display_name: Optional[str] = None,
     referral_code: Optional[str] = None,
-) -> None:
+) -> Dict[str, Any]:
     sb = _sb()
     update_payload: Dict[str, Any] = {
         "last_seen_at": _now_iso(),
@@ -257,18 +334,36 @@ def _touch_channel_identity(
 
     incoming_ref = _clean(referral_code)
     if incoming_ref and not bool(identity.get("referral_locked")):
-        referrer_account_id = get_referrer_account_id_from_code(incoming_ref)
+        try:
+            referrer_account_id = get_referrer_account_id_from_code(incoming_ref)
+        except Exception as e:
+            return _fail(
+                "_touch_channel_identity.referral_lookup",
+                e,
+                "Check referral lookup function and referral_profiles table.",
+            )
+
         if referrer_account_id:
             update_payload["referral_code"] = incoming_ref
             update_payload["referrer_account_id"] = referrer_account_id
             update_payload["referral_locked"] = True
 
-    (
-        sb.table("channel_identities")
-        .update(update_payload)
-        .eq("id", identity["id"])
-        .execute()
-    )
+    try:
+        updated = (
+            sb.table("channel_identities")
+            .update(update_payload)
+            .eq("id", identity["id"])
+            .execute()
+        )
+        rows = getattr(updated, "data", None) or []
+        return {"ok": True, "channel_identity": rows[0] if rows else {**identity, **update_payload}}
+    except Exception as e:
+        return _fail(
+            "_touch_channel_identity.update",
+            e,
+            "Check channel_identities update path.",
+            {"update_payload": update_payload, "id": identity.get("id")},
+        )
 
 
 def ensure_account_for_channel_identity(
@@ -281,39 +376,73 @@ def ensure_account_for_channel_identity(
     channel = _clean(channel_type).lower()
     provider_id = _clean(provider_user_id)
 
-    existing_identity = get_channel_identity(
-        channel_type=channel,
-        provider_user_id=provider_id,
-    )
+    try:
+        existing_identity = get_channel_identity(
+            channel_type=channel,
+            provider_user_id=provider_id,
+        )
+    except Exception as e:
+        return _fail(
+            "get_channel_identity",
+            e,
+            "Check channel_identities table and read access.",
+            {"channel_type": channel, "provider_user_id": provider_id},
+        )
+
     if existing_identity:
-        account = get_account_by_account_id(existing_identity["account_id"])
+        try:
+            account = get_account_by_account_id(existing_identity["account_id"])
+        except Exception as e:
+            return _fail(
+                "get_account_by_account_id",
+                e,
+                "Check accounts table and account_id column.",
+                {"account_id": existing_identity.get("account_id")},
+            )
+
         if account:
-            _touch_channel_identity(
+            touched = _touch_channel_identity(
                 identity=existing_identity,
                 display_name=display_name,
                 referral_code=referral_code,
             )
+            if not touched.get("ok"):
+                return touched
+
             return {
                 "ok": True,
                 "account": account,
-                "channel_identity": existing_identity,
+                "channel_identity": touched.get("channel_identity") or existing_identity,
                 "created": False,
             }
 
-    existing_account = get_account_by_provider_identity(
-        provider=channel,
-        provider_user_id=provider_id,
-    )
+    try:
+        existing_account = get_account_by_provider_identity(
+            provider=channel,
+            provider_user_id=provider_id,
+        )
+    except Exception as e:
+        return _fail(
+            "get_account_by_provider_identity",
+            e,
+            "Check accounts table provider/provider_user_id columns.",
+            {"provider": channel, "provider_user_id": provider_id},
+        )
+
     if existing_account:
         identity = get_channel_identity(channel_type=channel, provider_user_id=provider_id)
         if not identity:
-            identity = create_or_update_channel_identity(
+            created_or_updated = create_or_update_channel_identity(
                 account_id=existing_account["account_id"],
                 channel_type=channel,
                 provider_user_id=provider_id,
                 display_name=display_name,
                 referral_code=referral_code,
             )
+            if not created_or_updated.get("ok"):
+                return created_or_updated
+            identity = created_or_updated.get("channel_identity")
+
         return {
             "ok": True,
             "account": existing_account,
@@ -321,12 +450,16 @@ def ensure_account_for_channel_identity(
             "created": False,
         }
 
-    account = create_account_for_channel_identity(
+    created_account = create_account_for_channel_identity(
         channel_type=channel,
         provider_user_id=provider_id,
         display_name=display_name,
         referral_code=referral_code,
     )
+    if not created_account.get("ok"):
+        return created_account
+
+    account = created_account["account"]
     identity = get_channel_identity(channel_type=channel, provider_user_id=provider_id)
 
     return {
