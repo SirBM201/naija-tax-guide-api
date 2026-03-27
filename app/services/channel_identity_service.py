@@ -178,72 +178,6 @@ def create_account_for_channel_identity(
     return account
 
 
-def ensure_account_for_channel_identity(
-    *,
-    channel_type: str,
-    provider_user_id: str,
-    display_name: Optional[str] = None,
-    referral_code: Optional[str] = None,
-) -> Dict[str, Any]:
-    channel = _clean(channel_type).lower()
-    provider_id = _clean(provider_user_id)
-
-    existing_identity = get_channel_identity(
-        channel_type=channel,
-        provider_user_id=provider_id,
-    )
-    if existing_identity:
-        account = get_account_by_account_id(existing_identity["account_id"])
-        if account:
-            _touch_channel_identity(
-                identity=existing_identity,
-                display_name=display_name,
-                referral_code=referral_code,
-            )
-            return {
-                "ok": True,
-                "account": account,
-                "channel_identity": existing_identity,
-                "created": False,
-            }
-
-    existing_account = get_account_by_provider_identity(
-        provider=channel,
-        provider_user_id=provider_id,
-    )
-    if existing_account:
-        identity = get_channel_identity(channel_type=channel, provider_user_id=provider_id)
-        if not identity:
-            identity = create_or_update_channel_identity(
-                account_id=existing_account["account_id"],
-                channel_type=channel,
-                provider_user_id=provider_id,
-                display_name=display_name,
-                referral_code=referral_code,
-            )
-        return {
-            "ok": True,
-            "account": existing_account,
-            "channel_identity": identity,
-            "created": False,
-        }
-
-    account = create_account_for_channel_identity(
-        channel_type=channel,
-        provider_user_id=provider_id,
-        display_name=display_name,
-        referral_code=referral_code,
-    )
-    identity = get_channel_identity(channel_type=channel, provider_user_id=provider_id)
-
-    return {
-        "ok": True,
-        "account": account,
-        "channel_identity": identity,
-        "created": True,
-    }
-
-
 def create_or_update_channel_identity(
     *,
     account_id: str,
@@ -335,6 +269,72 @@ def _touch_channel_identity(
         .eq("id", identity["id"])
         .execute()
     )
+
+
+def ensure_account_for_channel_identity(
+    *,
+    channel_type: str,
+    provider_user_id: str,
+    display_name: Optional[str] = None,
+    referral_code: Optional[str] = None,
+) -> Dict[str, Any]:
+    channel = _clean(channel_type).lower()
+    provider_id = _clean(provider_user_id)
+
+    existing_identity = get_channel_identity(
+        channel_type=channel,
+        provider_user_id=provider_id,
+    )
+    if existing_identity:
+        account = get_account_by_account_id(existing_identity["account_id"])
+        if account:
+            _touch_channel_identity(
+                identity=existing_identity,
+                display_name=display_name,
+                referral_code=referral_code,
+            )
+            return {
+                "ok": True,
+                "account": account,
+                "channel_identity": existing_identity,
+                "created": False,
+            }
+
+    existing_account = get_account_by_provider_identity(
+        provider=channel,
+        provider_user_id=provider_id,
+    )
+    if existing_account:
+        identity = get_channel_identity(channel_type=channel, provider_user_id=provider_id)
+        if not identity:
+            identity = create_or_update_channel_identity(
+                account_id=existing_account["account_id"],
+                channel_type=channel,
+                provider_user_id=provider_id,
+                display_name=display_name,
+                referral_code=referral_code,
+            )
+        return {
+            "ok": True,
+            "account": existing_account,
+            "channel_identity": identity,
+            "created": False,
+        }
+
+    account = create_account_for_channel_identity(
+        channel_type=channel,
+        provider_user_id=provider_id,
+        display_name=display_name,
+        referral_code=referral_code,
+    )
+    identity = get_channel_identity(channel_type=channel, provider_user_id=provider_id)
+
+    return {
+        "ok": True,
+        "account": account,
+        "channel_identity": identity,
+        "created": True,
+    }
 
 
 def initialize_channel_subscription_context(
