@@ -1,13 +1,10 @@
 from __future__ import annotations
 
-import os
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from app.core.supabase_client import supabase
 from app.services.guest_access_service import get_referrer_account_id_from_code
-
-DEFAULT_PROVIDER = os.getenv("DEFAULT_AUTH_PROVIDER", "channel")
 
 
 def _sb():
@@ -34,7 +31,8 @@ def _safe_email_from_channel(
 
     digits = "".join(ch for ch in provider_id if ch.isdigit())
     if not digits:
-        return None
+        safe = provider_id.replace("@", "_").replace(" ", "_")
+        digits = safe
 
     if channel == "whatsapp":
         return f"wa_{digits}@naijataxguide.local"
@@ -45,7 +43,7 @@ def _safe_email_from_channel(
     if channel == "web":
         return f"web_{digits}@naijataxguide.local"
 
-    return None
+    return f"channel_{digits}@naijataxguide.local"
 
 
 def _fail(where: str, error: Any, fix: str, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -101,22 +99,20 @@ def get_account_by_account_id(account_id: str) -> Optional[Dict[str, Any]]:
     return rows[0] if rows else None
 
 
-def get_account_by_provider_identity(
+def get_account_by_channel_pseudo_identity(
     *,
-    provider: str,
-    provider_user_id: str,
+    pseudo_email: str,
 ) -> Optional[Dict[str, Any]]:
-    provider = _clean(provider).lower()
-    provider_user_id = _clean(provider_user_id)
-    if not provider or not provider_user_id:
+    email = _clean(pseudo_email)
+    if not email:
         return None
 
     sb = _sb()
     res = (
         sb.table("accounts")
         .select("*")
-        .eq("provider", provider)
-        .eq("provider_user_id", provider_user_id)
+        .eq("provider", "web")
+        .eq("provider_user_id", email)
         .limit(1)
         .execute()
     )
@@ -153,31 +149,50 @@ def create_account_for_channel_identity(
         provider_user_id=provider_id,
     )
 
-    # Keep this payload minimal to avoid schema mismatches on accounts.
+    # Important:
+    # accounts.provider must stay compatible with existing accounts_provider_check.
+    # The actual channel source of truth now lives in channel_identities.
     account_payload = {
-        "provider": channel,
-        "provider_user_id": provider_id,
+        "provider": "web",
+        "provider_user_id": pseudo_email,
         "email": pseudo_email,
     }
 
     try:
-        created = sb.table("accounts").insert(account_payload).execute()
-        rows = getattr(created, "data", None) or []
-        if not rows:
-            return _fail(
-                "accounts.insert",
-                "No rows returned from accounts insert",
-                "Check accounts table defaults, RLS, and required columns.",
-                {"account_payload": account_payload},
-            )
-        account = rows[0]
+        existing_account = get_account_by_channel_pseudo_identity(pseudo_email=pseudo_email or "")
+        if existing_account:
+            account = existing_account
+        else:
+            created = sb.table("accounts").insert(account_payload).execute()
+            rows = getattr(created, "data", None) or []
+            if not rows:
+                return _fail(
+                    "accounts.insert",
+                    "No rows returned from accounts insert",
+                    "Check accounts table defaults, RLS, and required columns.",
+                    {"account_payload": account_payload},
+                )
+            account = rows[0]
     except Exception as e:
         return _fail(
             "accounts.insert",
             e,
-            "Check accounts schema. Required columns may differ from provider/provider_user_id/email only.",
+            "Check accounts schema. provider must remain an allowed value. This implementation uses provider='web' and stores real channel identity in channel_identities.",
             {"account_payload": account_payload},
         )
+
+    existing_identity = get_channel_identity(
+        channel_type=channel,
+        provider_user_id=provider_id,
+    )
+
+    if existing_identity:
+        return {
+            "ok": True,
+            "account": account,
+            "channel_identity": existing_identity,
+            "created": False,
+        }
 
     channel_identity_payload = {
         "account_id": account["account_id"],
@@ -192,11 +207,14 @@ def create_account_for_channel_identity(
         "metadata": {
             "display_name": name,
             "created_from": "channel_first_entry",
+            "pseudo_email": pseudo_email,
         },
     }
 
     try:
-        sb.table("channel_identities").insert(channel_identity_payload).execute()
+        created_identity = sb.table("channel_identities").insert(channel_identity_payload).execute()
+        identity_rows = getattr(created_identity, "data", None) or []
+        identity = identity_rows[0] if identity_rows else channel_identity_payload
     except Exception as e:
         return _fail(
             "channel_identities.insert",
@@ -229,7 +247,12 @@ def create_account_for_channel_identity(
                 {"referral_payload": referral_payload},
             )
 
-    return {"ok": True, "account": account}
+    return {
+        "ok": True,
+        "account": account,
+        "channel_identity": identity,
+        "created": True,
+    }
 
 
 def create_or_update_channel_identity(
@@ -416,17 +439,21 @@ def ensure_account_for_channel_identity(
                 "created": False,
             }
 
+    pseudo_email = _safe_email_from_channel(
+        channel_type=channel,
+        provider_user_id=provider_id,
+    )
+
     try:
-        existing_account = get_account_by_provider_identity(
-            provider=channel,
-            provider_user_id=provider_id,
+        existing_account = get_account_by_channel_pseudo_identity(
+            pseudo_email=pseudo_email or ""
         )
     except Exception as e:
         return _fail(
-            "get_account_by_provider_identity",
+            "get_account_by_channel_pseudo_identity",
             e,
             "Check accounts table provider/provider_user_id columns.",
-            {"provider": channel, "provider_user_id": provider_id},
+            {"pseudo_email": pseudo_email},
         )
 
     if existing_account:
@@ -460,7 +487,10 @@ def ensure_account_for_channel_identity(
         return created_account
 
     account = created_account["account"]
-    identity = get_channel_identity(channel_type=channel, provider_user_id=provider_id)
+    identity = created_account.get("channel_identity") or get_channel_identity(
+        channel_type=channel,
+        provider_user_id=provider_id,
+    )
 
     return {
         "ok": True,
