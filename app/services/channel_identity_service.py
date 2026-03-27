@@ -5,6 +5,7 @@ from typing import Any, Dict, Optional
 
 from app.core.supabase_client import supabase
 from app.services.guest_access_service import get_referrer_account_id_from_code
+from app.services.paystack_service import initialize_transaction
 
 
 def _sb():
@@ -36,10 +37,8 @@ def _safe_email_from_channel(
 
     if channel == "whatsapp":
         return f"wa_{digits}@naijataxguide.local"
-
     if channel == "telegram":
         return f"tg_{digits}@naijataxguide.local"
-
     if channel == "web":
         return f"web_{digits}@naijataxguide.local"
 
@@ -120,6 +119,23 @@ def get_account_by_channel_pseudo_identity(
     return rows[0] if rows else None
 
 
+def get_plan_by_code(plan_code: str) -> Optional[Dict[str, Any]]:
+    code = _clean(plan_code)
+    if not code:
+        return None
+
+    sb = _sb()
+    res = (
+        sb.table("plans")
+        .select("*")
+        .eq("code", code)
+        .limit(1)
+        .execute()
+    )
+    rows = getattr(res, "data", None) or []
+    return rows[0] if rows else None
+
+
 def create_account_for_channel_identity(
     *,
     channel_type: str,
@@ -149,9 +165,6 @@ def create_account_for_channel_identity(
         provider_user_id=provider_id,
     )
 
-    # Important:
-    # accounts.provider must stay compatible with existing accounts_provider_check.
-    # The actual channel source of truth now lives in channel_identities.
     account_payload = {
         "provider": "web",
         "provider_user_id": pseudo_email,
@@ -507,11 +520,85 @@ def initialize_channel_subscription_context(
     provider_user_id: str,
     plan_code: str,
 ) -> Dict[str, Any]:
-    return {
-        "ok": True,
-        "account_id": _clean(account_id),
-        "channel_type": _clean(channel_type).lower(),
-        "provider_user_id": _clean(provider_user_id),
-        "plan_code": _clean(plan_code),
-        "payment_flow": "paystack_link",
-    }
+    acct = _clean(account_id)
+    channel = _clean(channel_type).lower()
+    provider_id = _clean(provider_user_id)
+    code = _clean(plan_code)
+
+    try:
+        account = get_account_by_account_id(acct)
+        if not account:
+            return {
+                "ok": False,
+                "error": "account_not_found",
+                "where": "get_account_by_account_id",
+                "fix": "Pass a valid account_id created through /api/channel/ensure-account.",
+            }
+
+        plan = get_plan_by_code(code)
+        if not plan:
+            return {
+                "ok": False,
+                "error": "plan_not_found",
+                "where": "get_plan_by_code",
+                "fix": "Use a valid plan code from the plans table.",
+                "plan_code": code,
+            }
+
+        email = _clean(account.get("email"))
+        amount_kobo = int(plan.get("price_kobo") or 0)
+
+        if not email:
+            return {
+                "ok": False,
+                "error": "account_email_missing",
+                "where": "initialize_channel_subscription_context",
+                "fix": "Ensure the canonical account has an email value before payment initialization.",
+                "account_id": acct,
+            }
+
+        if amount_kobo <= 0:
+            return {
+                "ok": False,
+                "error": "invalid_plan_amount",
+                "where": "initialize_channel_subscription_context",
+                "fix": "Ensure the plans table contains a positive price_kobo value for this plan.",
+                "plan_code": code,
+            }
+
+        paystack_resp = initialize_transaction(
+            email=email,
+            amount_kobo=amount_kobo,
+            metadata={
+                "product": "naija_tax_guide",
+                "plan_code": code,
+                "account_id": acct,
+                "channel_type": channel,
+                "provider_user_id": provider_id,
+            },
+        )
+
+        return {
+            "ok": True,
+            "account_id": acct,
+            "channel_type": channel,
+            "provider_user_id": provider_id,
+            "plan_code": code,
+            "payment_flow": "paystack_link",
+            "authorization_url": paystack_resp.get("authorization_url"),
+            "access_code": paystack_resp.get("access_code"),
+            "reference": paystack_resp.get("reference"),
+        }
+
+    except Exception as e:
+        return _fail(
+            "initialize_channel_subscription_context",
+            e,
+            "Check plans table shape and paystack initialize_transaction service signature.",
+            {
+                "account_id": acct,
+                "channel_type": channel,
+                "provider_user_id": provider_id,
+                "plan_code": code,
+            },
+        )
