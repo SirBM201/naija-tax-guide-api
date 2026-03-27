@@ -245,6 +245,7 @@ def create_app() -> Flask:
     _register_bp("app.routes.whatsapp", "bp", alias_name="whatsapp", required=False, url_prefix=api_prefix)
 
     _register_bp("app.routes.entry", "bp", alias_name="entry", required=False, url_prefix=api_prefix)
+    _register_bp("app.routes.channel_access", "bp", alias_name="channel_access", required=False, url_prefix=api_prefix)
 
     if _safe_get_env_bool("ENABLE_DEBUG_ROUTES"):
         _register_bp("app.routes._debug", "bp", required=False, url_prefix=api_prefix)
@@ -308,6 +309,12 @@ def create_app() -> Flask:
         if not entry_registered:
             hints.append(
                 "Entry blueprint is NOT registered. Confirm app/routes/entry.py exists and exports bp = Blueprint(...)."
+            )
+
+        channel_access_registered = any((r.get("alias_name") == "channel_access") for r in boot.get("registered", []))
+        if not channel_access_registered:
+            hints.append(
+                "Channel access blueprint is NOT registered. Confirm app/routes/channel_access.py exists and exports bp = Blueprint(...)."
             )
 
         if cookie_mode and origins == "*":
