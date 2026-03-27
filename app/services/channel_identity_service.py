@@ -128,7 +128,8 @@ def get_plan_by_code(plan_code: str) -> Optional[Dict[str, Any]]:
     res = (
         sb.table("plans")
         .select("*")
-        .eq("code", code)
+        .eq("plan_code", code)
+        .eq("active", True)
         .limit(1)
         .execute()
     )
@@ -541,12 +542,16 @@ def initialize_channel_subscription_context(
                 "ok": False,
                 "error": "plan_not_found",
                 "where": "get_plan_by_code",
-                "fix": "Use a valid plan code from the plans table.",
+                "fix": "Use a valid plan_code from the plans table.",
                 "plan_code": code,
             }
 
         email = _clean(account.get("email"))
-        amount_kobo = int(plan.get("price_kobo") or 0)
+        price_major = plan.get("price")
+        try:
+            amount_kobo = int(float(price_major) * 100)
+        except Exception:
+            amount_kobo = 0
 
         if not email:
             return {
@@ -562,8 +567,9 @@ def initialize_channel_subscription_context(
                 "ok": False,
                 "error": "invalid_plan_amount",
                 "where": "initialize_channel_subscription_context",
-                "fix": "Ensure the plans table contains a positive price_kobo value for this plan.",
+                "fix": "Ensure the plans table contains a positive numeric price value for this plan.",
                 "plan_code": code,
+                "price": price_major,
             }
 
         paystack_resp = initialize_transaction(
