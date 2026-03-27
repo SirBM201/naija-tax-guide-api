@@ -244,6 +244,8 @@ def create_app() -> Flask:
     _register_bp("app.routes.telegram", "bp", alias_name="telegram", required=False, url_prefix=api_prefix)
     _register_bp("app.routes.whatsapp", "bp", alias_name="whatsapp", required=False, url_prefix=api_prefix)
 
+    _register_bp("app.routes.entry", "bp", alias_name="entry", required=False, url_prefix=api_prefix)
+
     if _safe_get_env_bool("ENABLE_DEBUG_ROUTES"):
         _register_bp("app.routes._debug", "bp", required=False, url_prefix=api_prefix)
         _register_bp("app.routes.debug_routes", "bp", required=False, url_prefix=api_prefix)
@@ -300,6 +302,12 @@ def create_app() -> Flask:
         if not link_tokens_registered:
             hints.append(
                 "Link tokens blueprint is NOT registered. Confirm app/routes/link_tokens.py exists and exports bp = Blueprint(...)."
+            )
+
+        entry_registered = any((r.get("alias_name") == "entry") for r in boot.get("registered", []))
+        if not entry_registered:
+            hints.append(
+                "Entry blueprint is NOT registered. Confirm app/routes/entry.py exists and exports bp = Blueprint(...)."
             )
 
         if cookie_mode and origins == "*":
