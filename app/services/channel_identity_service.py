@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
@@ -18,6 +19,10 @@ def _now_iso() -> str:
 
 def _clean(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _make_reference(prefix: str = "NTGCH") -> str:
+    return f"{prefix}-{uuid.uuid4().hex[:12].upper()}"
 
 
 def _safe_email_from_channel(
@@ -572,9 +577,12 @@ def initialize_channel_subscription_context(
                 "price": price_major,
             }
 
+        reference = _make_reference()
+
         paystack_resp = initialize_transaction(
             email=email,
             amount_kobo=amount_kobo,
+            reference=reference,
             metadata={
                 "product": "naija_tax_guide",
                 "plan_code": code,
@@ -593,7 +601,7 @@ def initialize_channel_subscription_context(
             "payment_flow": "paystack_link",
             "authorization_url": paystack_resp.get("authorization_url"),
             "access_code": paystack_resp.get("access_code"),
-            "reference": paystack_resp.get("reference"),
+            "reference": paystack_resp.get("reference") or reference,
         }
 
     except Exception as e:
