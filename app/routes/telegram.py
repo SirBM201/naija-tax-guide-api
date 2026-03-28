@@ -131,8 +131,81 @@ def _safe_sync_runtime_identity(
         }
 
 
+def _extract_account_id(shell: Dict[str, Any], lookup: Dict[str, Any]) -> str:
+    return str(
+        lookup.get("account_id")
+        or shell.get("account_id")
+        or shell.get("id")
+        or ""
+    ).strip()
+
+
+def _send_guest_welcome(chat_id: Any) -> None:
+    send_telegram_text(
+        chat_id,
+        "Welcome to Naija Tax Guide ✅\n\n"
+        "You can ask your tax questions here directly on Telegram.\n\n"
+        "Optional extras:\n"
+        "- Use the website for dashboard/history/billing\n"
+        "- Use a referral link if someone shared one with you\n"
+        "- Upgrade later when you need paid access\n\n"
+        "Send your question now.",
+    )
+
+
+def _handle_question(
+    *,
+    chat_id: Any,
+    account_id: str,
+    tg_user_id: str,
+    text: str,
+    runtime_sync: Dict[str, Any] | None = None,
+    linked: bool = False,
+) -> Any:
+    payload = _build_ask_payload(account_id=account_id, tg_user_id=tg_user_id, text=text)
+    resp = _call_ask_guarded(payload)
+
+    if not resp.get("ok") and not (resp.get("answer") or resp.get("message")):
+        send_telegram_text(
+            chat_id,
+            "❌ Question processing failed.\n"
+            f"Reason: {resp.get('error', 'unknown_error')}\n"
+            f"Details: {_clip(resp.get('root_cause') or resp.get('details') or 'n/a')}\n"
+            f"Fix: {_clip(resp.get('fix') or 'Check ask_guarded integration and backend AI flow.')}",
+        )
+        return jsonify(
+            {
+                "ok": False,
+                "stage": "ask_failed",
+                "details": resp,
+                "runtime_sync": runtime_sync,
+                "linked": linked,
+            }
+        ), 200
+
+    answer = (resp.get("answer") or resp.get("message") or "").strip()
+    if not answer:
+        answer = "I couldn't process that right now. Please try again."
+
+    send_telegram_text(chat_id, answer)
+    return jsonify(
+        {
+            "ok": True,
+            "linked": linked,
+            "ask": resp,
+            "runtime_sync": runtime_sync,
+        }
+    )
+
+
 @bp.post("/telegram/webhook")
 def tg_webhook():
+    """
+    New behavior:
+    - Telegram users can start directly from Telegram without website linking
+    - LINK CODE still works, but is optional
+    - Unlinked Telegram users are treated as channel-first users, not blocked
+    """
     update = request.get_json(silent=True) or {}
 
     msg = update.get("message") or update.get("edited_message") or {}
@@ -183,98 +256,21 @@ def tg_webhook():
         )
         return jsonify({"ok": False, "stage": "lookup_account", "details": lk}), 200
 
-    if not lk.get("linked"):
-        code = extract_code(text)
-
-        if code:
-            attempt = consume_and_link(
-                provider="tg",
-                code=code,
-                provider_user_id=tg_user_id,
-                display_name=display_name,
-                phone=None,
-            )
-
-            if attempt.get("ok"):
-                linked_account_id = str(attempt.get("account_id") or "").strip()
-                runtime_sync = None
-                if linked_account_id:
-                    runtime_sync = _safe_sync_runtime_identity(
-                        account_id=linked_account_id,
-                        tg_user_id=tg_user_id,
-                        telegram_chat_id=str(chat_id),
-                        display_name=display_name,
-                        username=tg_username,
-                        chat_type=chat_type,
-                    )
-
-                send_telegram_text(
-                    chat_id,
-                    "✅ Telegram linked successfully!\nNow send your tax question here anytime.",
-                )
-                return jsonify(
-                    {
-                        "ok": True,
-                        "linked": True,
-                        "linked_now": True,
-                        "account_id": attempt.get("account_id"),
-                        "auth_user_id": attempt.get("auth_user_id"),
-                        "runtime_sync": runtime_sync,
-                    }
-                )
-
-            send_telegram_text(
-                chat_id,
-                "❌ Link failed.\n"
-                f"Reason: {attempt.get('error', 'unknown_error')}\n"
-                f"Details: {_clip(attempt.get('root_cause') or attempt.get('details') or 'n/a')}\n"
-                f"Fix: {_clip(attempt.get('fix') or 'Check link token flow and accounts link update.')}",
-            )
-            return jsonify({"ok": True, "linked": False, "link_attempt": attempt}), 200
-
-        send_telegram_text(
-            chat_id,
-            "Your Telegram is not linked yet.\n"
-            "1) Login on the website\n"
-            "2) Generate your LINK CODE\n"
-            "3) Reply here with the 8-character code\n\n"
-            "Example: 7K9M2H8P",
-        )
-        return jsonify({"ok": True, "linked": False})
-
-    if not text:
-        send_telegram_text(chat_id, "Send your question as text and I will reply.")
-        return jsonify({"ok": True, "linked": True, "ignored": True, "reason": "no_text"})
-
-    if text.lower().startswith("/start"):
-        account_id = str(lk.get("account_id") or "").strip()
-        runtime_sync = None
-        if account_id:
-            runtime_sync = _safe_sync_runtime_identity(
-                account_id=account_id,
-                tg_user_id=tg_user_id,
-                telegram_chat_id=str(chat_id),
-                display_name=display_name,
-                username=tg_username,
-                chat_type=chat_type,
-            )
-
-        send_telegram_text(
-            chat_id,
-            "Welcome! Your Telegram is linked ✅. Send your tax question anytime.",
-        )
-        return jsonify({"ok": True, "linked": True, "runtime_sync": runtime_sync})
-
-    account_id = str(lk.get("account_id") or "").strip()
+    account_id = _extract_account_id(shell, lk)
     if not account_id:
         send_telegram_text(
             chat_id,
-            "❌ Question processing failed.\n"
-            "Reason: missing_account_id\n"
-            "Details: Telegram channel is linked but no canonical account_id was returned.\n"
-            "Fix: Check accounts_service.lookup_account and accounts.account_id population.",
+            "❌ Telegram account creation succeeded but no account_id is available.\n"
+            "Fix: Ensure upsert_account / lookup_account returns canonical account_id.",
         )
-        return jsonify({"ok": False, "stage": "missing_account_id", "lookup": lk}), 200
+        return jsonify(
+            {
+                "ok": False,
+                "stage": "missing_account_id",
+                "shell": shell,
+                "lookup": lk,
+            }
+        ), 200
 
     runtime_sync = _safe_sync_runtime_identity(
         account_id=account_id,
@@ -285,36 +281,96 @@ def tg_webhook():
         chat_type=chat_type,
     )
 
-    payload = _build_ask_payload(account_id=account_id, tg_user_id=tg_user_id, text=text)
-    resp = _call_ask_guarded(payload)
+    linked = bool(lk.get("linked"))
 
-    if not resp.get("ok") and not (resp.get("answer") or resp.get("message")):
+    code = extract_code(text)
+    if code:
+        attempt = consume_and_link(
+            provider="tg",
+            code=code,
+            provider_user_id=tg_user_id,
+            display_name=display_name,
+            phone=None,
+        )
+
+        if attempt.get("ok"):
+            linked_account_id = str(attempt.get("account_id") or account_id).strip()
+            runtime_sync = _safe_sync_runtime_identity(
+                account_id=linked_account_id,
+                tg_user_id=tg_user_id,
+                telegram_chat_id=str(chat_id),
+                display_name=display_name,
+                username=tg_username,
+                chat_type=chat_type,
+            )
+
+            send_telegram_text(
+                chat_id,
+                "✅ Telegram linked successfully!\n"
+                "Your Telegram can now work with your website account too.\n"
+                "Send your tax question anytime.",
+            )
+            return jsonify(
+                {
+                    "ok": True,
+                    "linked": True,
+                    "linked_now": True,
+                    "account_id": attempt.get("account_id"),
+                    "auth_user_id": attempt.get("auth_user_id"),
+                    "runtime_sync": runtime_sync,
+                }
+            )
+
         send_telegram_text(
             chat_id,
-            "❌ Question processing failed.\n"
-            f"Reason: {resp.get('error', 'unknown_error')}\n"
-            f"Details: {_clip(resp.get('root_cause') or resp.get('details') or 'n/a')}\n"
-            f"Fix: {_clip(resp.get('fix') or 'Check ask_guarded integration and backend AI flow.')}",
+            "❌ Link failed.\n"
+            f"Reason: {attempt.get('error', 'unknown_error')}\n"
+            f"Details: {_clip(attempt.get('root_cause') or attempt.get('details') or 'n/a')}\n"
+            f"Fix: {_clip(attempt.get('fix') or 'Check link token flow and accounts link update.')}",
         )
+        return jsonify({"ok": True, "linked": linked, "link_attempt": attempt}), 200
+
+    if not text:
+        send_telegram_text(chat_id, "Send your question as text and I will reply.")
         return jsonify(
             {
-                "ok": False,
-                "stage": "ask_failed",
-                "details": resp,
+                "ok": True,
+                "linked": linked,
+                "ignored": True,
+                "reason": "no_text",
                 "runtime_sync": runtime_sync,
             }
-        ), 200
+        )
 
-    answer = (resp.get("answer") or resp.get("message") or "").strip()
-    if not answer:
-        answer = "I couldn't process that right now. Please try again."
+    lowered = text.lower().strip()
 
-    send_telegram_text(chat_id, answer)
-    return jsonify(
-        {
-            "ok": True,
-            "linked": True,
-            "ask": resp,
-            "runtime_sync": runtime_sync,
-        }
+    if lowered.startswith("/start"):
+        _send_guest_welcome(chat_id)
+        return jsonify(
+            {
+                "ok": True,
+                "linked": linked,
+                "runtime_sync": runtime_sync,
+                "mode": "guest_or_linked_welcome",
+            }
+        )
+
+    if lowered in {"hi", "hello", "hey", "good morning", "good afternoon", "good evening"}:
+        _send_guest_welcome(chat_id)
+        return jsonify(
+            {
+                "ok": True,
+                "linked": linked,
+                "runtime_sync": runtime_sync,
+                "mode": "guest_or_linked_welcome",
+            }
+        )
+
+    return _handle_question(
+        chat_id=chat_id,
+        account_id=account_id,
+        tg_user_id=tg_user_id,
+        text=text,
+        runtime_sync=runtime_sync,
+        linked=linked,
     )
