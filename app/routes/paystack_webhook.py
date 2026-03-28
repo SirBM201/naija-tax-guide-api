@@ -11,6 +11,7 @@ from app.services.referral_service import (
     reverse_rewards_for_payment_reference,
 )
 from app.services.subscriptions_service import activate_subscription_now
+from app.services.channel_post_payment_service import notify_channel_payment_success
 
 bp = Blueprint("paystack_webhook", __name__)
 
@@ -33,6 +34,10 @@ REVERSAL_EVENTS = {
 
 def _sb():
     return supabase() if callable(supabase) else supabase
+
+
+def _clean(value: Any) -> str:
+    return str(value or "").strip()
 
 
 def _safe_update_paystack_tx(reference: str, payload: Dict[str, Any], status: str) -> None:
@@ -95,11 +100,11 @@ def _insert_event(event_id: str, event_type: str, reference: Optional[str], payl
 
 
 def _extract_reference(data: Dict[str, Any]) -> str:
-    return (data.get("reference") or data.get("transaction_reference") or "").strip()
+    return _clean(data.get("reference") or data.get("transaction_reference"))
 
 
 def _extract_status(data: Dict[str, Any]) -> str:
-    return (data.get("status") or "").strip().lower()
+    return _clean(data.get("status")).lower()
 
 
 def _extract_metadata(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -108,11 +113,46 @@ def _extract_metadata(data: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _extract_account_id(metadata: Dict[str, Any]) -> str:
-    return (metadata.get("account_id") or "").strip()
+    return _clean(metadata.get("account_id"))
 
 
 def _extract_plan_code(metadata: Dict[str, Any]) -> str:
-    return (metadata.get("plan_code") or "").strip().lower()
+    return _clean(metadata.get("plan_code")).lower()
+
+
+def _extract_channel_type(metadata: Dict[str, Any]) -> str:
+    return _clean(metadata.get("channel_type")).lower()
+
+
+def _extract_provider_user_id(metadata: Dict[str, Any]) -> str:
+    return _clean(metadata.get("provider_user_id"))
+
+
+def _handle_channel_post_payment_notification(
+    *,
+    metadata: Dict[str, Any],
+    account_id: str,
+    plan_code: str,
+) -> Dict[str, Any]:
+    channel_type = _extract_channel_type(metadata)
+    provider_user_id = _extract_provider_user_id(metadata)
+
+    if channel_type not in {"telegram", "whatsapp"}:
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": "not_channel_payment",
+            "channel_type": channel_type,
+        }
+
+    notify_result = notify_channel_payment_success(
+        account_id=account_id,
+        channel_type=channel_type,
+        provider_user_id=provider_user_id or None,
+        plan_code=plan_code,
+    )
+
+    return notify_result
 
 
 def _handle_successful_payment(
@@ -148,10 +188,17 @@ def _handle_successful_payment(
         plan_code=plan_code,
     )
 
+    channel_notification = _handle_channel_post_payment_notification(
+        metadata=metadata,
+        account_id=account_id,
+        plan_code=plan_code,
+    )
+
     return {
         "ok": True,
         "activation": activation,
         "referral": referral,
+        "channel_notification": channel_notification,
     }
 
 
@@ -179,14 +226,14 @@ def _handle_reversal_event(
 @bp.post("/paystack/webhook")
 def paystack_webhook():
     raw = request.get_data() or b""
-    sig = (request.headers.get("x-paystack-signature") or "").strip()
+    sig = _clean(request.headers.get("x-paystack-signature"))
 
     if not verify_webhook_signature(raw, sig):
         return jsonify({"ok": False, "error": "invalid_signature"}), 401
 
     payload: Dict[str, Any] = request.get_json(silent=True) or {}
-    event_type = str(payload.get("event") or "").strip()
-    event_id = str(payload.get("id") or "").strip()
+    event_type = _clean(payload.get("event"))
+    event_id = _clean(payload.get("id"))
 
     data = payload.get("data") or {}
     reference = _extract_reference(data)
@@ -220,4 +267,3 @@ def paystack_webhook():
             "reversal_outcome": reversal_outcome,
         }
     ), 200
-
