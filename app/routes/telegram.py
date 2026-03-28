@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib
 import inspect
 import re
 from typing import Any, Dict, Optional
@@ -11,6 +10,10 @@ from app.core.supabase_client import supabase
 from app.services.accounts_service import lookup_account, upsert_account
 from app.services.ask_service import ask_guarded
 from app.services.channel_identity_runtime_service import sync_channel_identity_runtime
+from app.services.channel_identity_service import (
+    get_channel_identity,
+    initialize_channel_subscription_context,
+)
 from app.services.channel_linking_service import consume_and_link, extract_code
 from app.services.outbound_service import send_telegram_text
 
@@ -421,6 +424,36 @@ def _send_guest_welcome(chat_id: Any) -> None:
     send_telegram_text(chat_id, WELCOME_MENU)
 
 
+def _resolve_effective_account_id(base_account_id: str, tg_user_id: str) -> Dict[str, Any]:
+    """
+    Telegram should follow channel_identities account linkage first.
+    That avoids saving pending plan on a shell account while the real channel is linked elsewhere.
+    """
+    base = _clean(base_account_id)
+    provider_id = _clean(tg_user_id)
+
+    try:
+        identity = get_channel_identity(
+            channel_type="telegram",
+            provider_user_id=provider_id,
+        )
+        linked_account_id = _clean((identity or {}).get("account_id"))
+        return {
+            "ok": True,
+            "account_id": linked_account_id or base,
+            "channel_identity": identity or {},
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": "effective_account_resolution_failed",
+            "root_cause": f"{type(e).__name__}: {_clip(e)}",
+            "fix": "Check channel_identity_service.get_channel_identity read path.",
+            "account_id": base,
+            "channel_identity": {},
+        }
+
+
 def _fetch_latest_daily_usage(account_id: str) -> Dict[str, Any]:
     table = _sb().table("ai_daily_usage").select("*").eq("account_id", account_id)
 
@@ -621,73 +654,53 @@ def _format_plan_summary(summary: Dict[str, Any]) -> str:
     )
 
 
-def _get_identity_row(account_id: str, tg_user_id: str) -> Dict[str, Any]:
-    acct = _clean(account_id)
-    provider_user_id = _clean(tg_user_id)
+def _get_pending_plan_from_provider(tg_user_id: str) -> Dict[str, Any]:
+    provider_id = _clean(tg_user_id)
+    if not provider_id:
+        return {"ok": False, "error": "provider_user_id_required"}
 
-    if not acct or not provider_user_id:
-        return {"ok": False, "error": "identity_lookup_input_required"}
+    try:
+        identity = get_channel_identity(
+            channel_type="telegram",
+            provider_user_id=provider_id,
+        )
+        if not identity:
+            return {
+                "ok": True,
+                "pending": False,
+                "identity": {},
+                "metadata": {},
+            }
 
-    attempts = [
-        ("updated_at", True),
-        ("created_at", True),
-        (None, False),
-    ]
-    last_error: Optional[str] = None
+        metadata = identity.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
 
-    for column, do_order in attempts:
-        try:
-            query = (
-                _sb()
-                .table("channel_identities")
-                .select("*")
-                .eq("account_id", acct)
-                .eq("channel_type", "telegram")
-                .eq("provider_user_id", provider_user_id)
-            )
-            if do_order and column:
-                query = query.order(column, desc=True)
-            res = query.limit(1).execute()
-            rows = getattr(res, "data", None) or []
-            return {"ok": True, "row": rows[0] if rows else {}}
-        except Exception as e:
-            last_error = f"{type(e).__name__}: {_clip(e)}"
+        pending_code = _clean(metadata.get("pending_plan_code"))
+        if not pending_code:
+            return {
+                "ok": True,
+                "pending": False,
+                "identity": identity,
+                "metadata": metadata,
+            }
 
-    return {
-        "ok": False,
-        "error": "identity_lookup_failed",
-        "root_cause": last_error or "Unknown channel_identities lookup failure",
-    }
-
-
-def _get_pending_plan_from_identity(account_id: str, tg_user_id: str) -> Dict[str, Any]:
-    ident = _get_identity_row(account_id, tg_user_id)
-    if not ident.get("ok"):
-        return ident
-
-    row = ident.get("row") or {}
-    metadata = row.get("metadata") or {}
-    if not isinstance(metadata, dict):
-        metadata = {}
-
-    pending_code = _clean(metadata.get("pending_plan_code"))
-    if not pending_code:
+        plan = _plan_from_code(pending_code)
         return {
             "ok": True,
-            "pending": False,
+            "pending": True,
+            "identity": identity,
             "metadata": metadata,
-            "row": row,
+            "plan_code": pending_code,
+            "plan": plan,
         }
-
-    plan = _plan_from_code(pending_code)
-    return {
-        "ok": True,
-        "pending": True,
-        "metadata": metadata,
-        "row": row,
-        "plan_code": pending_code,
-        "plan": plan,
-    }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": "pending_plan_lookup_failed",
+            "root_cause": f"{type(e).__name__}: {_clip(e)}",
+            "fix": "Check channel_identity_service.get_channel_identity and metadata field access.",
+        }
 
 
 def _save_pending_plan_selection(
@@ -743,132 +756,10 @@ def _clear_pending_plan_selection(
     )
 
 
-def _extract_payment_url(result: Dict[str, Any]) -> Optional[str]:
-    candidates = [
-        result.get("authorization_url"),
-        result.get("payment_url"),
-        result.get("checkout_url"),
-        result.get("url"),
-        result.get("link"),
-    ]
-
-    data = result.get("data")
-    if isinstance(data, dict):
-        candidates.extend(
-            [
-                data.get("authorization_url"),
-                data.get("payment_url"),
-                data.get("checkout_url"),
-                data.get("url"),
-                data.get("link"),
-            ]
-        )
-
-    for item in candidates:
-        value = _clean(item)
-        if value:
-            return value
-    return None
-
-
-def _try_dynamic_payment_init(account_id: str, plan_code: str) -> Dict[str, Any]:
-    candidates = [
-        ("app.services.paystack_service", "initialize_plan_payment"),
-        ("app.services.paystack_service", "initialize_payment"),
-        ("app.services.paystack_service", "initialize_checkout"),
-        ("app.services.payments_service", "initialize_plan_payment"),
-        ("app.services.payments_service", "initialize_payment"),
-        ("app.services.payments_service", "initialize_checkout"),
-        ("app.services.billing_service", "initialize_plan_payment"),
-        ("app.services.billing_service", "initialize_plan_checkout"),
-        ("app.services.billing_service", "init_plan_checkout"),
-        ("app.services.subscription_service", "initialize_plan_payment"),
-        ("app.services.subscription_service", "initialize_plan_checkout"),
-        ("app.services.subscription_service", "create_plan_checkout"),
-    ]
-
-    errors = []
-
-    for module_name, func_name in candidates:
-        try:
-            module = importlib.import_module(module_name)
-            fn = getattr(module, func_name, None)
-            if not callable(fn):
-                continue
-
-            payload = {
-                "account_id": account_id,
-                "plan_code": plan_code,
-                "source": "telegram",
-                "channel": "tg",
-                "platform": "telegram",
-            }
-
-            sig = inspect.signature(fn)
-            params = list(sig.parameters.values())
-            has_var_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
-            accepted_names = {
-                p.name
-                for p in params
-                if p.kind in (
-                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                    inspect.Parameter.KEYWORD_ONLY,
-                )
-            }
-
-            filtered_kwargs = {k: v for k, v in payload.items() if has_var_kwargs or k in accepted_names}
-
-            missing_required = []
-            for p in params:
-                if p.kind in (
-                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                    inspect.Parameter.KEYWORD_ONLY,
-                ):
-                    if p.default is inspect._empty and p.name not in filtered_kwargs:
-                        missing_required.append(p.name)
-
-            if missing_required:
-                errors.append(
-                    f"{module_name}.{func_name} missing required args: {', '.join(missing_required)}"
-                )
-                continue
-
-            result = fn(**filtered_kwargs)
-            if inspect.isawaitable(result):
-                errors.append(f"{module_name}.{func_name} returned awaitable; sync route cannot await it")
-                continue
-
-            if isinstance(result, dict):
-                url = _extract_payment_url(result)
-                if url:
-                    return {
-                        "ok": True,
-                        "provider": f"{module_name}.{func_name}",
-                        "result": result,
-                        "payment_url": url,
-                    }
-                errors.append(f"{module_name}.{func_name} returned dict without payment url")
-                continue
-
-            errors.append(f"{module_name}.{func_name} returned {type(result).__name__}, expected dict")
-        except Exception as e:
-            errors.append(f"{module_name}.{func_name}: {type(e).__name__}: {_clip(e)}")
-
-    return {
-        "ok": False,
-        "error": "payment_initializer_not_found",
-        "root_cause": " | ".join(errors[-5:]) if errors else "No supported payment initializer found",
-        "fix": (
-            "Expose a callable checkout initializer in one of these service modules: "
-            "paystack_service, payments_service, billing_service, or subscription_service."
-        ),
-    }
-
-
 def _handle_payment_confirmation(
     *,
     chat_id: Any,
-    account_id: str,
+    effective_account_id: str,
     tg_user_id: str,
     telegram_chat_id: str,
     display_name: Optional[str],
@@ -877,7 +768,7 @@ def _handle_payment_confirmation(
     linked: bool,
     runtime_sync: Dict[str, Any] | None,
 ) -> Any:
-    pending = _get_pending_plan_from_identity(account_id, tg_user_id)
+    pending = _get_pending_plan_from_provider(tg_user_id)
 
     if not pending.get("ok"):
         send_telegram_text(
@@ -916,13 +807,17 @@ def _handle_payment_confirmation(
             }
         )
 
+    identity = pending.get("identity") or {}
     plan = pending.get("plan")
     plan_code = pending.get("plan_code")
 
-    if not plan or not plan_code:
+    identity_account_id = _clean(identity.get("account_id"))
+    checkout_account_id = identity_account_id or _clean(effective_account_id)
+
+    if not plan or not plan_code or not checkout_account_id:
         send_telegram_text(
             chat_id,
-            "I found a pending selection, but the plan details are incomplete.\n"
+            "I found a pending selection, but the linked account details are incomplete.\n"
             "Send 4 to choose again."
         )
         return jsonify(
@@ -935,19 +830,32 @@ def _handle_payment_confirmation(
             }
         ), 200
 
-    payment = _try_dynamic_payment_init(account_id, plan_code)
+    payment = initialize_channel_subscription_context(
+        account_id=checkout_account_id,
+        channel_type="telegram",
+        provider_user_id=tg_user_id,
+        plan_code=plan_code,
+    )
 
     if not payment.get("ok"):
-        send_telegram_text(
-            chat_id,
-            "❌ I recognized your plan and tried to start payment, but no working payment initializer "
-            "was found in the backend.\n\n"
-            f"Selected plan: {plan.get('display_name')}\n"
-            f"Price: {plan.get('price')}\n\n"
-            f"Reason: {payment.get('error', 'unknown_error')}\n"
-            f"Details: {_clip(payment.get('root_cause') or 'n/a')}\n"
-            f"Fix: {_clip(payment.get('fix') or 'Connect Telegram to the existing Paystack checkout initializer.')}",
-        )
+        if payment.get("error") == "real_email_required":
+            send_telegram_text(
+                chat_id,
+                f"Your selected plan is {plan.get('display_name')}.\n"
+                f"Price: {plan.get('price')}\n\n"
+                "Payment cannot start yet because there is no valid public email on the linked account.\n"
+                "Please make sure your website account email is properly set, then try again."
+            )
+        else:
+            send_telegram_text(
+                chat_id,
+                "❌ I recognized your plan, but payment could not start right now.\n\n"
+                f"Selected plan: {plan.get('display_name')}\n"
+                f"Price: {plan.get('price')}\n\n"
+                f"Reason: {payment.get('error', 'unknown_error')}\n"
+                f"Details: {_clip(payment.get('root_cause') or payment.get('where') or 'n/a')}\n"
+                f"Fix: {_clip(payment.get('fix') or 'Check channel subscription initializer.')}"
+            )
         return jsonify(
             {
                 "ok": False,
@@ -959,9 +867,26 @@ def _handle_payment_confirmation(
             }
         ), 200
 
-    payment_url = payment.get("payment_url")
+    payment_url = _clean(payment.get("authorization_url"))
+    if not payment_url:
+        send_telegram_text(
+            chat_id,
+            "❌ Payment initialization ran, but no authorization URL was returned.\n"
+            "Please try again."
+        )
+        return jsonify(
+            {
+                "ok": False,
+                "linked": linked,
+                "mode": "payment_url_missing",
+                "runtime_sync": runtime_sync,
+                "pending": pending,
+                "payment": payment,
+            }
+        ), 200
+
     clear_result = _clear_pending_plan_selection(
-        account_id=account_id,
+        account_id=checkout_account_id,
         tg_user_id=tg_user_id,
         telegram_chat_id=telegram_chat_id,
         display_name=display_name,
@@ -994,7 +919,7 @@ def _handle_plan_phrase(
     *,
     chat_id: Any,
     text: str,
-    account_id: str,
+    effective_account_id: str,
     tg_user_id: str,
     telegram_chat_id: str,
     display_name: Optional[str],
@@ -1037,7 +962,7 @@ def _handle_plan_phrase(
 
     if plan_code and plan:
         saved = _save_pending_plan_selection(
-            account_id=account_id,
+            account_id=effective_account_id,
             tg_user_id=tg_user_id,
             telegram_chat_id=telegram_chat_id,
             display_name=display_name,
@@ -1045,6 +970,26 @@ def _handle_plan_phrase(
             chat_type=chat_type,
             plan=plan,
         )
+
+        if not saved.get("ok"):
+            send_telegram_text(
+                chat_id,
+                "❌ I recognized your selected plan, but could not save the payment step.\n"
+                f"Reason: {saved.get('error', 'unknown_error')}\n"
+                f"Details: {_clip(saved.get('root_cause') or 'n/a')}\n"
+                "Please try again."
+            )
+            return jsonify(
+                {
+                    "ok": False,
+                    "linked": linked,
+                    "mode": "pending_plan_save_failed",
+                    "runtime_sync": runtime_sync,
+                    "plan_match": plan_match,
+                    "saved_pending": saved,
+                }
+            ), 200
+
         send_telegram_text(chat_id, _build_plan_selection_message(plan))
         return jsonify(
             {
@@ -1226,7 +1171,7 @@ def tg_webhook():
     - Menu-driven onboarding for hi/hello/start
     - Direct-question fallback remains available
     - Natural-language plan recognition is supported
-    - YES/PAY confirmation tries to initialize payment dynamically
+    - YES/PAY confirmation uses initialize_channel_subscription_context
     """
     update = request.get_json(silent=True) or {}
 
@@ -1278,8 +1223,8 @@ def tg_webhook():
         )
         return jsonify({"ok": False, "stage": "lookup_account", "details": lk}), 200
 
-    account_id = _extract_account_id(shell, lk)
-    if not account_id:
+    base_account_id = _extract_account_id(shell, lk)
+    if not base_account_id:
         send_telegram_text(
             chat_id,
             "❌ Telegram account creation succeeded but no account_id is available.\n"
@@ -1294,8 +1239,11 @@ def tg_webhook():
             }
         ), 200
 
+    resolved = _resolve_effective_account_id(base_account_id, tg_user_id)
+    effective_account_id = _clean(resolved.get("account_id")) or base_account_id
+
     runtime_sync = _safe_sync_runtime_identity(
-        account_id=account_id,
+        account_id=effective_account_id,
         tg_user_id=tg_user_id,
         telegram_chat_id=str(chat_id),
         display_name=display_name,
@@ -1316,7 +1264,7 @@ def tg_webhook():
         )
 
         if attempt.get("ok"):
-            linked_account_id = str(attempt.get("account_id") or account_id).strip()
+            linked_account_id = str(attempt.get("account_id") or effective_account_id).strip()
             runtime_sync = _safe_sync_runtime_identity(
                 account_id=linked_account_id,
                 tg_user_id=tg_user_id,
@@ -1380,7 +1328,7 @@ def tg_webhook():
     if lowered in PLAN_CONFIRM_WORDS:
         return _handle_payment_confirmation(
             chat_id=chat_id,
-            account_id=account_id,
+            effective_account_id=effective_account_id,
             tg_user_id=tg_user_id,
             telegram_chat_id=str(chat_id),
             display_name=display_name,
@@ -1394,7 +1342,7 @@ def tg_webhook():
         return _handle_menu_option(
             option=lowered,
             chat_id=chat_id,
-            account_id=account_id,
+            account_id=effective_account_id,
             tg_user_id=tg_user_id,
             runtime_sync=runtime_sync,
             linked=linked,
@@ -1403,7 +1351,7 @@ def tg_webhook():
     plan_response = _handle_plan_phrase(
         chat_id=chat_id,
         text=text,
-        account_id=account_id,
+        effective_account_id=effective_account_id,
         tg_user_id=tg_user_id,
         telegram_chat_id=str(chat_id),
         display_name=display_name,
@@ -1417,7 +1365,7 @@ def tg_webhook():
 
     return _handle_question(
         chat_id=chat_id,
-        account_id=account_id,
+        account_id=effective_account_id,
         tg_user_id=tg_user_id,
         text=text,
         runtime_sync=runtime_sync,
