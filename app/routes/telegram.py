@@ -20,14 +20,6 @@ def _clip(value: Any, limit: int = 260) -> str:
 
 
 def _build_ask_payload(*, account_id: str, tg_user_id: str, text: str) -> Dict[str, Any]:
-    """
-    Build a broad alias-rich payload so Telegram can survive ask_service naming drift.
-
-    Reason:
-    - web and telegram entrypoints have diverged a few times
-    - ask_guarded signature may expect question/query/text/message or other keyword names
-    - we inspect the signature later and pass only supported kwargs
-    """
     clean_text = (text or "").strip()
     return {
         "account_id": account_id,
@@ -49,10 +41,6 @@ def _build_ask_payload(*, account_id: str, tg_user_id: str, text: str) -> Dict[s
 
 
 def _call_ask_guarded(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Inspect ask_guarded and call it with keyword args only.
-    This avoids positional-call failures and helps expose the next mismatch clearly.
-    """
     try:
         sig = inspect.signature(ask_guarded)
         params = list(sig.parameters.values())
@@ -115,15 +103,11 @@ def _safe_sync_runtime_identity(
     *,
     account_id: str,
     tg_user_id: str,
+    telegram_chat_id: str,
     display_name: str | None,
     username: str | None,
     chat_type: str | None,
 ) -> Dict[str, Any]:
-    """
-    Auto-correct Telegram provider_user_id whenever the real inbound Telegram id changes.
-    We intentionally use tg_user_id as the canonical runtime id because your existing
-    Telegram account/linking flow is keyed on provider='tg' + provider_user_id=tg_user_id.
-    """
     try:
         return sync_channel_identity_runtime(
             account_id=account_id,
@@ -134,6 +118,8 @@ def _safe_sync_runtime_identity(
                 "telegram_username": (username or "").strip() or None,
                 "telegram_chat_type": (chat_type or "").strip() or None,
                 "telegram_runtime_sync": True,
+                "telegram_chat_id": str(telegram_chat_id).strip() if telegram_chat_id else None,
+                "last_runtime_chat_id": str(telegram_chat_id).strip() if telegram_chat_id else None,
             },
         )
     except Exception as e:
@@ -147,13 +133,6 @@ def _safe_sync_runtime_identity(
 
 @bp.post("/telegram/webhook")
 def tg_webhook():
-    """
-    Flow:
-    - Upsert shell account (provider=tg)
-    - If not linked: accept 8-char code and link OR instruct
-    - If linked: runtime-sync the real Telegram provider_user_id
-    - Then treat message as a question -> ask_guarded -> send answer
-    """
     update = request.get_json(silent=True) or {}
 
     msg = update.get("message") or update.get("edited_message") or {}
@@ -223,6 +202,7 @@ def tg_webhook():
                     runtime_sync = _safe_sync_runtime_identity(
                         account_id=linked_account_id,
                         tg_user_id=tg_user_id,
+                        telegram_chat_id=str(chat_id),
                         display_name=display_name,
                         username=tg_username,
                         chat_type=chat_type,
@@ -273,6 +253,7 @@ def tg_webhook():
             runtime_sync = _safe_sync_runtime_identity(
                 account_id=account_id,
                 tg_user_id=tg_user_id,
+                telegram_chat_id=str(chat_id),
                 display_name=display_name,
                 username=tg_username,
                 chat_type=chat_type,
@@ -298,6 +279,7 @@ def tg_webhook():
     runtime_sync = _safe_sync_runtime_identity(
         account_id=account_id,
         tg_user_id=tg_user_id,
+        telegram_chat_id=str(chat_id),
         display_name=display_name,
         username=tg_username,
         chat_type=chat_type,
