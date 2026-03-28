@@ -35,9 +35,9 @@ def get_account_by_account_id(account_id: str) -> Optional[Dict[str, Any]]:
     if not acct:
         return None
 
-    sb = _sb()
     res = (
-        sb.table("accounts")
+        _sb()
+        .table("accounts")
         .select("*")
         .eq("account_id", acct)
         .limit(1)
@@ -60,9 +60,9 @@ def get_channel_identity(
     if not acct or not channel:
         return None
 
-    sb = _sb()
     query = (
-        sb.table("channel_identities")
+        _sb()
+        .table("channel_identities")
         .select("*")
         .eq("account_id", acct)
         .eq("channel_type", channel)
@@ -371,6 +371,13 @@ def notify_channel_payment_success(
             channel_type=channel,
             provider_user_id=provider_id or None,
         )
+        if not identity and provider_id:
+            identity = get_channel_identity(
+                account_id=acct,
+                channel_type=channel,
+                provider_user_id=None,
+            )
+
         if not identity:
             return {
                 "ok": False,
@@ -382,26 +389,48 @@ def notify_channel_payment_success(
                 "provider_user_id": provider_id or None,
             }
 
-        actual_provider_user_id = _clean(identity.get("provider_user_id"))
-        if not actual_provider_user_id:
-            return {
-                "ok": False,
-                "error": "provider_user_id_missing",
-                "where": "notify_channel_payment_success",
-                "fix": "Ensure provider_user_id exists on the matched channel identity row.",
-                "identity": identity,
-            }
-
         message = _build_success_message(plan_code=code)
+        metadata = identity.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
 
         if channel == "whatsapp":
+            actual_provider_user_id = _clean(identity.get("provider_user_id"))
+            if not actual_provider_user_id:
+                return {
+                    "ok": False,
+                    "error": "provider_user_id_missing",
+                    "where": "notify_channel_payment_success",
+                    "fix": "Ensure provider_user_id exists on the matched WhatsApp identity row.",
+                    "identity": identity,
+                }
+
             delivery = _send_whatsapp_text(
                 phone_number=actual_provider_user_id,
                 text=message,
             )
+            delivery_target = actual_provider_user_id
+
         else:
+            telegram_chat_id = _clean(
+                metadata.get("telegram_chat_id")
+                or metadata.get("last_runtime_chat_id")
+                or metadata.get("telegram_last_chat_id")
+            )
+            fallback_provider_user_id = _clean(identity.get("provider_user_id"))
+            delivery_target = telegram_chat_id or fallback_provider_user_id
+
+            if not delivery_target:
+                return {
+                    "ok": False,
+                    "error": "telegram_chat_target_missing",
+                    "where": "notify_channel_payment_success",
+                    "fix": "Ensure Telegram runtime sync stores telegram_chat_id metadata or provider_user_id.",
+                    "identity": identity,
+                }
+
             delivery = _send_telegram_text(
-                chat_id=actual_provider_user_id,
+                chat_id=delivery_target,
                 text=message,
             )
 
@@ -415,7 +444,7 @@ def notify_channel_payment_success(
                 "message_preview": message,
                 "account_id": acct,
                 "channel_type": channel,
-                "provider_user_id": actual_provider_user_id,
+                "provider_user_id": delivery_target,
                 "plan_code": code,
             }
 
@@ -423,7 +452,7 @@ def notify_channel_payment_success(
             "ok": True,
             "account_id": acct,
             "channel_type": channel,
-            "provider_user_id": actual_provider_user_id,
+            "provider_user_id": delivery_target,
             "plan_code": code,
             "message_preview": message,
             "delivery_status": "sent",
