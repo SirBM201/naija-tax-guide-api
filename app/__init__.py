@@ -248,6 +248,7 @@ def create_app() -> Flask:
     _register_bp("app.routes.channel_access", "bp", alias_name="channel_access", required=False, url_prefix=api_prefix)
     _register_bp("app.routes.channel_profile", "bp", alias_name="channel_profile", required=False, url_prefix=api_prefix)
     _register_bp("app.routes.channel_payment", "bp", alias_name="channel_payment", required=False, url_prefix=api_prefix)
+    _register_bp("app.routes.channel_notifications", "bp", alias_name="channel_notifications", required=False, url_prefix=api_prefix)
 
     if _safe_get_env_bool("ENABLE_DEBUG_ROUTES"):
         _register_bp("app.routes._debug", "bp", required=False, url_prefix=api_prefix)
@@ -329,6 +330,12 @@ def create_app() -> Flask:
         if not channel_payment_registered:
             hints.append(
                 "Channel payment blueprint is NOT registered. Confirm app/routes/channel_payment.py exists and exports bp = Blueprint(...)."
+            )
+
+        channel_notifications_registered = any((r.get("alias_name") == "channel_notifications") for r in boot.get("registered", []))
+        if not channel_notifications_registered:
+            hints.append(
+                "Channel notifications blueprint is NOT registered. Confirm app/routes/channel_notifications.py exists and exports bp = Blueprint(...)."
             )
 
         if cookie_mode and origins == "*":
