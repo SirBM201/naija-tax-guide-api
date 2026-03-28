@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import inspect
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from flask import Blueprint, jsonify, request
 
+from app.core.supabase_client import supabase
 from app.services.accounts_service import lookup_account, upsert_account
 from app.services.ask_service import ask_guarded
 from app.services.channel_linking_service import consume_and_link, extract_code
@@ -14,9 +15,74 @@ from app.services.channel_identity_runtime_service import sync_channel_identity_
 bp = Blueprint("telegram", __name__)
 
 
+WELCOME_MENU = (
+    "Welcome to Naija Tax Guide ✅\n\n"
+    "Reply with:\n"
+    "1 — Ask a tax question\n"
+    "2 — Check AI credits balance\n"
+    "3 — Check current plan\n"
+    "4 — Upgrade subscription\n"
+    "5 — Link website account\n"
+    "6 — Help / how to use this bot\n\n"
+    "You can also type your tax question directly at any time."
+)
+
+HELP_TEXT = (
+    "How to use Naija Tax Guide on Telegram:\n\n"
+    "• Send 1 to start asking a tax question\n"
+    "• Send 2 to check AI credits balance\n"
+    "• Send 3 to check your current plan\n"
+    "• Send 4 to view upgrade options\n"
+    "• Send 5 if you want to link your website account\n"
+    "• Send 6 to see this help again\n\n"
+    "You can also type a full tax question directly, for example:\n"
+    "“What expenses are deductible for a small business in Nigeria?”"
+)
+
+LINK_TEXT = (
+    "Website account linking is optional.\n\n"
+    "If you already use the website and want this Telegram account connected to it:\n"
+    "1) Login on the website\n"
+    "2) Generate your LINK CODE\n"
+    "3) Reply here with the 8-character code\n\n"
+    "Example: 7K9M2H8P"
+)
+
+UPGRADE_TEXT = (
+    "Available plan options:\n\n"
+    "Starter:\n"
+    "• starter_monthly\n"
+    "• starter_quarterly\n"
+    "• starter_yearly\n\n"
+    "Professional:\n"
+    "• professional_monthly\n"
+    "• professional_quarterly\n"
+    "• professional_yearly\n\n"
+    "Business:\n"
+    "• business_monthly\n"
+    "• business_quarterly\n"
+    "• business_yearly\n\n"
+    "To upgrade, tell me the exact plan code you want, for example:\n"
+    "starter_monthly"
+)
+
+
+def _sb():
+    return supabase() if callable(supabase) else supabase
+
+
 def _clip(value: Any, limit: int = 260) -> str:
     text = str(value or "")
     return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _clean(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _menu_trigger(text: str) -> bool:
+    lowered = _clean(text).lower()
+    return lowered in {"hi", "hello", "hey", "/start", "start", "good morning", "good afternoon", "good evening"}
 
 
 def _build_ask_payload(*, account_id: str, tg_user_id: str, text: str) -> Dict[str, Any]:
@@ -141,15 +207,156 @@ def _extract_account_id(shell: Dict[str, Any], lookup: Dict[str, Any]) -> str:
 
 
 def _send_guest_welcome(chat_id: Any) -> None:
-    send_telegram_text(
-        chat_id,
-        "Welcome to Naija Tax Guide ✅\n\n"
-        "You can ask your tax questions here directly on Telegram.\n\n"
-        "Optional extras:\n"
-        "- Use the website for dashboard/history/billing\n"
-        "- Use a referral link if someone shared one with you\n"
-        "- Upgrade later when you need paid access\n\n"
-        "Send your question now.",
+    send_telegram_text(chat_id, WELCOME_MENU)
+
+
+def _get_credit_summary(account_id: str) -> Dict[str, Any]:
+    acct = _clean(account_id)
+    if not acct:
+        return {
+            "ok": False,
+            "error": "account_id_required",
+            "fix": "Account id is required for credit lookup.",
+        }
+
+    try:
+        balance_res = (
+            _sb()
+            .table("ai_credit_balances")
+            .select("*")
+            .eq("account_id", acct)
+            .limit(1)
+            .execute()
+        )
+        balance_rows = getattr(balance_res, "data", None) or []
+        balance_row = balance_rows[0] if balance_rows else {}
+
+        daily_res = (
+            _sb()
+            .table("ai_daily_usage")
+            .select("*")
+            .eq("account_id", acct)
+            .order("usage_date", desc=True)
+            .limit(1)
+            .execute()
+        )
+        daily_rows = getattr(daily_res, "data", None) or []
+        daily_row = daily_rows[0] if daily_rows else {}
+
+        return {
+            "ok": True,
+            "balance_row": balance_row,
+            "daily_row": daily_row,
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": "credit_lookup_failed",
+            "root_cause": f"{type(e).__name__}: {_clip(e)}",
+            "fix": "Check ai_credit_balances and ai_daily_usage table access.",
+        }
+
+
+def _format_credit_summary(summary: Dict[str, Any]) -> str:
+    if not summary.get("ok"):
+        return (
+            "❌ Could not check AI credits right now.\n"
+            f"Reason: {summary.get('error', 'unknown_error')}\n"
+            f"Details: {_clip(summary.get('root_cause') or 'n/a')}\n"
+            f"Fix: {_clip(summary.get('fix') or 'Check backend credit tables.')}"
+        )
+
+    balance_row = summary.get("balance_row") or {}
+    daily_row = summary.get("daily_row") or {}
+
+    balance = balance_row.get("balance")
+    updated_at = balance_row.get("updated_at")
+    used_today = (
+        daily_row.get("used_today")
+        or daily_row.get("count")
+        or daily_row.get("usage_count")
+        or daily_row.get("questions_used")
+    )
+    usage_date = daily_row.get("usage_date") or daily_row.get("date")
+
+    return (
+        "AI Credits Summary:\n\n"
+        f"Current balance: {balance if balance is not None else 'Not available'}\n"
+        f"Used today: {used_today if used_today is not None else 'Not available'}\n"
+        f"Usage date: {usage_date or 'Not available'}\n"
+        f"Last updated: {updated_at or 'Not available'}"
+    )
+
+
+def _get_plan_summary(account_id: str) -> Dict[str, Any]:
+    acct = _clean(account_id)
+    if not acct:
+        return {
+            "ok": False,
+            "error": "account_id_required",
+            "fix": "Account id is required for plan lookup.",
+        }
+
+    try:
+        sub_res = (
+            _sb()
+            .table("user_subscriptions")
+            .select("*")
+            .eq("account_id", acct)
+            .order("created_at", desc=True)
+            .limit(3)
+            .execute()
+        )
+        rows = getattr(sub_res, "data", None) or []
+
+        active_row = None
+        for row in rows:
+            if row.get("is_active") is True or str(row.get("status") or "").lower() in {"active", "trialing"}:
+                active_row = row
+                break
+
+        chosen = active_row or (rows[0] if rows else {})
+        return {
+            "ok": True,
+            "subscription": chosen,
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": "plan_lookup_failed",
+            "root_cause": f"{type(e).__name__}: {_clip(e)}",
+            "fix": "Check user_subscriptions table access and columns.",
+        }
+
+
+def _format_plan_summary(summary: Dict[str, Any]) -> str:
+    if not summary.get("ok"):
+        return (
+            "❌ Could not check your current plan right now.\n"
+            f"Reason: {summary.get('error', 'unknown_error')}\n"
+            f"Details: {_clip(summary.get('root_cause') or 'n/a')}\n"
+            f"Fix: {_clip(summary.get('fix') or 'Check backend subscription tables.')}"
+        )
+
+    sub = summary.get("subscription") or {}
+    if not sub:
+        return (
+            "Current Plan:\n\n"
+            "No active subscription found.\n"
+            "Send 4 if you want to see upgrade options."
+        )
+
+    plan_code = sub.get("plan_code") or "Not available"
+    status = sub.get("status") or ("active" if sub.get("is_active") else "inactive")
+    started_at = sub.get("started_at") or sub.get("starts_at") or sub.get("created_at")
+    expires_at = sub.get("expires_at") or sub.get("ends_at") or sub.get("grace_until") or sub.get("trial_until")
+
+    return (
+        "Current Plan:\n\n"
+        f"Plan code: {plan_code}\n"
+        f"Status: {status}\n"
+        f"Started: {started_at or 'Not available'}\n"
+        f"Expires: {expires_at or 'Not available'}"
     )
 
 
@@ -198,13 +405,109 @@ def _handle_question(
     )
 
 
+def _handle_menu_option(
+    *,
+    option: str,
+    chat_id: Any,
+    account_id: str,
+    tg_user_id: str,
+    runtime_sync: Dict[str, Any] | None,
+    linked: bool,
+) -> Any:
+    if option == "1":
+        send_telegram_text(
+            chat_id,
+            "Send your tax question now.\n\n"
+            "Example:\n"
+            "What expenses are deductible for a small business in Nigeria?",
+        )
+        return jsonify(
+            {
+                "ok": True,
+                "linked": linked,
+                "mode": "ask_prompt",
+                "runtime_sync": runtime_sync,
+            }
+        )
+
+    if option == "2":
+        summary = _get_credit_summary(account_id)
+        send_telegram_text(chat_id, _format_credit_summary(summary))
+        return jsonify(
+            {
+                "ok": True,
+                "linked": linked,
+                "mode": "credits_balance",
+                "runtime_sync": runtime_sync,
+                "credits": summary,
+            }
+        )
+
+    if option == "3":
+        summary = _get_plan_summary(account_id)
+        send_telegram_text(chat_id, _format_plan_summary(summary))
+        return jsonify(
+            {
+                "ok": True,
+                "linked": linked,
+                "mode": "plan_summary",
+                "runtime_sync": runtime_sync,
+                "plan": summary,
+            }
+        )
+
+    if option == "4":
+        send_telegram_text(chat_id, UPGRADE_TEXT)
+        return jsonify(
+            {
+                "ok": True,
+                "linked": linked,
+                "mode": "upgrade_menu",
+                "runtime_sync": runtime_sync,
+            }
+        )
+
+    if option == "5":
+        send_telegram_text(chat_id, LINK_TEXT)
+        return jsonify(
+            {
+                "ok": True,
+                "linked": linked,
+                "mode": "link_help",
+                "runtime_sync": runtime_sync,
+            }
+        )
+
+    if option == "6":
+        send_telegram_text(chat_id, HELP_TEXT)
+        return jsonify(
+            {
+                "ok": True,
+                "linked": linked,
+                "mode": "help",
+                "runtime_sync": runtime_sync,
+            }
+        )
+
+    return _handle_question(
+        chat_id=chat_id,
+        account_id=account_id,
+        tg_user_id=tg_user_id,
+        text=option,
+        runtime_sync=runtime_sync,
+        linked=linked,
+    )
+
+
 @bp.post("/telegram/webhook")
 def tg_webhook():
     """
-    New behavior:
-    - Telegram users can start directly from Telegram without website linking
-    - LINK CODE still works, but is optional
-    - Unlinked Telegram users are treated as channel-first users, not blocked
+    Channel-first Telegram behavior:
+    - User can start directly from Telegram
+    - Referral is optional
+    - Website linking is optional
+    - Menu-driven onboarding for hi/hello/start
+    - Direct-question fallback remains available
     """
     update = request.get_json(silent=True) or {}
 
@@ -331,7 +634,7 @@ def tg_webhook():
         return jsonify({"ok": True, "linked": linked, "link_attempt": attempt}), 200
 
     if not text:
-        send_telegram_text(chat_id, "Send your question as text and I will reply.")
+        send_telegram_text(chat_id, "Send a message to continue.\n\n" + WELCOME_MENU)
         return jsonify(
             {
                 "ok": True,
@@ -342,9 +645,7 @@ def tg_webhook():
             }
         )
 
-    lowered = text.lower().strip()
-
-    if lowered.startswith("/start"):
+    if _menu_trigger(text):
         _send_guest_welcome(chat_id)
         return jsonify(
             {
@@ -355,15 +656,15 @@ def tg_webhook():
             }
         )
 
-    if lowered in {"hi", "hello", "hey", "good morning", "good afternoon", "good evening"}:
-        _send_guest_welcome(chat_id)
-        return jsonify(
-            {
-                "ok": True,
-                "linked": linked,
-                "runtime_sync": runtime_sync,
-                "mode": "guest_or_linked_welcome",
-            }
+    lowered = text.lower().strip()
+    if lowered in {"1", "2", "3", "4", "5", "6"}:
+        return _handle_menu_option(
+            option=lowered,
+            chat_id=chat_id,
+            account_id=account_id,
+            tg_user_id=tg_user_id,
+            runtime_sync=runtime_sync,
+            linked=linked,
         )
 
     return _handle_question(
