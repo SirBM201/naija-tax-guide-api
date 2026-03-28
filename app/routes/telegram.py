@@ -9,6 +9,7 @@ from app.services.accounts_service import lookup_account, upsert_account
 from app.services.ask_service import ask_guarded
 from app.services.channel_linking_service import consume_and_link, extract_code
 from app.services.outbound_service import send_telegram_text
+from app.services.channel_identity_runtime_service import sync_channel_identity_runtime
 
 bp = Blueprint("telegram", __name__)
 
@@ -29,23 +30,19 @@ def _build_ask_payload(*, account_id: str, tg_user_id: str, text: str) -> Dict[s
     """
     clean_text = (text or "").strip()
     return {
-        # canonical identity
         "account_id": account_id,
-        # channel metadata
         "provider": "tg",
         "channel": "tg",
         "platform": "telegram",
         "source": "telegram",
         "provider_user_id": tg_user_id,
         "channel_user_id": tg_user_id,
-        # question aliases
         "question": clean_text,
         "query": clean_text,
         "text": clean_text,
         "message": clean_text,
         "user_message": clean_text,
         "user_query": clean_text,
-        # common optional fields
         "lang": "en",
         "mode": "text",
     }
@@ -114,13 +111,48 @@ def _call_ask_guarded(payload: Dict[str, Any]) -> Dict[str, Any]:
         }
 
 
+def _safe_sync_runtime_identity(
+    *,
+    account_id: str,
+    tg_user_id: str,
+    display_name: str | None,
+    username: str | None,
+    chat_type: str | None,
+) -> Dict[str, Any]:
+    """
+    Auto-correct Telegram provider_user_id whenever the real inbound Telegram id changes.
+    We intentionally use tg_user_id as the canonical runtime id because your existing
+    Telegram account/linking flow is keyed on provider='tg' + provider_user_id=tg_user_id.
+    """
+    try:
+        return sync_channel_identity_runtime(
+            account_id=account_id,
+            channel_type="telegram",
+            provider_user_id=str(tg_user_id).strip(),
+            display_name=display_name,
+            metadata_patch={
+                "telegram_username": (username or "").strip() or None,
+                "telegram_chat_type": (chat_type or "").strip() or None,
+                "telegram_runtime_sync": True,
+            },
+        )
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": "telegram_runtime_sync_failed",
+            "root_cause": f"{type(e).__name__}: {_clip(e)}",
+            "fix": "Check app.services.channel_identity_runtime_service.sync_channel_identity_runtime and channel_identities table shape.",
+        }
+
+
 @bp.post("/telegram/webhook")
 def tg_webhook():
     """
     Flow:
     - Upsert shell account (provider=tg)
     - If not linked: accept 8-char code and link OR instruct
-    - If linked: treat message as a question -> ask_guarded -> send answer
+    - If linked: runtime-sync the real Telegram provider_user_id
+    - Then treat message as a question -> ask_guarded -> send answer
     """
     update = request.get_json(silent=True) or {}
 
@@ -130,10 +162,14 @@ def tg_webhook():
 
     chat = msg.get("chat") or {}
     chat_id = chat.get("id")
+    chat_type = chat.get("type")
+
     text = (msg.get("text") or "").strip()
 
     user = msg.get("from") or {}
     tg_user_id = str(user.get("id") or "").strip()
+    tg_username = (user.get("username") or "").strip() or None
+
     display_name = " ".join(
         [x for x in [user.get("first_name"), user.get("last_name")] if x]
     ) or None
@@ -181,6 +217,17 @@ def tg_webhook():
             )
 
             if attempt.get("ok"):
+                linked_account_id = str(attempt.get("account_id") or "").strip()
+                runtime_sync = None
+                if linked_account_id:
+                    runtime_sync = _safe_sync_runtime_identity(
+                        account_id=linked_account_id,
+                        tg_user_id=tg_user_id,
+                        display_name=display_name,
+                        username=tg_username,
+                        chat_type=chat_type,
+                    )
+
                 send_telegram_text(
                     chat_id,
                     "✅ Telegram linked successfully!\nNow send your tax question here anytime.",
@@ -192,6 +239,7 @@ def tg_webhook():
                         "linked_now": True,
                         "account_id": attempt.get("account_id"),
                         "auth_user_id": attempt.get("auth_user_id"),
+                        "runtime_sync": runtime_sync,
                     }
                 )
 
@@ -219,11 +267,22 @@ def tg_webhook():
         return jsonify({"ok": True, "linked": True, "ignored": True, "reason": "no_text"})
 
     if text.lower().startswith("/start"):
+        account_id = str(lk.get("account_id") or "").strip()
+        runtime_sync = None
+        if account_id:
+            runtime_sync = _safe_sync_runtime_identity(
+                account_id=account_id,
+                tg_user_id=tg_user_id,
+                display_name=display_name,
+                username=tg_username,
+                chat_type=chat_type,
+            )
+
         send_telegram_text(
             chat_id,
             "Welcome! Your Telegram is linked ✅. Send your tax question anytime.",
         )
-        return jsonify({"ok": True, "linked": True})
+        return jsonify({"ok": True, "linked": True, "runtime_sync": runtime_sync})
 
     account_id = str(lk.get("account_id") or "").strip()
     if not account_id:
@@ -236,6 +295,14 @@ def tg_webhook():
         )
         return jsonify({"ok": False, "stage": "missing_account_id", "lookup": lk}), 200
 
+    runtime_sync = _safe_sync_runtime_identity(
+        account_id=account_id,
+        tg_user_id=tg_user_id,
+        display_name=display_name,
+        username=tg_username,
+        chat_type=chat_type,
+    )
+
     payload = _build_ask_payload(account_id=account_id, tg_user_id=tg_user_id, text=text)
     resp = _call_ask_guarded(payload)
 
@@ -247,11 +314,25 @@ def tg_webhook():
             f"Details: {_clip(resp.get('root_cause') or resp.get('details') or 'n/a')}\n"
             f"Fix: {_clip(resp.get('fix') or 'Check ask_guarded integration and backend AI flow.')}",
         )
-        return jsonify({"ok": False, "stage": "ask_failed", "details": resp}), 200
+        return jsonify(
+            {
+                "ok": False,
+                "stage": "ask_failed",
+                "details": resp,
+                "runtime_sync": runtime_sync,
+            }
+        ), 200
 
     answer = (resp.get("answer") or resp.get("message") or "").strip()
     if not answer:
         answer = "I couldn't process that right now. Please try again."
 
     send_telegram_text(chat_id, answer)
-    return jsonify({"ok": True, "linked": True, "ask": resp})
+    return jsonify(
+        {
+            "ok": True,
+            "linked": True,
+            "ask": resp,
+            "runtime_sync": runtime_sync,
+        }
+    )
