@@ -16,6 +16,79 @@ from app.services.channel_identity_runtime_service import sync_channel_identity_
 bp = Blueprint("telegram", __name__)
 
 
+PLAN_CATALOG: Dict[str, Dict[str, Dict[str, Any]]] = {
+    "starter": {
+        "monthly": {
+            "plan_code": "starter_monthly",
+            "display_name": "Starter Monthly",
+            "price": "₦5,000",
+            "credits": 100,
+            "support": "Standard support",
+        },
+        "quarterly": {
+            "plan_code": "starter_quarterly",
+            "display_name": "Starter Quarterly",
+            "price": "₦14,000",
+            "credits": 300,
+            "support": "Standard support",
+        },
+        "yearly": {
+            "plan_code": "starter_yearly",
+            "display_name": "Starter Yearly",
+            "price": "₦51,000",
+            "credits": 1200,
+            "support": "Standard support",
+        },
+    },
+    "professional": {
+        "monthly": {
+            "plan_code": "professional_monthly",
+            "display_name": "Professional Monthly",
+            "price": "₦12,000",
+            "credits": 300,
+            "support": "Priority support",
+        },
+        "quarterly": {
+            "plan_code": "professional_quarterly",
+            "display_name": "Professional Quarterly",
+            "price": "₦33,600",
+            "credits": 900,
+            "support": "Priority support",
+        },
+        "yearly": {
+            "plan_code": "professional_yearly",
+            "display_name": "Professional Yearly",
+            "price": "₦122,400",
+            "credits": 3600,
+            "support": "Priority support",
+        },
+    },
+    "business": {
+        "monthly": {
+            "plan_code": "business_monthly",
+            "display_name": "Business Monthly",
+            "price": "₦25,000",
+            "credits": 800,
+            "support": "Priority support + account review",
+        },
+        "quarterly": {
+            "plan_code": "business_quarterly",
+            "display_name": "Business Quarterly",
+            "price": "₦70,000",
+            "credits": 2400,
+            "support": "Priority support + account review",
+        },
+        "yearly": {
+            "plan_code": "business_yearly",
+            "display_name": "Business Yearly",
+            "price": "₦255,000",
+            "credits": 9600,
+            "support": "Priority support + account review",
+        },
+    },
+}
+
+
 WELCOME_MENU = (
     "Welcome to Naija Tax Guide ✅\n\n"
     "Reply with:\n"
@@ -50,20 +123,24 @@ LINK_TEXT = (
 )
 
 UPGRADE_TEXT = (
-    "Available plan options:\n\n"
-    "Starter:\n"
-    "• starter_monthly\n"
-    "• starter_quarterly\n"
-    "• starter_yearly\n\n"
-    "Professional:\n"
-    "• professional_monthly\n"
-    "• professional_quarterly\n"
-    "• professional_yearly\n\n"
-    "Business:\n"
-    "• business_monthly\n"
-    "• business_quarterly\n"
-    "• business_yearly\n\n"
-    "You can say things naturally, for example:\n"
+    "Available subscription plans:\n\n"
+    "Starter\n"
+    "• Monthly — ₦5,000 — 100 AI credits\n"
+    "• Quarterly — ₦14,000 — 300 AI credits\n"
+    "• Yearly — ₦51,000 — 1,200 AI credits\n\n"
+    "Professional\n"
+    "• Monthly — ₦12,000 — 300 AI credits\n"
+    "• Quarterly — ₦33,600 — 900 AI credits\n"
+    "• Yearly — ₦122,400 — 3,600 AI credits\n\n"
+    "Business\n"
+    "• Monthly — ₦25,000 — 800 AI credits\n"
+    "• Quarterly — ₦70,000 — 2,400 AI credits\n"
+    "• Yearly — ₦255,000 — 9,600 AI credits\n\n"
+    "Support levels:\n"
+    "• Starter — Standard support\n"
+    "• Professional — Priority support\n"
+    "• Business — Priority support + account review\n\n"
+    "You can reply naturally, for example:\n"
     "• I want professional monthly\n"
     "• Give me starter quarterly\n"
     "• I need business yearly"
@@ -112,6 +189,26 @@ def _contains_phrase(text: str, phrase: str) -> bool:
     return phrase in text
 
 
+def _get_plan_details(tier: Optional[str], period: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not tier or not period:
+        return None
+    return PLAN_CATALOG.get(tier, {}).get(period)
+
+
+def _build_plan_selection_message(plan: Dict[str, Any]) -> str:
+    return (
+        "I recognized your selected plan as:\n\n"
+        f"{plan.get('display_name')}\n"
+        f"Plan code: {plan.get('plan_code')}\n"
+        f"Price: {plan.get('price')}\n"
+        f"Included AI credits: {plan.get('credits')}\n"
+        f"Support level: {plan.get('support')}\n\n"
+        "Reply YES to continue to payment.\n"
+        "Send 4 to see all plans again.\n"
+        "You can also still ask tax questions here anytime."
+    )
+
+
 def _detect_plan_intent(text: str) -> Dict[str, Any]:
     """
     Detect natural-language plan requests.
@@ -128,7 +225,6 @@ def _detect_plan_intent(text: str) -> Dict[str, Any]:
     if not normalized:
         return {"ok": False}
 
-    # exact plan code support
     exact_codes = [
         "starter_monthly",
         "starter_quarterly",
@@ -143,6 +239,7 @@ def _detect_plan_intent(text: str) -> Dict[str, Any]:
     for code in exact_codes:
         if code in raw.lower() or code.replace("_", " ") in normalized:
             tier, period = code.split("_", 1)
+            plan = _get_plan_details(tier, period)
             return {
                 "ok": True,
                 "matched": True,
@@ -150,6 +247,7 @@ def _detect_plan_intent(text: str) -> Dict[str, Any]:
                 "period": period,
                 "plan_code": code,
                 "confidence": "high",
+                "plan": plan,
             }
 
     tier_found: Optional[str] = None
@@ -165,6 +263,7 @@ def _detect_plan_intent(text: str) -> Dict[str, Any]:
             break
 
     if tier_found and period_found:
+        plan = _get_plan_details(tier_found, period_found)
         return {
             "ok": True,
             "matched": True,
@@ -172,6 +271,7 @@ def _detect_plan_intent(text: str) -> Dict[str, Any]:
             "period": period_found,
             "plan_code": f"{tier_found}_{period_found}",
             "confidence": "medium",
+            "plan": plan,
         }
 
     if tier_found:
@@ -182,6 +282,7 @@ def _detect_plan_intent(text: str) -> Dict[str, Any]:
             "period": None,
             "plan_code": None,
             "confidence": "partial",
+            "plan": None,
         }
 
     return {"ok": False}
@@ -516,16 +617,20 @@ def _handle_plan_phrase(
     tier = plan_match.get("tier")
     period = plan_match.get("period")
     plan_code = plan_match.get("plan_code")
+    plan = plan_match.get("plan")
 
     if tier and not period:
         send_telegram_text(
             chat_id,
-            f"I recognized the {tier} plan.\n\n"
+            f"I recognized the {tier.title()} plan.\n\n"
             "Which billing cycle do you want?\n"
-            "• monthly\n"
-            "• quarterly\n"
-            "• yearly\n\n"
-            f"Example:\n{tier}_monthly",
+            "• Monthly\n"
+            "• Quarterly\n"
+            "• Yearly\n\n"
+            f"Examples:\n"
+            f"• {tier} monthly\n"
+            f"• {tier} quarterly\n"
+            f"• {tier} yearly",
         )
         return jsonify(
             {
@@ -537,19 +642,30 @@ def _handle_plan_phrase(
             }
         )
 
-    if plan_code:
-        send_telegram_text(
-            chat_id,
-            f"I recognized your selected plan as:\n{plan_code}\n\n"
-            "That looks good.\n"
-            "The next step is payment initialization for that plan.\n"
-            "You can also still ask tax questions here anytime.",
-        )
+    if plan_code and plan:
+        send_telegram_text(chat_id, _build_plan_selection_message(plan))
         return jsonify(
             {
                 "ok": True,
                 "linked": linked,
                 "mode": "plan_code_detected",
+                "runtime_sync": runtime_sync,
+                "plan_match": plan_match,
+            }
+        )
+
+    if plan_code and not plan:
+        send_telegram_text(
+            chat_id,
+            f"I recognized your selected plan as:\n{plan_code}\n\n"
+            "But I could not load the pricing details for that plan right now.\n"
+            "Send 4 to see all plans again.",
+        )
+        return jsonify(
+            {
+                "ok": True,
+                "linked": linked,
+                "mode": "plan_code_detected_missing_catalog",
                 "runtime_sync": runtime_sync,
                 "plan_match": plan_match,
             }
