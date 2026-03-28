@@ -76,6 +76,44 @@ def _fail(where: str, error: Any, fix: str, extra: Optional[Dict[str, Any]] = No
     return payload
 
 
+def _extract_paystack_checkout_fields(paystack_resp: Any) -> Dict[str, Optional[str]]:
+    """
+    Accepts either:
+    - flat dict: {"authorization_url": "...", "access_code": "...", "reference": "..."}
+    - nested dict: {"status": True, "message": "...", "data": {...}}
+    """
+    if not isinstance(paystack_resp, dict):
+        return {
+            "authorization_url": None,
+            "access_code": None,
+            "reference": None,
+        }
+
+    data = paystack_resp.get("data")
+    nested = data if isinstance(data, dict) else {}
+
+    authorization_url = _clean(
+        paystack_resp.get("authorization_url")
+        or nested.get("authorization_url")
+    ) or None
+
+    access_code = _clean(
+        paystack_resp.get("access_code")
+        or nested.get("access_code")
+    ) or None
+
+    reference = _clean(
+        paystack_resp.get("reference")
+        or nested.get("reference")
+    ) or None
+
+    return {
+        "authorization_url": authorization_url,
+        "access_code": access_code,
+        "reference": reference,
+    }
+
+
 def get_channel_identity(
     *,
     channel_type: str,
@@ -668,6 +706,8 @@ def initialize_channel_subscription_context(
             },
         )
 
+        checkout = _extract_paystack_checkout_fields(paystack_resp)
+
         return {
             "ok": True,
             "account_id": acct,
@@ -675,9 +715,10 @@ def initialize_channel_subscription_context(
             "provider_user_id": provider_id,
             "plan_code": code,
             "payment_flow": "paystack_link",
-            "authorization_url": paystack_resp.get("authorization_url"),
-            "access_code": paystack_resp.get("access_code"),
-            "reference": paystack_resp.get("reference") or reference,
+            "authorization_url": checkout.get("authorization_url"),
+            "access_code": checkout.get("access_code"),
+            "reference": checkout.get("reference") or reference,
+            "paystack_raw": paystack_resp,
         }
 
     except Exception as e:
