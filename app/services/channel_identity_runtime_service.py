@@ -163,11 +163,12 @@ def sync_channel_identity_runtime(
     metadata_patch: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    Main runtime auto-correct entry point.
+    Runtime identity self-healing.
 
-    Use this after receiving a real inbound WhatsApp/Telegram message.
-    It ensures the linked account's channel identity keeps the latest
-    real provider_user_id (e.g. Telegram message.chat.id).
+    Canonical rule:
+    - provider_user_id remains the stable platform identity for linkage
+      (for Telegram: user/from.id in the current architecture)
+    - delivery ids such as telegram_chat_id are stored in metadata
     """
     acct = _clean(account_id)
     channel = _clean(channel_type).lower()
@@ -199,7 +200,7 @@ def sync_channel_identity_runtime(
             "ok": False,
             "error": "provider_user_id_required",
             "where": "sync_channel_identity_runtime",
-            "fix": "Pass the real inbound provider_user_id (for Telegram, message.chat.id).",
+            "fix": "Pass the real stable provider_user_id from the inbound platform event.",
         }
 
     try:
@@ -236,7 +237,6 @@ def sync_channel_identity_runtime(
             }
 
         if by_account:
-            old_provider_user_id = _clean(by_account.get("provider_user_id"))
             current_md = by_account.get("metadata") or {}
             if not isinstance(current_md, dict):
                 current_md = {}
@@ -250,11 +250,6 @@ def sync_channel_identity_runtime(
 
             if name:
                 merged_md["display_name"] = name
-
-            if old_provider_user_id != provider_id:
-                merged_md["provider_user_id_autocorrected"] = True
-                merged_md["previous_provider_user_id"] = old_provider_user_id
-                merged_md["provider_user_id_corrected_at"] = _now_iso()
 
             updated = (
                 _sb()
@@ -273,9 +268,8 @@ def sync_channel_identity_runtime(
 
             return {
                 "ok": True,
-                "autocorrected": old_provider_user_id != provider_id,
-                "old_provider_user_id": old_provider_user_id,
-                "new_provider_user_id": provider_id,
+                "autocorrected": False,
+                "provider_user_id": provider_id,
                 "channel_identity": rows[0] if rows else {**by_account, "provider_user_id": provider_id, "metadata": merged_md},
             }
 
@@ -291,7 +285,7 @@ def sync_channel_identity_runtime(
                 "runtime_seen": True,
                 "last_runtime_provider_user_id": provider_id,
                 "display_name": name or None,
-                "created_from": "runtime_autocorrect_service",
+                "created_from": "runtime_sync_service",
             },
         }
 
