@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import re
 from typing import Any, Dict, Optional
 
 from flask import Blueprint, jsonify, request
@@ -62,9 +63,23 @@ UPGRADE_TEXT = (
     "• business_monthly\n"
     "• business_quarterly\n"
     "• business_yearly\n\n"
-    "To upgrade, tell me the exact plan code you want, for example:\n"
-    "starter_monthly"
+    "You can say things naturally, for example:\n"
+    "• I want professional monthly\n"
+    "• Give me starter quarterly\n"
+    "• I need business yearly"
 )
+
+TIER_ALIASES = {
+    "starter": ["starter", "basic", "beginner", "small"],
+    "professional": ["professional", "pro", "premium"],
+    "business": ["business", "biz", "company"],
+}
+
+PERIOD_ALIASES = {
+    "monthly": ["monthly", "month", "per month", "every month", "30 days"],
+    "quarterly": ["quarterly", "quarter", "3 months", "three months", "90 days"],
+    "yearly": ["yearly", "year", "annual", "annually", "12 months", "one year", "365 days"],
+}
 
 
 def _sb():
@@ -83,6 +98,93 @@ def _clean(value: Any) -> str:
 def _menu_trigger(text: str) -> bool:
     lowered = _clean(text).lower()
     return lowered in {"hi", "hello", "hey", "/start", "start", "good morning", "good afternoon", "good evening"}
+
+
+def _normalize_text(text: str) -> str:
+    lowered = _clean(text).lower()
+    lowered = lowered.replace("-", " ").replace("_", " ")
+    lowered = re.sub(r"[^\w\s]", " ", lowered)
+    lowered = re.sub(r"\s+", " ", lowered).strip()
+    return lowered
+
+
+def _contains_phrase(text: str, phrase: str) -> bool:
+    return phrase in text
+
+
+def _detect_plan_intent(text: str) -> Dict[str, Any]:
+    """
+    Detect natural-language plan requests.
+
+    Examples:
+    - professional monthly
+    - i want pro monthly
+    - give me business yearly
+    - starter plan
+    """
+    raw = _clean(text)
+    normalized = _normalize_text(raw)
+
+    if not normalized:
+        return {"ok": False}
+
+    # exact plan code support
+    exact_codes = [
+        "starter_monthly",
+        "starter_quarterly",
+        "starter_yearly",
+        "professional_monthly",
+        "professional_quarterly",
+        "professional_yearly",
+        "business_monthly",
+        "business_quarterly",
+        "business_yearly",
+    ]
+    for code in exact_codes:
+        if code in raw.lower() or code.replace("_", " ") in normalized:
+            tier, period = code.split("_", 1)
+            return {
+                "ok": True,
+                "matched": True,
+                "tier": tier,
+                "period": period,
+                "plan_code": code,
+                "confidence": "high",
+            }
+
+    tier_found: Optional[str] = None
+    for tier, aliases in TIER_ALIASES.items():
+        if any(_contains_phrase(normalized, alias) for alias in aliases):
+            tier_found = tier
+            break
+
+    period_found: Optional[str] = None
+    for period, aliases in PERIOD_ALIASES.items():
+        if any(_contains_phrase(normalized, alias) for alias in aliases):
+            period_found = period
+            break
+
+    if tier_found and period_found:
+        return {
+            "ok": True,
+            "matched": True,
+            "tier": tier_found,
+            "period": period_found,
+            "plan_code": f"{tier_found}_{period_found}",
+            "confidence": "medium",
+        }
+
+    if tier_found:
+        return {
+            "ok": True,
+            "matched": True,
+            "tier": tier_found,
+            "period": None,
+            "plan_code": None,
+            "confidence": "partial",
+        }
+
+    return {"ok": False}
 
 
 def _build_ask_payload(*, account_id: str, tg_user_id: str, text: str) -> Dict[str, Any]:
@@ -210,6 +312,41 @@ def _send_guest_welcome(chat_id: Any) -> None:
     send_telegram_text(chat_id, WELCOME_MENU)
 
 
+def _fetch_latest_daily_usage(account_id: str) -> Dict[str, Any]:
+    """
+    Schema-tolerant fetch for ai_daily_usage.
+    """
+    table = _sb().table("ai_daily_usage").select("*").eq("account_id", account_id)
+
+    attempts = [
+        ("updated_at", True),
+        ("created_at", True),
+        (None, False),
+    ]
+
+    last_error: Optional[str] = None
+
+    for column, do_order in attempts:
+        try:
+            query = table
+            if do_order and column:
+                query = query.order(column, desc=True)
+            res = query.limit(1).execute()
+            rows = getattr(res, "data", None) or []
+            return {
+                "ok": True,
+                "row": rows[0] if rows else {},
+            }
+        except Exception as e:
+            last_error = f"{type(e).__name__}: {_clip(e)}"
+
+    return {
+        "ok": False,
+        "error": "daily_usage_lookup_failed",
+        "root_cause": last_error or "Unknown ai_daily_usage lookup failure",
+    }
+
+
 def _get_credit_summary(account_id: str) -> Dict[str, Any]:
     acct = _clean(account_id)
     if not acct:
@@ -231,17 +368,16 @@ def _get_credit_summary(account_id: str) -> Dict[str, Any]:
         balance_rows = getattr(balance_res, "data", None) or []
         balance_row = balance_rows[0] if balance_rows else {}
 
-        daily_res = (
-            _sb()
-            .table("ai_daily_usage")
-            .select("*")
-            .eq("account_id", acct)
-            .order("usage_date", desc=True)
-            .limit(1)
-            .execute()
-        )
-        daily_rows = getattr(daily_res, "data", None) or []
-        daily_row = daily_rows[0] if daily_rows else {}
+        daily_result = _fetch_latest_daily_usage(acct)
+        daily_row = daily_result.get("row") or {}
+
+        if not daily_result.get("ok"):
+            return {
+                "ok": False,
+                "error": "credit_lookup_failed",
+                "root_cause": daily_result.get("root_cause"),
+                "fix": "Check ai_credit_balances and ai_daily_usage table access.",
+            }
 
         return {
             "ok": True,
@@ -276,14 +412,20 @@ def _format_credit_summary(summary: Dict[str, Any]) -> str:
         or daily_row.get("count")
         or daily_row.get("usage_count")
         or daily_row.get("questions_used")
+        or daily_row.get("used")
     )
-    usage_date = daily_row.get("usage_date") or daily_row.get("date")
+    usage_date = (
+        daily_row.get("usage_date")
+        or daily_row.get("date")
+        or daily_row.get("created_at")
+        or daily_row.get("updated_at")
+    )
 
     return (
         "AI Credits Summary:\n\n"
         f"Current balance: {balance if balance is not None else 'Not available'}\n"
-        f"Used today: {used_today if used_today is not None else 'Not available'}\n"
-        f"Usage date: {usage_date or 'Not available'}\n"
+        f"Used recently: {used_today if used_today is not None else 'Not available'}\n"
+        f"Usage record date: {usage_date or 'Not available'}\n"
         f"Last updated: {updated_at or 'Not available'}"
     )
 
@@ -358,6 +500,62 @@ def _format_plan_summary(summary: Dict[str, Any]) -> str:
         f"Started: {started_at or 'Not available'}\n"
         f"Expires: {expires_at or 'Not available'}"
     )
+
+
+def _handle_plan_phrase(
+    *,
+    chat_id: Any,
+    text: str,
+    linked: bool,
+    runtime_sync: Dict[str, Any] | None,
+) -> Any:
+    plan_match = _detect_plan_intent(text)
+    if not plan_match.get("ok"):
+        return None
+
+    tier = plan_match.get("tier")
+    period = plan_match.get("period")
+    plan_code = plan_match.get("plan_code")
+
+    if tier and not period:
+        send_telegram_text(
+            chat_id,
+            f"I recognized the {tier} plan.\n\n"
+            "Which billing cycle do you want?\n"
+            "• monthly\n"
+            "• quarterly\n"
+            "• yearly\n\n"
+            f"Example:\n{tier}_monthly",
+        )
+        return jsonify(
+            {
+                "ok": True,
+                "linked": linked,
+                "mode": "plan_tier_detected",
+                "runtime_sync": runtime_sync,
+                "plan_match": plan_match,
+            }
+        )
+
+    if plan_code:
+        send_telegram_text(
+            chat_id,
+            f"I recognized your selected plan as:\n{plan_code}\n\n"
+            "That looks good.\n"
+            "The next step is payment initialization for that plan.\n"
+            "You can also still ask tax questions here anytime.",
+        )
+        return jsonify(
+            {
+                "ok": True,
+                "linked": linked,
+                "mode": "plan_code_detected",
+                "runtime_sync": runtime_sync,
+                "plan_match": plan_match,
+            }
+        )
+
+    return None
 
 
 def _handle_question(
@@ -508,6 +706,7 @@ def tg_webhook():
     - Website linking is optional
     - Menu-driven onboarding for hi/hello/start
     - Direct-question fallback remains available
+    - Natural-language plan recognition is supported
     """
     update = request.get_json(silent=True) or {}
 
@@ -666,6 +865,15 @@ def tg_webhook():
             runtime_sync=runtime_sync,
             linked=linked,
         )
+
+    plan_response = _handle_plan_phrase(
+        chat_id=chat_id,
+        text=text,
+        linked=linked,
+        runtime_sync=runtime_sync,
+    )
+    if plan_response is not None:
+        return plan_response
 
     return _handle_question(
         chat_id=chat_id,
