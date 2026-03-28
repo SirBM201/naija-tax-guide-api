@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import Any, Dict, Optional
 
 import requests
@@ -87,6 +88,66 @@ def _build_success_message(
     )
 
 
+def _post_with_retry(
+    *,
+    url: str,
+    json_payload: Dict[str, Any],
+    headers: Optional[Dict[str, str]] = None,
+    timeout: int = 30,
+    attempts: int = 3,
+    backoff_seconds: float = 1.2,
+) -> Dict[str, Any]:
+    last_error: Optional[Exception] = None
+    last_status_code: Optional[int] = None
+    last_response_text: Optional[str] = None
+    last_json: Optional[Dict[str, Any]] = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            resp = requests.post(url, json=json_payload, headers=headers, timeout=timeout)
+            last_status_code = resp.status_code
+
+            try:
+                parsed = resp.json()
+            except Exception:
+                parsed = {"raw_text": resp.text}
+
+            last_json = parsed
+            last_response_text = resp.text
+
+            if resp.status_code < 500:
+                return {
+                    "ok": True,
+                    "status_code": resp.status_code,
+                    "response": parsed,
+                    "attempt": attempt,
+                }
+
+        except requests.RequestException as e:
+            last_error = e
+
+        if attempt < attempts:
+            time.sleep(backoff_seconds * attempt)
+
+    if last_error is not None:
+        return {
+            "ok": False,
+            "kind": "network_error",
+            "root_cause": repr(last_error),
+            "status_code": last_status_code,
+            "response": last_json or {"raw_text": last_response_text},
+            "attempts": attempts,
+        }
+
+    return {
+        "ok": False,
+        "kind": "http_error",
+        "status_code": last_status_code,
+        "response": last_json or {"raw_text": last_response_text},
+        "attempts": attempts,
+    }
+
+
 def _send_whatsapp_text(
     *,
     phone_number: str,
@@ -129,27 +190,46 @@ def _send_whatsapp_text(
     }
 
     try:
-        resp = requests.post(url, json=payload, headers=headers, timeout=30)
-        try:
-            data = resp.json()
-        except Exception:
-            data = {"raw_text": resp.text}
+        result = _post_with_retry(
+            url=url,
+            json_payload=payload,
+            headers=headers,
+            timeout=30,
+            attempts=3,
+            backoff_seconds=1.0,
+        )
 
-        if resp.status_code >= 400:
+        if not result.get("ok"):
+            return {
+                "ok": False,
+                "error": "whatsapp_send_failed",
+                "where": "_send_whatsapp_text",
+                "fix": "Check WhatsApp Cloud API credentials, recipient number format, business permissions, or temporary network issues.",
+                "status_code": result.get("status_code"),
+                "response": result.get("response"),
+                "attempts": result.get("attempts"),
+                "phone_number": phone_number,
+                "transport_kind": result.get("kind"),
+                "root_cause": result.get("root_cause"),
+            }
+
+        if int(result.get("status_code") or 0) >= 400:
             return {
                 "ok": False,
                 "error": "whatsapp_send_failed",
                 "where": "_send_whatsapp_text",
                 "fix": "Check WhatsApp Cloud API credentials, recipient number format, and business account permissions.",
-                "status_code": resp.status_code,
-                "response": data,
+                "status_code": result.get("status_code"),
+                "response": result.get("response"),
+                "attempt": result.get("attempt"),
                 "phone_number": phone_number,
             }
 
         return {
             "ok": True,
             "channel_type": "whatsapp",
-            "delivery_response": data,
+            "delivery_response": result.get("response"),
+            "attempt": result.get("attempt"),
         }
     except Exception as e:
         return _fail(
@@ -187,27 +267,47 @@ def _send_telegram_text(
     }
 
     try:
-        resp = requests.post(url, json=payload, timeout=30)
-        try:
-            data = resp.json()
-        except Exception:
-            data = {"raw_text": resp.text}
+        result = _post_with_retry(
+            url=url,
+            json_payload=payload,
+            headers=None,
+            timeout=30,
+            attempts=4,
+            backoff_seconds=1.2,
+        )
 
-        if resp.status_code >= 400 or not data.get("ok", False):
+        if not result.get("ok"):
+            return {
+                "ok": False,
+                "error": "telegram_send_failed",
+                "where": "_send_telegram_text",
+                "fix": "Check TELEGRAM_BOT_TOKEN, bot permissions, chat state, or temporary network instability.",
+                "status_code": result.get("status_code"),
+                "response": result.get("response"),
+                "attempts": result.get("attempts"),
+                "chat_id": chat_id,
+                "transport_kind": result.get("kind"),
+                "root_cause": result.get("root_cause"),
+            }
+
+        response = result.get("response") or {}
+        if int(result.get("status_code") or 0) >= 400 or not response.get("ok", False):
             return {
                 "ok": False,
                 "error": "telegram_send_failed",
                 "where": "_send_telegram_text",
                 "fix": "Check TELEGRAM_BOT_TOKEN, bot permissions, and whether the chat has started the bot.",
-                "status_code": resp.status_code,
-                "response": data,
+                "status_code": result.get("status_code"),
+                "response": response,
+                "attempt": result.get("attempt"),
                 "chat_id": chat_id,
             }
 
         return {
             "ok": True,
             "channel_type": "telegram",
-            "delivery_response": data,
+            "delivery_response": response,
+            "attempt": result.get("attempt"),
         }
     except Exception as e:
         return _fail(
