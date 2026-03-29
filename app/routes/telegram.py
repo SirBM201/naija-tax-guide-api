@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import inspect
 import re
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from flask import Blueprint, jsonify, request
 
@@ -92,7 +92,6 @@ PLAN_CATALOG: Dict[str, Dict[str, Dict[str, Any]]] = {
     },
 }
 
-
 WELCOME_MENU = (
     "Welcome to Naija Tax Guide ✅\n\n"
     "Reply with:\n"
@@ -101,7 +100,8 @@ WELCOME_MENU = (
     "3 — Check current plan\n"
     "4 — Upgrade subscription\n"
     "5 — Link website account\n"
-    "6 — Help / how to use this bot\n\n"
+    "6 — Referral / invite a friend\n"
+    "7 — Help / how to use this bot\n\n"
     "You can also type your tax question directly at any time."
 )
 
@@ -112,9 +112,17 @@ HELP_TEXT = (
     "• Send 3 to check your current plan\n"
     "• Send 4 to view upgrade options\n"
     "• Send 5 if you want to link your website account\n"
-    "• Send 6 to see this help again\n\n"
-    "You can also type a full tax question directly, for example:\n"
-    "“What expenses are deductible for a small business in Nigeria?”"
+    "• Send 6 for referral / invite a friend\n"
+    "• Send 7 to see this help again\n\n"
+    "You can also type a full tax question directly.\n"
+    "You can also type a plan naturally, for example:\n"
+    "• starter quarterly\n"
+    "• professional yearly\n"
+    "• business monthly\n\n"
+    "You can also type by credit size, for example:\n"
+    "• 100 credits\n"
+    "• 300 AI credits\n"
+    "• 9600 credits"
 )
 
 LINK_TEXT = (
@@ -147,7 +155,11 @@ UPGRADE_TEXT = (
     "You can reply naturally, for example:\n"
     "• I want professional monthly\n"
     "• Give me starter quarterly\n"
-    "• I need business yearly"
+    "• I need business yearly\n\n"
+    "You can also reply by credits, for example:\n"
+    "• 100 credits\n"
+    "• 300 AI credits\n"
+    "• 9600 credits"
 )
 
 PLAN_CONFIRM_WORDS = {"yes", "pay", "continue", "proceed", "go ahead", "ok", "okay"}
@@ -169,18 +181,27 @@ def _sb():
     return supabase() if callable(supabase) else supabase
 
 
+def _clean(value: Any) -> str:
+    return str(value or "").strip()
+
+
 def _clip(value: Any, limit: int = 260) -> str:
     text = str(value or "")
     return text if len(text) <= limit else text[:limit] + "…"
 
 
-def _clean(value: Any) -> str:
-    return str(value or "").strip()
-
-
 def _menu_trigger(text: str) -> bool:
     lowered = _clean(text).lower()
-    return lowered in {"hi", "hello", "hey", "/start", "start", "good morning", "good afternoon", "good evening"}
+    return lowered in {
+        "hi",
+        "hello",
+        "hey",
+        "/start",
+        "start",
+        "good morning",
+        "good afternoon",
+        "good evening",
+    }
 
 
 def _normalize_text(text: str) -> str:
@@ -195,19 +216,28 @@ def _contains_phrase(text: str, phrase: str) -> bool:
     return phrase in text
 
 
-def _get_plan_details(tier: Optional[str], period: Optional[str]) -> Optional[Dict[str, Any]]:
-    if not tier or not period:
-        return None
-    return PLAN_CATALOG.get(tier, {}).get(period)
+def _catalog_plan_list() -> List[Dict[str, Any]]:
+    plans: List[Dict[str, Any]] = []
+    for tier_data in PLAN_CATALOG.values():
+        for plan in tier_data.values():
+            plans.append(plan)
+    return plans
 
 
 def _plan_from_code(plan_code: str) -> Optional[Dict[str, Any]]:
     code = _clean(plan_code).lower()
-    for tier_data in PLAN_CATALOG.values():
-        for plan in tier_data.values():
-            if _clean(plan.get("plan_code")).lower() == code:
-                return plan
+    for plan in _catalog_plan_list():
+        if _clean(plan.get("plan_code")).lower() == code:
+            return plan
     return None
+
+
+def _plans_by_credits(credits: int) -> List[Dict[str, Any]]:
+    matches: List[Dict[str, Any]] = []
+    for plan in _catalog_plan_list():
+        if int(plan.get("credits") or 0) == int(credits):
+            matches.append(plan)
+    return matches
 
 
 def _build_plan_selection_message(plan: Dict[str, Any]) -> str:
@@ -222,6 +252,54 @@ def _build_plan_selection_message(plan: Dict[str, Any]) -> str:
         "Send 4 to see all plans again.\n"
         "You can also still ask tax questions here anytime."
     )
+
+
+def _build_credit_choice_message(credits: int, plans: List[Dict[str, Any]]) -> str:
+    lines = [
+        f"I found more than one plan with {credits} AI credits:\n"
+    ]
+    for idx, plan in enumerate(plans, start=1):
+        lines.append(
+            f"{idx} — {plan.get('display_name')} — {plan.get('price')}"
+        )
+    lines.append("\nReply with 1 or 2 to continue.")
+    return "\n".join(lines)
+
+
+def _extract_credit_intent(text: str) -> Dict[str, Any]:
+    normalized = _normalize_text(text)
+    if not normalized:
+        return {"ok": False}
+
+    match = re.search(r"\b(\d{2,5})\b", normalized)
+    if not match:
+        return {"ok": False}
+
+    credits_value = int(match.group(1))
+    if credits_value not in {100, 300, 800, 900, 1200, 2400, 3600, 9600}:
+        return {"ok": False}
+
+    if "credit" not in normalized and "ai" not in normalized:
+        return {"ok": False}
+
+    plans = _plans_by_credits(credits_value)
+    if not plans:
+        return {"ok": False}
+
+    if len(plans) == 1:
+        return {
+            "ok": True,
+            "kind": "single",
+            "credits": credits_value,
+            "plan": plans[0],
+        }
+
+    return {
+        "ok": True,
+        "kind": "multiple",
+        "credits": credits_value,
+        "plans": plans,
+    }
 
 
 def _detect_plan_intent(text: str) -> Dict[str, Any]:
@@ -245,7 +323,7 @@ def _detect_plan_intent(text: str) -> Dict[str, Any]:
     for code in exact_codes:
         if code in raw.lower() or code.replace("_", " ") in normalized:
             tier, period = code.split("_", 1)
-            plan = _get_plan_details(tier, period)
+            plan = PLAN_CATALOG.get(tier, {}).get(period)
             return {
                 "ok": True,
                 "matched": True,
@@ -269,7 +347,7 @@ def _detect_plan_intent(text: str) -> Dict[str, Any]:
             break
 
     if tier_found and period_found:
-        plan = _get_plan_details(tier_found, period_found)
+        plan = PLAN_CATALOG.get(tier_found, {}).get(period_found)
         return {
             "ok": True,
             "matched": True,
@@ -425,10 +503,6 @@ def _send_guest_welcome(chat_id: Any) -> None:
 
 
 def _resolve_effective_account_id(base_account_id: str, tg_user_id: str) -> Dict[str, Any]:
-    """
-    Telegram should follow channel_identities account linkage first.
-    That avoids saving pending plan on a shell account while the real channel is linked elsewhere.
-    """
     base = _clean(base_account_id)
     provider_id = _clean(tg_user_id)
 
@@ -726,6 +800,30 @@ def _save_pending_plan_selection(
             "pending_plan_price": plan.get("price"),
             "pending_plan_credits": plan.get("credits"),
             "pending_plan_support": plan.get("support"),
+            "pending_credit_options": None,
+        },
+    )
+
+
+def _save_pending_credit_options(
+    *,
+    account_id: str,
+    tg_user_id: str,
+    telegram_chat_id: str,
+    display_name: Optional[str],
+    username: Optional[str],
+    chat_type: Optional[str],
+    plans: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    return _safe_sync_runtime_identity(
+        account_id=account_id,
+        tg_user_id=tg_user_id,
+        telegram_chat_id=telegram_chat_id,
+        display_name=display_name,
+        username=username,
+        chat_type=chat_type,
+        metadata_patch={
+            "pending_credit_options": [p.get("plan_code") for p in plans],
         },
     )
 
@@ -752,7 +850,242 @@ def _clear_pending_plan_selection(
             "pending_plan_price": None,
             "pending_plan_credits": None,
             "pending_plan_support": None,
+            "pending_credit_options": None,
         },
+    )
+
+
+def _get_pending_credit_options(tg_user_id: str) -> List[str]:
+    try:
+        identity = get_channel_identity(
+            channel_type="telegram",
+            provider_user_id=_clean(tg_user_id),
+        )
+        metadata = (identity or {}).get("metadata") or {}
+        if not isinstance(metadata, dict):
+            return []
+        options = metadata.get("pending_credit_options") or []
+        if isinstance(options, list):
+            return [str(x).strip() for x in options if str(x).strip()]
+        return []
+    except Exception:
+        return []
+
+
+def _get_referral_summary(account_id: str) -> Dict[str, Any]:
+    acct = _clean(account_id)
+    if not acct:
+        return {"ok": False, "error": "account_id_required"}
+
+    try:
+        prof_res = (
+            _sb()
+            .table("referral_profiles")
+            .select("*")
+            .eq("account_id", acct)
+            .limit(1)
+            .execute()
+        )
+        prof_rows = getattr(prof_res, "data", None) or []
+        profile = prof_rows[0] if prof_rows else {}
+
+        code = _clean(profile.get("referral_code") or profile.get("code"))
+        referrals_count = profile.get("total_referrals") or profile.get("referrals_count") or profile.get("count")
+
+        link = ""
+        if code:
+            link = f"https://t.me/naija_tax_guide_bot?start=ref_{code}"
+
+        return {
+            "ok": True,
+            "profile": profile,
+            "code": code,
+            "count": referrals_count,
+            "link": link,
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": "referral_lookup_failed",
+            "root_cause": f"{type(e).__name__}: {_clip(e)}",
+            "fix": "Check referral_profiles table access and columns.",
+        }
+
+
+def _format_referral_summary(summary: Dict[str, Any]) -> str:
+    if not summary.get("ok"):
+        return (
+            "❌ Could not load your referral details right now.\n"
+            f"Reason: {summary.get('error', 'unknown_error')}\n"
+            f"Details: {_clip(summary.get('root_cause') or 'n/a')}\n"
+            f"Fix: {_clip(summary.get('fix') or 'Check referral setup.')}"
+        )
+
+    code = summary.get("code") or "Not available"
+    count = summary.get("count")
+    link = summary.get("link") or "Not available"
+
+    return (
+        "Referral / Invite a Friend:\n\n"
+        f"Referral code: {code}\n"
+        f"Total referrals: {count if count is not None else 'Not available'}\n"
+        f"Referral link: {link}\n\n"
+        "Share your referral code or link with friends."
+    )
+
+
+def _handle_credit_phrase(
+    *,
+    chat_id: Any,
+    text: str,
+    effective_account_id: str,
+    tg_user_id: str,
+    telegram_chat_id: str,
+    display_name: Optional[str],
+    username: Optional[str],
+    chat_type: Optional[str],
+    linked: bool,
+    runtime_sync: Dict[str, Any] | None,
+) -> Any:
+    credit_match = _extract_credit_intent(text)
+    if not credit_match.get("ok"):
+        return None
+
+    if credit_match.get("kind") == "single":
+        plan = credit_match.get("plan")
+        saved = _save_pending_plan_selection(
+            account_id=effective_account_id,
+            tg_user_id=tg_user_id,
+            telegram_chat_id=telegram_chat_id,
+            display_name=display_name,
+            username=username,
+            chat_type=chat_type,
+            plan=plan,
+        )
+        if not saved.get("ok"):
+            send_telegram_text(
+                chat_id,
+                "❌ I recognized the credit-based plan selection, but could not save it.\nPlease try again."
+            )
+            return jsonify(
+                {
+                    "ok": False,
+                    "linked": linked,
+                    "mode": "credit_plan_save_failed",
+                    "runtime_sync": runtime_sync,
+                }
+            ), 200
+
+        send_telegram_text(chat_id, _build_plan_selection_message(plan))
+        return jsonify(
+            {
+                "ok": True,
+                "linked": linked,
+                "mode": "credit_plan_single_detected",
+                "runtime_sync": runtime_sync,
+                "credit_match": credit_match,
+            }
+        )
+
+    plans = credit_match.get("plans") or []
+    saved = _save_pending_credit_options(
+        account_id=effective_account_id,
+        tg_user_id=tg_user_id,
+        telegram_chat_id=telegram_chat_id,
+        display_name=display_name,
+        username=username,
+        chat_type=chat_type,
+        plans=plans,
+    )
+    send_telegram_text(
+        chat_id,
+        _build_credit_choice_message(int(credit_match.get("credits")), plans),
+    )
+    return jsonify(
+        {
+            "ok": True,
+            "linked": linked,
+            "mode": "credit_plan_multiple_detected",
+            "runtime_sync": runtime_sync,
+            "credit_match": credit_match,
+            "saved_credit_options": saved,
+        }
+    )
+
+
+def _handle_numeric_credit_choice(
+    *,
+    chat_id: Any,
+    text: str,
+    effective_account_id: str,
+    tg_user_id: str,
+    telegram_chat_id: str,
+    display_name: Optional[str],
+    username: Optional[str],
+    chat_type: Optional[str],
+    linked: bool,
+    runtime_sync: Dict[str, Any] | None,
+) -> Any:
+    choice_text = _clean(text)
+    if choice_text not in {"1", "2", "3"}:
+        return None
+
+    options = _get_pending_credit_options(tg_user_id)
+    if not options:
+        return None
+
+    idx = int(choice_text) - 1
+    if idx < 0 or idx >= len(options):
+        send_telegram_text(chat_id, "Invalid option. Please reply with one of the shown option numbers.")
+        return jsonify(
+            {
+                "ok": True,
+                "linked": linked,
+                "mode": "invalid_credit_choice",
+                "runtime_sync": runtime_sync,
+            }
+        )
+
+    plan = _plan_from_code(options[idx])
+    if not plan:
+        send_telegram_text(chat_id, "I could not load the selected plan. Send 4 to view plans again.")
+        return jsonify(
+            {
+                "ok": False,
+                "linked": linked,
+                "mode": "credit_choice_plan_missing",
+                "runtime_sync": runtime_sync,
+            }
+        ), 200
+
+    saved = _save_pending_plan_selection(
+        account_id=effective_account_id,
+        tg_user_id=tg_user_id,
+        telegram_chat_id=telegram_chat_id,
+        display_name=display_name,
+        username=username,
+        chat_type=chat_type,
+        plan=plan,
+    )
+    if not saved.get("ok"):
+        send_telegram_text(chat_id, "❌ Could not save your selected plan. Please try again.")
+        return jsonify(
+            {
+                "ok": False,
+                "linked": linked,
+                "mode": "credit_choice_save_failed",
+                "runtime_sync": runtime_sync,
+            }
+        ), 200
+
+    send_telegram_text(chat_id, _build_plan_selection_message(plan))
+    return jsonify(
+        {
+            "ok": True,
+            "linked": linked,
+            "mode": "credit_choice_resolved",
+            "runtime_sync": runtime_sync,
+        }
     )
 
 
@@ -796,7 +1129,8 @@ def _handle_payment_confirmation(
             "Or type a plan naturally, for example:\n"
             "• starter quarterly\n"
             "• professional monthly\n"
-            "• business yearly"
+            "• business yearly\n"
+            "• 300 AI credits"
         )
         return jsonify(
             {
@@ -871,8 +1205,7 @@ def _handle_payment_confirmation(
     if not payment_url:
         send_telegram_text(
             chat_id,
-            "❌ Payment initialization ran, but no authorization URL was returned.\n"
-            "Please try again."
+            "❌ Payment initialization ran, but no authorization URL was returned.\nPlease try again."
         )
         return jsonify(
             {
@@ -1141,6 +1474,19 @@ def _handle_menu_option(
         )
 
     if option == "6":
+        summary = _get_referral_summary(account_id)
+        send_telegram_text(chat_id, _format_referral_summary(summary))
+        return jsonify(
+            {
+                "ok": True,
+                "linked": linked,
+                "mode": "referral_summary",
+                "runtime_sync": runtime_sync,
+                "referral": summary,
+            }
+        )
+
+    if option == "7":
         send_telegram_text(chat_id, HELP_TEXT)
         return jsonify(
             {
@@ -1163,16 +1509,6 @@ def _handle_menu_option(
 
 @bp.post("/telegram/webhook")
 def tg_webhook():
-    """
-    Channel-first Telegram behavior:
-    - User can start directly from Telegram
-    - Referral is optional
-    - Website linking is optional
-    - Menu-driven onboarding for hi/hello/start
-    - Direct-question fallback remains available
-    - Natural-language plan recognition is supported
-    - YES/PAY confirmation uses initialize_channel_subscription_context
-    """
     update = request.get_json(silent=True) or {}
 
     msg = update.get("message") or update.get("edited_message") or {}
@@ -1325,6 +1661,21 @@ def tg_webhook():
 
     lowered = text.lower().strip()
 
+    credit_choice_response = _handle_numeric_credit_choice(
+        chat_id=chat_id,
+        text=text,
+        effective_account_id=effective_account_id,
+        tg_user_id=tg_user_id,
+        telegram_chat_id=str(chat_id),
+        display_name=display_name,
+        username=tg_username,
+        chat_type=chat_type,
+        linked=linked,
+        runtime_sync=runtime_sync,
+    )
+    if credit_choice_response is not None:
+        return credit_choice_response
+
     if lowered in PLAN_CONFIRM_WORDS:
         return _handle_payment_confirmation(
             chat_id=chat_id,
@@ -1338,7 +1689,7 @@ def tg_webhook():
             runtime_sync=runtime_sync,
         )
 
-    if lowered in {"1", "2", "3", "4", "5", "6"}:
+    if lowered in {"1", "2", "3", "4", "5", "6", "7"}:
         return _handle_menu_option(
             option=lowered,
             chat_id=chat_id,
@@ -1347,6 +1698,21 @@ def tg_webhook():
             runtime_sync=runtime_sync,
             linked=linked,
         )
+
+    credit_response = _handle_credit_phrase(
+        chat_id=chat_id,
+        text=text,
+        effective_account_id=effective_account_id,
+        tg_user_id=tg_user_id,
+        telegram_chat_id=str(chat_id),
+        display_name=display_name,
+        username=tg_username,
+        chat_type=chat_type,
+        linked=linked,
+        runtime_sync=runtime_sync,
+    )
+    if credit_response is not None:
+        return credit_response
 
     plan_response = _handle_plan_phrase(
         chat_id=chat_id,
