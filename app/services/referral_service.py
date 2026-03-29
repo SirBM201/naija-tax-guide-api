@@ -40,12 +40,22 @@ def _clean_code(value: str | None) -> str:
 
 
 def _frontend_base_url() -> str:
-    return (
+    raw = (
         os.getenv("FRONTEND_APP_URL")
         or os.getenv("NEXT_PUBLIC_APP_URL")
         or os.getenv("APP_PUBLIC_URL")
         or ""
-    ).rstrip("/")
+    ).strip()
+
+    if not raw:
+        return ""
+
+    # Allow accidental comma-separated env values and pick the first usable URL.
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    if not parts:
+        return ""
+
+    return parts[0].rstrip("/")
 
 
 def _choice(chars: str, n: int) -> str:
@@ -704,7 +714,7 @@ def qualify_referral_after_successful_payment(
             "referral_id": direct_referral_id,
         }
 
-    beneficiaries = _find_level_chain_for_paid_user(paying_account_id)
+    beneficiaries = _find_level_chain_for_paid_user(paid_account_id)
     if not beneficiaries:
         return {
             "ok": True,
@@ -958,7 +968,7 @@ def get_referral_summary(account_id: str) -> Dict[str, Any]:
         .order("created_at", desc=True)
         .execute()
     )
-    rewards = _response_data(resp) if (resp := rewards_resp) else []
+    rewards = _response_data(rewards_resp)
 
     payouts_resp = (
         _sb()
