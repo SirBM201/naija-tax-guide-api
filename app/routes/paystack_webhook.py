@@ -7,6 +7,7 @@ from flask import Blueprint, jsonify, request
 from app.core.supabase_client import supabase
 from app.services.paystack_service import verify_webhook_signature
 from app.services.referral_service import (
+    ensure_referral_profile,
     qualify_referral_after_successful_payment,
     reverse_rewards_for_payment_reference,
 )
@@ -182,6 +183,16 @@ def _handle_successful_payment(
         plan_code=plan_code,
     )
 
+    # Ensure the payer has their own referral profile after first successful payment.
+    try:
+        ensured_referral_profile = ensure_referral_profile(account_id)
+    except Exception as e:
+        ensured_referral_profile = {
+            "ok": False,
+            "error": "ensure_referral_profile_failed",
+            "root_cause": repr(e),
+        }
+
     referral = qualify_referral_after_successful_payment(
         paying_account_id=account_id,
         payment_reference=reference,
@@ -197,6 +208,7 @@ def _handle_successful_payment(
     return {
         "ok": True,
         "activation": activation,
+        "ensured_referral_profile": ensured_referral_profile,
         "referral": referral,
         "channel_notification": channel_notification,
     }
