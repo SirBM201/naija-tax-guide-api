@@ -23,11 +23,23 @@ def _humanize_plan_code(plan_code: str) -> str:
     return code.replace("_", " ").title()
 
 
-def _build_telegram_return_link() -> str:
+def _telegram_bot_username() -> str:
     bot_username = _clean(request.args.get("bot")) or _clean(os.getenv("TELEGRAM_BOT_USERNAME"))
+    if bot_username.startswith("@"):
+        bot_username = bot_username[1:]
+    return bot_username
+
+
+def _build_telegram_app_link() -> str:
+    bot_username = _telegram_bot_username()
     if bot_username:
-        if bot_username.startswith("@"):
-            bot_username = bot_username[1:]
+        return f"tg://resolve?domain={bot_username}"
+    return "tg://resolve"
+
+
+def _build_telegram_web_link() -> str:
+    bot_username = _telegram_bot_username()
+    if bot_username:
         return f"https://t.me/{bot_username}"
     return "https://t.me"
 
@@ -48,8 +60,47 @@ def _render_channel_return_page(
     reference: str,
     plan_code: str,
     status_text: str,
+    channel_type: str,
 ) -> Response:
     pretty_plan = _humanize_plan_code(plan_code)
+
+    telegram_app_link = _build_telegram_app_link()
+    telegram_web_link = _build_telegram_web_link()
+
+    if channel_type == "telegram":
+        button_html = f"""
+        <a
+          class="btn"
+          href="{escape(telegram_web_link)}"
+          onclick="return openTelegramApp(event)"
+        >
+          {escape(button_label)}
+        </a>
+        """
+        extra_script = f"""
+        <script>
+          function openTelegramApp(event) {{
+            event.preventDefault();
+
+            var appUrl = {telegram_app_link!r};
+            var webUrl = {telegram_web_link!r};
+
+            try {{
+              window.location.href = appUrl;
+              setTimeout(function() {{
+                window.location.href = webUrl;
+              }}, 900);
+            }} catch (e) {{
+              window.location.href = webUrl;
+            }}
+
+            return false;
+          }}
+        </script>
+        """
+    else:
+        button_html = f'<a class="btn" href="{escape(button_url)}">{escape(button_label)}</a>'
+        extra_script = ""
 
     html = f"""<!doctype html>
 <html lang="en">
@@ -146,7 +197,7 @@ def _render_channel_return_page(
         <div><strong>Reference:</strong> {escape(reference or "Not available")}</div>
       </div>
 
-      <a class="btn" href="{escape(button_url)}">{escape(button_label)}</a>
+      {button_html}
 
       <div class="small">
         You can now return to your channel and continue using Naija Tax Guide.<br>
@@ -154,6 +205,7 @@ def _render_channel_return_page(
       </div>
     </div>
   </div>
+  {extra_script}
 </body>
 </html>"""
     return Response(html, status=200, mimetype="text/html")
@@ -168,8 +220,47 @@ def _render_pending_page(
     reference: str,
     plan_code: str,
     status_text: str,
+    channel_type: str,
 ) -> Response:
     pretty_plan = _humanize_plan_code(plan_code)
+
+    telegram_app_link = _build_telegram_app_link()
+    telegram_web_link = _build_telegram_web_link()
+
+    if channel_type == "telegram":
+        button_html = f"""
+        <a
+          class="btn"
+          href="{escape(telegram_web_link)}"
+          onclick="return openTelegramApp(event)"
+        >
+          {escape(button_label)}
+        </a>
+        """
+        extra_script = f"""
+        <script>
+          function openTelegramApp(event) {{
+            event.preventDefault();
+
+            var appUrl = {telegram_app_link!r};
+            var webUrl = {telegram_web_link!r};
+
+            try {{
+              window.location.href = appUrl;
+              setTimeout(function() {{
+                window.location.href = webUrl;
+              }}, 900);
+            }} catch (e) {{
+              window.location.href = webUrl;
+            }}
+
+            return false;
+          }}
+        </script>
+        """
+    else:
+        button_html = f'<a class="btn" href="{escape(button_url)}">{escape(button_label)}</a>'
+        extra_script = ""
 
     html = f"""<!doctype html>
 <html lang="en">
@@ -258,13 +349,14 @@ def _render_pending_page(
         <div><strong>Reference:</strong> {escape(reference or "Not available")}</div>
       </div>
 
-      <a class="btn" href="{escape(button_url)}">{escape(button_label)}</a>
+      {button_html}
 
       <div class="small">
         If payment was completed successfully, your channel confirmation message should arrive shortly.
       </div>
     </div>
   </div>
+  {extra_script}
 </body>
 </html>"""
     return Response(html, status=200, mimetype="text/html")
@@ -356,13 +448,13 @@ def channel_payment_return():
 
     if channel_type == "telegram":
         button_label = "Return to Telegram"
-        button_url = _build_telegram_return_link()
+        button_url = _build_telegram_web_link()
     elif channel_type == "whatsapp":
         button_label = "Return to WhatsApp"
         button_url = _build_whatsapp_return_link(provider_user_id)
     else:
         button_label = "Open channel"
-        button_url = _build_telegram_return_link()
+        button_url = _build_telegram_web_link()
 
     if not reference:
         return _render_pending_page(
@@ -373,6 +465,7 @@ def channel_payment_return():
             reference="",
             plan_code=plan_code,
             status_text="missing_reference",
+            channel_type=channel_type,
         )
 
     try:
@@ -390,13 +483,13 @@ def channel_payment_return():
 
         if channel_type == "telegram":
             button_label = "Return to Telegram"
-            button_url = _build_telegram_return_link()
+            button_url = _build_telegram_web_link()
         elif channel_type == "whatsapp":
             button_label = "Return to WhatsApp"
             button_url = _build_whatsapp_return_link(provider_user_id)
         else:
             button_label = "Open channel"
-            button_url = _build_telegram_return_link()
+            button_url = _build_telegram_web_link()
 
     except Exception as e:
         return _render_pending_page(
@@ -410,6 +503,7 @@ def channel_payment_return():
             reference=reference,
             plan_code=plan_code,
             status_text=f"verify_error: {type(e).__name__}",
+            channel_type=channel_type,
         )
 
     if status_text == "success":
@@ -424,6 +518,7 @@ def channel_payment_return():
             reference=reference,
             plan_code=plan_code,
             status_text=status_text,
+            channel_type=channel_type,
         )
 
     return _render_pending_page(
@@ -437,4 +532,5 @@ def channel_payment_return():
         reference=reference,
         plan_code=plan_code,
         status_text=status_text or "unknown",
+        channel_type=channel_type,
     )
