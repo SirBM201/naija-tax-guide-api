@@ -1,16 +1,16 @@
 from __future__ import annotations
 
+import logging
 import os
 import time
 from typing import Any, Dict, Optional
 
-import logging
 import requests
 
 from app.core.supabase_client import supabase
 
 logger = logging.getLogger(__name__)
-SERVICE_VERSION = "channel_post_payment_service_v2_debug"
+SERVICE_VERSION = "channel_post_payment_service_v3_fixed"
 
 
 def _sb():
@@ -32,6 +32,13 @@ def _fail(where: str, error: Any, fix: str, extra: Optional[Dict[str, Any]] = No
     if extra:
         payload.update(extra)
     return payload
+
+
+def _humanize_plan_code(plan_code: str) -> str:
+    code = _clean(plan_code).lower()
+    if not code:
+        return "Not available"
+    return code.replace("_", " ").title()
 
 
 def get_account_by_account_id(account_id: str) -> Optional[Dict[str, Any]]:
@@ -75,21 +82,169 @@ def get_channel_identity(
     if provider_id:
         query = query.eq("provider_user_id", provider_id)
 
+    try:
+        query = query.order("updated_at", desc=True)
+    except Exception:
+        pass
+
     res = query.limit(1).execute()
     rows = getattr(res, "data", None) or []
     return rows[0] if rows else None
 
 
+def get_channel_identity_by_provider_user_id(
+    *,
+    channel_type: str,
+    provider_user_id: str,
+) -> Optional[Dict[str, Any]]:
+    channel = _clean(channel_type).lower()
+    provider_id = _clean(provider_user_id)
+
+    if not channel or not provider_id:
+        return None
+
+    query = (
+        _sb()
+        .table("channel_identities")
+        .select("*")
+        .eq("channel_type", channel)
+        .eq("provider_user_id", provider_id)
+    )
+
+    try:
+        query = query.order("updated_at", desc=True)
+    except Exception:
+        pass
+
+    res = query.limit(1).execute()
+    rows = getattr(res, "data", None) or []
+    return rows[0] if rows else None
+
+
+def get_latest_subscription(account_id: str) -> Optional[Dict[str, Any]]:
+    acct = _clean(account_id)
+    if not acct:
+        return None
+
+    query = (
+        _sb()
+        .table("user_subscriptions")
+        .select("*")
+        .eq("account_id", acct)
+    )
+
+    order_attempts = [
+        ("created_at", True),
+        ("updated_at", True),
+        (None, False),
+    ]
+
+    for column, do_order in order_attempts:
+        try:
+            q = query
+            if do_order and column:
+                q = q.order(column, desc=True)
+            res = q.limit(3).execute()
+            rows = getattr(res, "data", None) or []
+            if not rows:
+                return None
+
+            active_row = None
+            for row in rows:
+                if row.get("is_active") is True or _clean(row.get("status")).lower() in {"active", "trialing"}:
+                    active_row = row
+                    break
+
+            return active_row or rows[0]
+        except Exception:
+            continue
+
+    return None
+
+
+def get_credit_balance(account_id: str) -> Optional[int]:
+    acct = _clean(account_id)
+    if not acct:
+        return None
+
+    try:
+        res = (
+            _sb()
+            .table("ai_credit_balances")
+            .select("*")
+            .eq("account_id", acct)
+            .limit(1)
+            .execute()
+        )
+        rows = getattr(res, "data", None) or []
+        row = rows[0] if rows else {}
+        value = row.get("balance")
+        return int(value) if value is not None else None
+    except Exception:
+        return None
+
+
+def get_referral_profile(account_id: str) -> Optional[Dict[str, Any]]:
+    acct = _clean(account_id)
+    if not acct:
+        return None
+
+    try:
+        res = (
+            _sb()
+            .table("referral_profiles")
+            .select("*")
+            .eq("account_id", acct)
+            .limit(1)
+            .execute()
+        )
+        rows = getattr(res, "data", None) or []
+        return rows[0] if rows else None
+    except Exception:
+        return None
+
+
 def _build_success_message(
     *,
     plan_code: str,
+    current_period_end: Optional[str] = None,
+    credit_balance: Optional[int] = None,
+    referral_code: Optional[str] = None,
 ) -> str:
-    return (
-        f"Payment received successfully.\n\n"
-        f"Your Naija Tax Guide subscription is now active.\n"
-        f"Plan: {plan_code}\n\n"
-        f"You can now continue using your paid access."
+    plan_label = _humanize_plan_code(plan_code)
+
+    lines = [
+        "✅ Payment received successfully.",
+        "",
+        "Your Naija Tax Guide subscription is now active.",
+        f"Plan: {plan_label}",
+    ]
+
+    if credit_balance is not None:
+        lines.append(f"Current AI credits balance: {credit_balance}")
+
+    if current_period_end:
+        lines.append(f"Expires: {current_period_end}")
+
+    if referral_code:
+        lines.extend(
+            [
+                "",
+                f"Your referral code: {referral_code}",
+            ]
+        )
+
+    lines.extend(
+        [
+            "",
+            "You can now continue using your paid access.",
+            "Send 2 to check AI credits balance.",
+            "Send 3 to check your current plan.",
+            "Send 6 to view your referral details.",
+        ]
     )
+
+    return "\n".join(lines)
 
 
 def _post_with_retry(
