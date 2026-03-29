@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, Optional, Tuple
 
+import logging
 from flask import Blueprint, jsonify, request
 
 from app.core.supabase_client import supabase
@@ -24,6 +25,8 @@ from app.services.referral_service import ensure_referral_profile, qualify_refer
 from app.services.channel_post_payment_service import notify_channel_payment_success
 
 bp = Blueprint("billing", __name__)
+logger = logging.getLogger(__name__)
+ROUTE_VERSION = "billing_webhook_v3_debug_channel_notify"
 
 
 def _sb():
@@ -938,12 +941,19 @@ def billing_webhook():
     - initializes plan credits
     - ensures referral profile exists
     - sends post-payment channel notification for Telegram / WhatsApp origin payments
+    - exposes detailed root cause information for debugging
     """
     raw_body = request.get_data(cache=False) or b""
     sig = (request.headers.get("x-paystack-signature") or "").strip()
 
     if not verify_webhook_signature(raw_body, sig):
-        return jsonify({"ok": False, "error": "invalid_signature"}), 401
+        logger.warning("[%s] invalid_signature", ROUTE_VERSION)
+        return jsonify({
+            "ok": False,
+            "route_version": ROUTE_VERSION,
+            "error": "invalid_signature",
+            "fix": "Confirm Paystack webhook secret and x-paystack-signature handling.",
+        }), 401
 
     payload = request.get_json(silent=True) or {}
     event_type = (payload.get("event") or "").strip().lower()
@@ -958,101 +968,167 @@ def billing_webhook():
         payload=payload,
     )
 
-    result: Dict[str, Any] = {"ok": True, "event_type": event_type, "reference": reference}
+    metadata = data.get("metadata") or {}
+    if not isinstance(metadata, dict):
+        metadata = {}
 
-    if event_type == "charge.success":
-        metadata = data.get("metadata") or {}
-        if not isinstance(metadata, dict):
-            metadata = {}
+    plan_code = (metadata.get("plan_code") or "").strip().lower()
+    account_id = (metadata.get("account_id") or "").strip()
+    channel_type = (metadata.get("channel_type") or "").strip().lower()
+    provider_user_id = (metadata.get("provider_user_id") or "").strip() or None
 
-        plan_code = (metadata.get("plan_code") or "").strip().lower()
-        account_id = (metadata.get("account_id") or "").strip()
-        channel_type = (metadata.get("channel_type") or "").strip().lower()
-        provider_user_id = (metadata.get("provider_user_id") or "").strip() or None
+    logger.info(
+        "[%s] event=%s reference=%s tx_id=%s account_id=%s plan_code=%s channel_type=%s provider_user_id=%s",
+        ROUTE_VERSION,
+        event_type,
+        reference,
+        tx_id,
+        account_id,
+        plan_code,
+        channel_type,
+        provider_user_id,
+    )
 
-        result["metadata"] = {
+    result: Dict[str, Any] = {
+        "ok": True,
+        "route_version": ROUTE_VERSION,
+        "event_type": event_type,
+        "reference": reference,
+        "tx_id": tx_id,
+        "metadata": {
             "account_id": account_id,
             "plan_code": plan_code,
             "channel_type": channel_type,
             "provider_user_id": provider_user_id,
+        },
+    }
+
+    if event_type != "charge.success":
+        result["skipped"] = True
+        result["reason"] = "not_charge_success"
+        logger.info("[%s] skipped event_type=%s", ROUTE_VERSION, event_type)
+        return jsonify(result), 200
+
+    if not (plan_code and account_id and reference):
+        result.update(
+            {
+                "ok": False,
+                "error": "missing_payment_metadata",
+                "root_cause": "charge.success received without required metadata fields",
+                "fix": "Ensure Paystack initialization stores account_id, plan_code, channel_type, and provider_user_id inside metadata.",
+            }
+        )
+        logger.warning("[%s] missing metadata result=%s", ROUTE_VERSION, result)
+        return jsonify(result), 200
+
+    plan = get_plan(plan_code)
+    if not plan:
+        result.update(
+            {
+                "ok": False,
+                "error": "plan_not_found",
+                "root_cause": f"No plan matched plan_code={plan_code}",
+                "fix": "Confirm get_plan(plan_code) returns the selected package.",
+            }
+        )
+        logger.warning("[%s] plan not found plan_code=%s", ROUTE_VERSION, plan_code)
+        return jsonify(result), 200
+
+    try:
+        sub = _upsert_user_subscription(
+            account_id=account_id,
+            plan_code=plan_code,
+            duration_days=int(plan["duration_days"]),
+            provider="paystack",
+            provider_ref=reference,
+        )
+    except Exception as e:
+        sub = {
+            "ok": False,
+            "error": "subscription_upsert_failed",
+            "root_cause": repr(e),
+            "fix": "Check _upsert_user_subscription logic and user_subscriptions table constraints.",
         }
 
-        if plan_code and account_id and reference:
-            plan = get_plan(plan_code)
-            if plan:
-                sub = _upsert_user_subscription(
-                    account_id=account_id,
-                    plan_code=plan_code,
-                    duration_days=int(plan["duration_days"]),
-                    provider="paystack",
-                    provider_ref=reference,
-                )
-                credit_init = _init_plan_credits_safe(account_id, plan_code)
+    try:
+        credit_init = _init_plan_credits_safe(account_id, plan_code)
+    except Exception as e:
+        credit_init = {
+            "ok": False,
+            "error": "credit_init_failed",
+            "root_cause": repr(e),
+            "fix": "Check init_credits_for_plan and ai_credit_balances / ai_daily_usage table logic.",
+        }
 
-                try:
-                    referral_profile = ensure_referral_profile(account_id)
-                except Exception as e:
-                    referral_profile = {
-                        "ok": False,
-                        "error": "ensure_referral_profile_failed",
-                        "root_cause": repr(e),
-                    }
+    try:
+        referral_profile = ensure_referral_profile(account_id)
+    except Exception as e:
+        referral_profile = {
+            "ok": False,
+            "error": "ensure_referral_profile_failed",
+            "root_cause": repr(e),
+            "fix": "Check referral_profiles table access and referral profile creation logic.",
+        }
 
-                try:
-                    referral_qualification = qualify_referral_after_successful_payment(
-                        paying_account_id=account_id,
-                        payment_reference=reference,
-                        plan_code=plan_code,
-                    )
-                except Exception as e:
-                    referral_qualification = {
-                        "ok": False,
-                        "error": "qualify_referral_after_successful_payment_failed",
-                        "root_cause": repr(e),
-                    }
+    try:
+        referral_qualification = qualify_referral_after_successful_payment(
+            paying_account_id=account_id,
+            payment_reference=reference,
+            plan_code=plan_code,
+        )
+    except Exception as e:
+        referral_qualification = {
+            "ok": False,
+            "error": "qualify_referral_after_successful_payment_failed",
+            "root_cause": repr(e),
+            "fix": "Check referral reward qualification logic and payment-reference dedupe behavior.",
+        }
 
-                if channel_type in {"telegram", "whatsapp"}:
-                    try:
-                        channel_notification = notify_channel_payment_success(
-                            account_id=account_id,
-                            channel_type=channel_type,
-                            plan_code=plan_code,
-                            provider_user_id=provider_user_id,
-                        )
-                    except Exception as e:
-                        channel_notification = {
-                            "ok": False,
-                            "error": "channel_notification_failed",
-                            "root_cause": repr(e),
-                        }
-                else:
-                    channel_notification = {
-                        "ok": True,
-                        "skipped": True,
-                        "reason": "not_channel_payment",
-                        "channel_type": channel_type,
-                    }
-
-                result.update(
-                    {
-                        "subscription": sub,
-                        "credits_initialized": credit_init,
-                        "ensured_referral_profile": referral_profile,
-                        "referral_qualification": referral_qualification,
-                        "channel_notification": channel_notification,
-                    }
-                )
-            else:
-                result.update({"ok": False, "error": "plan_not_found", "plan_code": plan_code})
-        else:
-            result.update(
-                {
-                    "ok": False,
-                    "error": "missing_payment_metadata",
-                    "account_id": account_id,
-                    "plan_code": plan_code,
-                    "reference": reference,
-                }
+    if channel_type in {"telegram", "whatsapp"}:
+        try:
+            channel_notification = notify_channel_payment_success(
+                account_id=account_id,
+                channel_type=channel_type,
+                plan_code=plan_code,
+                provider_user_id=provider_user_id,
             )
+        except Exception as e:
+            channel_notification = {
+                "ok": False,
+                "error": "channel_notification_failed",
+                "root_cause": repr(e),
+                "fix": "Check notify_channel_payment_success delivery path and channel identity resolution.",
+            }
+    else:
+        channel_notification = {
+            "ok": True,
+            "skipped": True,
+            "reason": "not_channel_payment",
+            "channel_type": channel_type,
+        }
+
+    result.update(
+        {
+            "subscription": sub,
+            "credits_initialized": credit_init,
+            "ensured_referral_profile": referral_profile,
+            "referral_qualification": referral_qualification,
+            "channel_notification": channel_notification,
+        }
+    )
+
+    logger.info(
+        "[%s] completed reference=%s channel_notification_ok=%s referral_profile_ok=%s credits_ok=%s sub_ok=%s",
+        ROUTE_VERSION,
+        reference,
+        channel_notification.get("ok"),
+        referral_profile.get("ok") if isinstance(referral_profile, dict) else None,
+        credit_init.get("ok") if isinstance(credit_init, dict) else None,
+        sub.get("ok") if isinstance(sub, dict) else None,
+    )
+
+    if not channel_notification.get("ok"):
+        logger.warning("[%s] channel notification failed details=%s", ROUTE_VERSION, _clip(channel_notification, 1200))
 
     return jsonify(result), 200
+
