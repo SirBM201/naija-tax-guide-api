@@ -183,7 +183,6 @@ def _handle_successful_payment(
         plan_code=plan_code,
     )
 
-    # Ensure the payer has their own referral profile after first successful payment.
     try:
         ensured_referral_profile = ensure_referral_profile(account_id)
     except Exception as e:
