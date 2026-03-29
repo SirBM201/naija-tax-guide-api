@@ -11,10 +11,6 @@ from typing import Any, Dict, List, Optional
 from app.core.supabase_client import supabase
 
 
-# =========================================================
-# INTERNAL HELPERS
-# =========================================================
-
 def _sb():
     return supabase() if callable(supabase) else supabase
 
@@ -88,9 +84,10 @@ def _to_decimal(value: Any, default: Decimal = Decimal("0")) -> Decimal:
         return default
 
 
-# =========================================================
-# ENV / PROGRAM CONFIG
-# =========================================================
+def _is_conflict_error(exc: Exception) -> bool:
+    text = repr(exc)
+    return "409" in text or "Conflict" in text or "duplicate key" in text
+
 
 def _program_enabled() -> bool:
     return str(os.getenv("REFERRAL_PROGRAM_ENABLED") or "1").strip().lower() in {
@@ -182,10 +179,6 @@ def _skip_if_existing_reward_found() -> bool:
     }
 
 
-# =========================================================
-# DATA CLASSES
-# =========================================================
-
 @dataclass
 class ReferralBootstrapResult:
     account_id: str
@@ -193,10 +186,6 @@ class ReferralBootstrapResult:
     captured_referral: Optional[Dict[str, Any]]
     skipped_reason: Optional[str] = None
 
-
-# =========================================================
-# LOW-LEVEL READ HELPERS
-# =========================================================
 
 def get_referral_profile_by_account_id(account_id: str) -> Optional[Dict[str, Any]]:
     account_id = str(account_id or "").strip()
@@ -308,10 +297,6 @@ def get_reward_rows_by_payment_reference(payment_reference: str) -> List[Dict[st
     return _response_data(resp)
 
 
-# =========================================================
-# REFERRAL PROFILE CREATION
-# =========================================================
-
 def build_referral_link(referral_code: str) -> str:
     base = _frontend_base_url()
     code = _clean_code(referral_code)
@@ -350,34 +335,50 @@ def ensure_referral_profile(account_id: str) -> Dict[str, Any]:
     if existing:
         return existing
 
-    code = generate_unique_referral_code()
-    link = build_referral_link(code)
     now_iso = _now_iso()
+    last_error: Exception | None = None
 
-    payload = {
-        "account_id": account_id,
-        "referral_code": code,
-        "referral_link": link,
-        "is_active": True,
-        "created_at": now_iso,
-        "updated_at": now_iso,
-    }
+    for _ in range(8):
+        code = generate_unique_referral_code()
+        link = build_referral_link(code)
 
-    resp = _sb().table("referral_profiles").insert(payload).execute()
-    created = _first(resp)
-    if created:
-        return created
+        payload = {
+            "account_id": account_id,
+            "referral_code": code,
+            "referral_link": link,
+            "is_active": True,
+            "created_at": now_iso,
+            "updated_at": now_iso,
+        }
+
+        try:
+            resp = _sb().table("referral_profiles").insert(payload).execute()
+            created = _first(resp)
+            if created:
+                return created
+        except Exception as e:
+            last_error = e
+
+            again = get_referral_profile_by_account_id(account_id)
+            if again:
+                return again
+
+            if _is_conflict_error(e):
+                continue
+            raise
+
+        again = get_referral_profile_by_account_id(account_id)
+        if again:
+            return again
 
     again = get_referral_profile_by_account_id(account_id)
     if again:
         return again
 
-    raise RuntimeError("Failed to create referral profile.")
+    raise RuntimeError(
+        f"Failed to create referral profile after retries. Last error: {repr(last_error)}"
+    )
 
-
-# =========================================================
-# REFERRAL CAPTURE / ACCOUNT BOOTSTRAP
-# =========================================================
 
 def create_pending_referral(
     *,
@@ -420,10 +421,17 @@ def create_pending_referral(
         "updated_at": now_iso,
     }
 
-    resp = _sb().table("referrals").insert(payload).execute()
-    created = _first(resp)
-    if created:
-        return created
+    try:
+        resp = _sb().table("referrals").insert(payload).execute()
+        created = _first(resp)
+        if created:
+            return created
+    except Exception as e:
+        again = get_referral_row_by_referred_account_id(referred_account_id)
+        if again:
+            return again
+        if not _is_conflict_error(e):
+            raise
 
     again = get_referral_row_by_referred_account_id(referred_account_id)
     if again:
@@ -494,10 +502,6 @@ def bootstrap_new_account_for_referrals(
     )
 
 
-# =========================================================
-# REWARD LEDGER HELPERS
-# =========================================================
-
 def _reward_type_for_level(level: int) -> str:
     return f"cash_level_{level}"
 
@@ -563,10 +567,21 @@ def _create_reward_row(
         "updated_at": now_iso,
     }
 
-    resp = _sb().table("referral_rewards").insert(payload).execute()
-    row = _first(resp)
-    if row:
-        return row
+    try:
+        resp = _sb().table("referral_rewards").insert(payload).execute()
+        row = _first(resp)
+        if row:
+            return row
+    except Exception as e:
+        existing = _existing_reward_for_referral_account_level(
+            referral_id=referral_id,
+            account_id=beneficiary_account_id,
+            level=level,
+        )
+        if existing:
+            return existing
+        if not _is_conflict_error(e):
+            raise
 
     existing = _existing_reward_for_referral_account_level(
         referral_id=referral_id,
@@ -580,17 +595,6 @@ def _create_reward_row(
 
 
 def _find_level_chain_for_paid_user(paid_account_id: str) -> List[Dict[str, Any]]:
-    """
-    Returns up to 2 reward recipients for the paying referred user.
-
-    Example:
-      A refers B
-      B refers C
-      C pays
-
-      level 1 => B
-      level 2 => A
-    """
     paid_account_id = str(paid_account_id or "").strip()
     if not paid_account_id:
         return []
@@ -637,25 +641,12 @@ def _find_level_chain_for_paid_user(paid_account_id: str) -> List[Dict[str, Any]
     return chain
 
 
-# =========================================================
-# QUALIFICATION AFTER SUCCESSFUL PAYMENT
-# =========================================================
-
 def qualify_referral_after_successful_payment(
     *,
     paying_account_id: str,
     payment_reference: str,
     plan_code: str | None = None,
 ) -> Dict[str, Any]:
-    """
-    Called after a verified first successful paid subscription.
-
-    Creates:
-      - level 1 reward row for direct referrer (₦500)
-      - level 2 reward row for indirect referrer (₦200), if available
-
-    Rewards start as pending and mature later after hold_days.
-    """
     if not _program_enabled():
         return {
             "ok": True,
@@ -724,7 +715,6 @@ def qualify_referral_after_successful_payment(
 
     now_iso = _now_iso()
 
-    # Mark the direct referral row as qualified before reward creation.
     _sb().table("referrals").update(
         {
             "status": "qualified",
@@ -759,7 +749,6 @@ def qualify_referral_after_successful_payment(
         )
         created_rewards.append(created)
 
-    # Final direct referral status after reward creation.
     target_status = _completed_referral_status()
     if target_status in {"qualified", "rewarded"}:
         _sb().table("referrals").update(
@@ -783,10 +772,6 @@ def qualify_referral_after_successful_payment(
     }
 
 
-# =========================================================
-# HOLD / MATURITY LOGIC
-# =========================================================
-
 def is_reward_ready_to_mature(reward_row: Dict[str, Any], now_dt: Optional[datetime] = None) -> bool:
     now_dt = now_dt or _now()
     status = str(reward_row.get("status") or "").strip().lower()
@@ -806,14 +791,6 @@ def mature_pending_rewards(
     account_id: str | None = None,
     limit: int = 500,
 ) -> Dict[str, Any]:
-    """
-    Converts reward rows from pending -> approved after hold period.
-
-    Call this:
-    - from admin cron
-    - before showing withdrawable balance
-    - before generating payout batch
-    """
     limit = max(1, min(_safe_int(limit, 500), 2000))
     q = (
         _sb()
@@ -836,12 +813,7 @@ def mature_pending_rewards(
 
     for row in rows:
         if not is_reward_ready_to_mature(row, now_dt=now_dt):
-            skipped.append(
-                {
-                    "reward_id": row.get("id"),
-                    "reason": "hold_not_finished",
-                }
-            )
+            skipped.append({"reward_id": row.get("id"), "reason": "hold_not_finished"})
             continue
 
         reward_id = str(row.get("id") or "").strip()
@@ -873,10 +845,6 @@ def mature_pending_rewards(
         "skipped": skipped,
     }
 
-
-# =========================================================
-# DISQUALIFY / EXPIRE / REVERSE HELPERS
-# =========================================================
 
 def disqualify_referral(
     *,
@@ -963,16 +931,11 @@ def reverse_rewards_for_payment_reference(
     }
 
 
-# =========================================================
-# USER SUMMARY / HISTORY
-# =========================================================
-
 def get_referral_summary(account_id: str) -> Dict[str, Any]:
     account_id = str(account_id or "").strip()
     if not account_id:
         raise ValueError("account_id is required")
 
-    # Mature eligible rewards first so dashboard is more accurate.
     _ = mature_pending_rewards(account_id=account_id, limit=1000)
 
     profile = ensure_referral_profile(account_id)
@@ -995,7 +958,7 @@ def get_referral_summary(account_id: str) -> Dict[str, Any]:
         .order("created_at", desc=True)
         .execute()
     )
-    rewards = _response_data(rewards_resp)
+    rewards = _response_data(resp) if (resp := rewards_resp) else []
 
     payouts_resp = (
         _sb()
@@ -1138,10 +1101,6 @@ def list_payouts_for_account(account_id: str, limit: int = 100) -> List[Dict[str
     return _response_data(resp)
 
 
-# =========================================================
-# PAYOUT BATCH HELPERS
-# =========================================================
-
 def get_approved_rewards_for_payout(account_id: str) -> List[Dict[str, Any]]:
     account_id = str(account_id or "").strip()
     if not account_id:
@@ -1167,4 +1126,3 @@ def compute_approved_payout_balance(account_id: str) -> Decimal:
     for row in rows:
         total += _to_decimal(row.get("reward_amount"))
     return total
-
