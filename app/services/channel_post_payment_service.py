@@ -241,6 +241,7 @@ def _build_success_message(
             "You can now continue using your paid access.",
             "Send 2 to check AI credits balance.",
             "Send 3 to check your current plan.",
+            "Send 6 to view your referral details.",
         ]
     )
 
@@ -527,15 +528,12 @@ def notify_channel_payment_success(
 
         identity: Optional[Dict[str, Any]] = None
 
-        # Most reliable path for channel-origin payments:
-        # resolve by provider_user_id first, because account_id may have shifted from shell to linked account.
         if provider_id:
             identity = get_channel_identity_by_provider_user_id(
                 channel_type=channel,
                 provider_user_id=provider_id,
             )
 
-        # Fallback to account-bound lookup.
         if not identity:
             identity = get_channel_identity(
                 account_id=acct,
@@ -543,7 +541,6 @@ def notify_channel_payment_success(
                 provider_user_id=provider_id or None,
             )
 
-        # Final fallback: any identity on that account/channel.
         if not identity:
             identity = get_channel_identity(
                 account_id=acct,
