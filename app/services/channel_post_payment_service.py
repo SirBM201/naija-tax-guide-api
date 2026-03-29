@@ -10,7 +10,7 @@ import requests
 from app.core.supabase_client import supabase
 
 logger = logging.getLogger(__name__)
-SERVICE_VERSION = "channel_post_payment_service_v3_fixed"
+SERVICE_VERSION = "channel_post_payment_service_v4_no_updated_at"
 
 
 def _sb():
@@ -82,11 +82,6 @@ def get_channel_identity(
     if provider_id:
         query = query.eq("provider_user_id", provider_id)
 
-    try:
-        query = query.order("updated_at", desc=True)
-    except Exception:
-        pass
-
     res = query.limit(1).execute()
     rows = getattr(res, "data", None) or []
     return rows[0] if rows else None
@@ -110,11 +105,6 @@ def get_channel_identity_by_provider_user_id(
         .eq("channel_type", channel)
         .eq("provider_user_id", provider_id)
     )
-
-    try:
-        query = query.order("updated_at", desc=True)
-    except Exception:
-        pass
 
     res = query.limit(1).execute()
     rows = getattr(res, "data", None) or []
@@ -227,12 +217,7 @@ def _build_success_message(
         lines.append(f"Expires: {current_period_end}")
 
     if referral_code:
-        lines.extend(
-            [
-                "",
-                f"Your referral code: {referral_code}",
-            ]
-        )
+        lines.extend(["", f"Your referral code: {referral_code}"])
 
     lines.extend(
         [
@@ -372,18 +357,6 @@ def _send_whatsapp_text(
                 "root_cause": result.get("root_cause"),
             }
 
-        if int(result.get("status_code") or 0) >= 400:
-            return {
-                "ok": False,
-                "error": "whatsapp_send_failed",
-                "where": "_send_whatsapp_text",
-                "fix": "Check WhatsApp Cloud API credentials, recipient number format, and business account permissions.",
-                "status_code": result.get("status_code"),
-                "response": result.get("response"),
-                "attempt": result.get("attempt"),
-                "phone_number": phone_number,
-            }
-
         return {
             "ok": True,
             "channel_type": "whatsapp",
@@ -431,7 +404,7 @@ def _send_telegram_text(
             json_payload=payload,
             headers=None,
             timeout=30,
-            attempts=4,
+            attempts=5,
             backoff_seconds=1.2,
         )
 
