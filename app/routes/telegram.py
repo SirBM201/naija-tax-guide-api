@@ -890,7 +890,18 @@ def _get_referral_summary(account_id: str) -> Dict[str, Any]:
         profile = prof_rows[0] if prof_rows else {}
 
         code = _clean(profile.get("referral_code") or profile.get("code"))
-        referrals_count = profile.get("total_referrals") or profile.get("referrals_count") or profile.get("count")
+
+        referrals_res = (
+            _sb()
+            .table("referrals")
+            .select("id", count="exact")
+            .eq("referrer_account_id", acct)
+            .execute()
+        )
+        referrals_count = getattr(referrals_res, "count", None)
+        if referrals_count is None:
+            referral_rows = getattr(referrals_res, "data", None) or []
+            referrals_count = len(referral_rows)
 
         link = ""
         if code:
@@ -900,7 +911,7 @@ def _get_referral_summary(account_id: str) -> Dict[str, Any]:
             "ok": True,
             "profile": profile,
             "code": code,
-            "count": referrals_count,
+            "count": int(referrals_count or 0),
             "link": link,
         }
     except Exception as e:
@@ -908,7 +919,7 @@ def _get_referral_summary(account_id: str) -> Dict[str, Any]:
             "ok": False,
             "error": "referral_lookup_failed",
             "root_cause": f"{type(e).__name__}: {_clip(e)}",
-            "fix": "Check referral_profiles table access and columns.",
+            "fix": "Check referral_profiles/referrals table access and columns.",
         }
 
 
@@ -928,7 +939,7 @@ def _format_referral_summary(summary: Dict[str, Any]) -> str:
     return (
         "Referral / Invite a Friend:\n\n"
         f"Referral code: {code}\n"
-        f"Total referrals: {count if count is not None else 'Not available'}\n"
+        f"Total referrals: {count if count is not None else 0}\n"
         f"Referral link: {link}\n\n"
         "Share your referral code or link with friends."
     )
