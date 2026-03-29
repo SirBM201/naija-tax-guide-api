@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, Optional, Tuple
-
+import json
 import logging
+
 from flask import Blueprint, jsonify, request
 
 from app.core.supabase_client import supabase
@@ -26,7 +27,7 @@ from app.services.channel_post_payment_service import notify_channel_payment_suc
 
 bp = Blueprint("billing", __name__)
 logger = logging.getLogger(__name__)
-ROUTE_VERSION = "billing_webhook_v3_debug_channel_notify"
+ROUTE_VERSION = "billing_webhook_v4_raw_json_fix"
 
 
 def _sb():
@@ -552,6 +553,19 @@ def _start_checkout_for_plan_change(
     }, None
 
 
+def _extract_reference(data: Dict[str, Any]) -> str:
+    return (data.get("reference") or "").strip()
+
+
+def _extract_status(data: Dict[str, Any]) -> str:
+    return str(data.get("status") or "").strip().lower()
+
+
+def _extract_metadata(data: Dict[str, Any]) -> Dict[str, Any]:
+    md = data.get("metadata")
+    return md if isinstance(md, dict) else {}
+
+
 # -------------------- ROUTES --------------------
 
 
@@ -936,6 +950,7 @@ def billing_webhook():
     """
     Paystack webhook:
     - validates signature
+    - parses raw JSON body first
     - stores event
     - on charge.success -> activates subscription
     - initializes plan credits
@@ -955,11 +970,43 @@ def billing_webhook():
             "fix": "Confirm Paystack webhook secret and x-paystack-signature handling.",
         }), 401
 
-    payload = request.get_json(silent=True) or {}
+    payload: Dict[str, Any] = {}
+    parse_mode = "unknown"
+    parse_error = None
+
+    if raw_body:
+        try:
+            payload = json.loads(raw_body.decode("utf-8"))
+            parse_mode = "raw_json"
+        except Exception as e:
+            parse_error = f"{type(e).__name__}: {e}"
+
+    if not payload:
+        try:
+            payload = request.get_json(force=True, silent=True) or {}
+            if payload:
+                parse_mode = "flask_force_json"
+        except Exception as e:
+            parse_error = f"{type(e).__name__}: {e}"
+
+    if not payload:
+        logger.warning("[%s] empty webhook payload parse_error=%s", ROUTE_VERSION, parse_error)
+        return jsonify({
+            "ok": False,
+            "route_version": ROUTE_VERSION,
+            "error": "empty_webhook_payload",
+            "root_cause": parse_error or "Could not parse Paystack webhook body",
+            "fix": "Parse webhook body from raw request bytes before relying on request.get_json().",
+            "content_type": request.headers.get("content-type"),
+            "content_length": request.headers.get("content-length"),
+            "raw_excerpt": raw_body[:500].decode("utf-8", errors="replace"),
+        }), 400
+
     event_type = (payload.get("event") or "").strip().lower()
     data = payload.get("data") or {}
-    reference = (data.get("reference") or "").strip() or None
+    reference = _extract_reference(data) or None
     tx_id = str(data.get("id") or "") or None
+    status_text = _extract_status(data)
 
     _store_paystack_event(
         event_id=tx_id,
@@ -968,18 +1015,16 @@ def billing_webhook():
         payload=payload,
     )
 
-    metadata = data.get("metadata") or {}
-    if not isinstance(metadata, dict):
-        metadata = {}
-
+    metadata = _extract_metadata(data)
     plan_code = (metadata.get("plan_code") or "").strip().lower()
     account_id = (metadata.get("account_id") or "").strip()
     channel_type = (metadata.get("channel_type") or "").strip().lower()
     provider_user_id = (metadata.get("provider_user_id") or "").strip() or None
 
     logger.info(
-        "[%s] event=%s reference=%s tx_id=%s account_id=%s plan_code=%s channel_type=%s provider_user_id=%s",
+        "[%s] parse_mode=%s event=%s reference=%s tx_id=%s account_id=%s plan_code=%s channel_type=%s provider_user_id=%s",
         ROUTE_VERSION,
+        parse_mode,
         event_type,
         reference,
         tx_id,
@@ -992,9 +1037,11 @@ def billing_webhook():
     result: Dict[str, Any] = {
         "ok": True,
         "route_version": ROUTE_VERSION,
+        "parse_mode": parse_mode,
         "event_type": event_type,
         "reference": reference,
         "tx_id": tx_id,
+        "status": status_text,
         "metadata": {
             "account_id": account_id,
             "plan_code": plan_code,
@@ -1016,6 +1063,7 @@ def billing_webhook():
                 "error": "missing_payment_metadata",
                 "root_cause": "charge.success received without required metadata fields",
                 "fix": "Ensure Paystack initialization stores account_id, plan_code, channel_type, and provider_user_id inside metadata.",
+                "raw_excerpt": raw_body[:500].decode("utf-8", errors="replace"),
             }
         )
         logger.warning("[%s] missing metadata result=%s", ROUTE_VERSION, result)
@@ -1118,10 +1166,11 @@ def billing_webhook():
     )
 
     logger.info(
-        "[%s] completed reference=%s channel_notification_ok=%s referral_profile_ok=%s credits_ok=%s sub_ok=%s",
+        "[%s] completed reference=%s parse_mode=%s channel_notification_ok=%s referral_profile_ok=%s credits_ok=%s sub_ok=%s",
         ROUTE_VERSION,
         reference,
-        channel_notification.get("ok"),
+        parse_mode,
+        channel_notification.get("ok") if isinstance(channel_notification, dict) else None,
         referral_profile.get("ok") if isinstance(referral_profile, dict) else None,
         credit_init.get("ok") if isinstance(credit_init, dict) else None,
         sub.get("ok") if isinstance(sub, dict) else None,
@@ -1131,4 +1180,3 @@ def billing_webhook():
         logger.warning("[%s] channel notification failed details=%s", ROUTE_VERSION, _clip(channel_notification, 1200))
 
     return jsonify(result), 200
-
